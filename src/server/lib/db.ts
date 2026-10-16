@@ -4,7 +4,7 @@ export type Db = Pool;
 export type Conn = Pool | PoolConnection;
 
 export function createDb(url: string): Db {
-  return mysql.createPool({
+  const pool = mysql.createPool({
     uri: url,
     connectionLimit: 10,
     // Store and read every DATETIME as UTC regardless of the server's zone.
@@ -15,6 +15,12 @@ export function createDb(url: string): Db {
     namedPlaceholders: false,
     multipleStatements: false,
   });
+  // CURRENT_TIMESTAMP defaults and NOW() use the session zone, so pin it to UTC
+  // too; otherwise a server on local time skews session and lockout timers.
+  pool.pool.on("connection", (conn) => {
+    conn.query("SET time_zone = '+00:00'");
+  });
+  return pool;
 }
 
 export async function rows<T>(conn: Conn, sql: string, params: unknown[] = []): Promise<T[]> {

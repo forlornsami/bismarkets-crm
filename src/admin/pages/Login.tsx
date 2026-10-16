@@ -163,7 +163,7 @@ export function Login({ onSignedIn }: { onSignedIn: () => void }) {
           </form>
         )}
         <p className="secure-note">
-          <Lock size={13} /> Protected connection. Every sign-in is recorded.
+          <Lock size={13} /> Authorised staff only. Every sign-in is recorded.
         </p>
       </div>
     </AuthScreen>

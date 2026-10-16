@@ -143,3 +143,13 @@ describe("migration splitter", () => {
     ]);
   });
 });
+
+describe.skipIf(!process.env.CRM_TEST_DATABASE_URL)("database connections", () => {
+  it("run every session in UTC whatever the server's zone", async () => {
+    const { createDb, one } = await import("../src/server/lib/db");
+    const db = createDb(process.env.CRM_TEST_DATABASE_URL!);
+    const row = await one<{ tz: string }>(db, "SELECT @@session.time_zone AS tz");
+    expect(row?.tz).toBe("+00:00");
+    await db.end();
+  });
+});
