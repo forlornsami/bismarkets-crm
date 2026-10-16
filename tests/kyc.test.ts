@@ -127,6 +127,7 @@ describe.skipIf(!hasDb)("KYC", () => {
     // Approving needs every check ticked.
     expect((await post(reviewer, `/api/staff/kyc/${identity.id}/decision`, { decision: "approve", checklist: ["name"] })).status).toBe(400);
     expect((await post(reviewer, `/api/staff/kyc/${identity.id}/decision`, { decision: "reject" })).status).toBe(400);
+    expect((await post(reviewer, `/api/staff/kyc/${identity.id}/decision`, { decision: "reject", reason: "See https://example.com" })).status).toBe(400);
     const rejected = await post(reviewer, `/api/staff/kyc/${identity.id}/decision`, { decision: "reject", reason: "The photo is blurred, please upload a sharper one" });
     expect(rejected.body.status).toBe("rejected");
     expect((await post(reviewer, `/api/staff/kyc/${identity.id}/decision`, { decision: "approve", checklist: ALL.identity })).status).toBe(400);

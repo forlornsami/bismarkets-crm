@@ -297,7 +297,9 @@ export function staffKycRouter(deps: AppDeps): Router {
         z
           .object({ decision: z.enum(["approve", "reject"]), reason: z.string().trim().max(500).optional(), checklist: z.array(z.string().max(32)).max(10).default([]) })
           .strict()
-          .refine((v) => v.decision === "approve" || (v.reason && v.reason.length >= 5), { message: "Tell the client why, so they can fix it", path: ["reason"] }),
+          .refine((v) => v.decision === "approve" || (v.reason && v.reason.length >= 5), { message: "Tell the client why, so they can fix it", path: ["reason"] })
+          // The portal shows the reason exactly as written, but only when it is plain text.
+          .refine((v) => !v.reason || !/[<>{}`\\]|https?:|\bwww\./i.test(v.reason), { message: "Write the reason as plain text, without links or symbols like < > { }", path: ["reason"] }),
         req.body,
       );
       const staff = staffOf(req);
