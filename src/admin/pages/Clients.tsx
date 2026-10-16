@@ -346,6 +346,10 @@ const ACTION_LABEL: Record<string, string> = {
   "kyc.document_viewed": "KYC document viewed by staff",
   "kyc.approved": "KYC document approved",
   "kyc.rejected": "KYC document rejected",
+  "kyc.new_document_requested": "Approval withdrawn, new document requested",
+  "kyc.review_taken_over": "KYC review taken over by another reviewer",
+  "client.device_signed_out": "Signed a device out",
+  "client.other_devices_signed_out": "Signed out all other devices",
 };
 
 function CountrySelect({ value, onChange }: { value: string; onChange: (country: string, dial: string) => void }) {

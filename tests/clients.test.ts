@@ -209,7 +209,8 @@ describe.skipIf(!hasDb)("client portal API", () => {
 
     const me = await api().get("/api/user").set(auth);
     expect(me.body.email).toBe("view@client.test");
-    expect(me.body.is_staff).toBeUndefined();
+    // Marked as staff so the support service refuses it: staff must not chat as the client.
+    expect(me.body).toMatchObject({ is_staff: true, read_only: true, impersonation: true });
     expect((await api().patch("/api/user").set(auth).send({ city: "Paris" })).status).toBe(403);
     expect((await api().post("/api/send-otp").set(auth).send({ email: "new@client.test" })).status).toBe(403);
 

@@ -1,7 +1,8 @@
 import type { NextFunction, Request, Response } from "express";
 import type { Config } from "../config";
 import { randomToken, sha256 } from "../lib/crypto";
-import { exec, one, type Conn, type Db } from "../lib/db";
+import { exec, one, rows, type Conn, type Db } from "../lib/db";
+import { queueSupportEvent } from "../lib/events";
 import { forbidden, unauthorized } from "../lib/http";
 
 export interface ClientContext {
@@ -32,14 +33,29 @@ export async function createClientSession(
   return { token, expiresAt };
 }
 
-export async function revokeClientSessions(conn: Conn, clientId: number, reason: string, exceptSessionId?: string) {
-  const result = await exec(
+/** Ends sessions and tells the support service, so the app stops pushing to signed-out devices. */
+export async function revokeClientSessions(conn: Conn, config: Config, clientId: number, reason: string, exceptSessionId?: string) {
+  const live = await rows<{ id: string; kind: string }>(
+    conn,
+    `SELECT id, kind FROM client_sessions WHERE client_id = ? AND revoked_at IS NULL AND expires_at > CURRENT_TIMESTAMP(3) ${exceptSessionId ? "AND id <> ?" : ""} FOR UPDATE`,
+    exceptSessionId ? [clientId, exceptSessionId] : [clientId],
+  );
+  await exec(
     conn,
     `UPDATE client_sessions SET revoked_at = CURRENT_TIMESTAMP(3), revoked_reason = ?
      WHERE client_id = ? AND revoked_at IS NULL ${exceptSessionId ? "AND id <> ?" : ""}`,
     exceptSessionId ? [reason, clientId, exceptSessionId] : [reason, clientId],
   );
-  return result.affectedRows;
+  for (const s of live) if (s.kind === "login") await queueSupportEvent(conn, config, { event: "session.revoked", clientId, sessionId: s.id });
+  return live.length;
+}
+
+/** Ends one session (sign-out, or the client removing a device). */
+export async function revokeClientSession(conn: Conn, config: Config, clientId: number, sessionId: string, reason: string) {
+  const r = await exec(conn, "UPDATE client_sessions SET revoked_at = CURRENT_TIMESTAMP(3), revoked_reason = ? WHERE id = ? AND client_id = ? AND revoked_at IS NULL", [reason, sessionId, clientId]);
+  const s = await one<{ kind: string }>(conn, "SELECT kind FROM client_sessions WHERE id = ?", [sessionId]);
+  if (r.affectedRows && s?.kind === "login") await queueSupportEvent(conn, config, { event: "session.revoked", clientId, sessionId });
+  return r.affectedRows > 0;
 }
 
 export function bearerToken(req: Request): string | null {

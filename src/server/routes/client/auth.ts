@@ -21,7 +21,8 @@ import {
 } from "../../clients/model";
 import { createResetLink } from "../../clients/reset";
 import { fieldError, TooManyRequests, validate, ValidationError } from "../../clients/errors";
-import { bearerToken, clientActor, clientAuth, clientOf, createClientSession, noImpersonation, revokeClientSessions } from "../../clients/session";
+import { bearerToken, clientActor, clientAuth, clientOf, createClientSession, noImpersonation, revokeClientSession, revokeClientSessions } from "../../clients/session";
+import { notifyClient } from "../../clients/notifications";
 import { auditContext, auditStandalone, writeAudit } from "../../lib/audit";
 import { sha256 } from "../../lib/crypto";
 import { exec, one, transaction } from "../../lib/db";
@@ -116,7 +117,7 @@ export function clientAuthRouter(deps: AppDeps): Router {
     handler(async (req, res) => {
       const client = clientOf(req);
       await transaction(db, async (conn) => {
-        await exec(conn, "UPDATE client_sessions SET revoked_at = CURRENT_TIMESTAMP(3), revoked_reason = 'logout' WHERE id = ?", [client.sessionId]);
+        await revokeClientSession(conn, config, client.id, client.sessionId, "logout");
         await writeAudit(conn, ctx(req, client), { action: client.kind === "impersonation" ? "client.impersonation_ended" : "client.logout", entityType: "client", entityId: client.id });
       });
       res.json({ message: "Logged out." });
@@ -304,7 +305,8 @@ export function clientAuthRouter(deps: AppDeps): Router {
         const used = await exec(conn, "UPDATE client_password_resets SET used_at = CURRENT_TIMESTAMP(3) WHERE token_hash = ? AND used_at IS NULL", [sha256(body.token)]);
         if (used.affectedRows !== 1) throw fieldError("email", "This password reset link is invalid or has expired.");
         await exec(conn, "UPDATE clients SET password_hash = ?, password_changed_at = CURRENT_TIMESTAMP(3), failed_login_count = 0, locked_until = NULL, email_verified_at = COALESCE(email_verified_at, CURRENT_TIMESTAMP(3)) WHERE id = ?", [passwordHash, reset.client_id]);
-        const revoked = await revokeClientSessions(conn, reset.client_id, "password_reset");
+        const revoked = await revokeClientSessions(conn, config, reset.client_id, "password_reset");
+        await notifyClient(conn, reset.client_id, { type: "security", title: "Password changed", body: "Your password was changed and you were signed out on every device. If this was not you, contact support straight away." });
         await writeAudit(conn, ctx(req, { id: reset.client_id, email: reset.email }), { action: "client.password_reset", entityType: "client", entityId: reset.client_id, meta: { sessionsRevoked: revoked } });
         await queueEmail(conn, config, {
           to: reset.email,
@@ -327,7 +329,15 @@ export function clientAuthRouter(deps: AppDeps): Router {
       const client = clientOf(req);
       const row = await loadClient(db, client.id);
       if (!row) throw new HttpError(401, "UNAUTHENTICATED", "Unauthenticated.");
-      res.json(presentForPortal(config, row, client.sessionId));
+      const user: Record<string, unknown> = presentForPortal(config, row, client.sessionId);
+      if (client.kind === "impersonation") {
+        // A staff member viewing the portal as this client. The flags let the
+        // portal show a read-only banner, and make the support service refuse
+        // the token so staff cannot chat or register devices as the client.
+        const staff = await one<{ name: string }>(db, "SELECT name FROM staff_users WHERE id = ?", [client.staffId]);
+        Object.assign(user, { impersonation: true, impersonated_by: staff?.name ?? "Staff", is_staff: true, read_only: true });
+      }
+      res.json(user);
     }),
   );
 
@@ -447,6 +457,7 @@ export function clientAuthRouter(deps: AppDeps): Router {
           throw err;
         }
         await writeAudit(conn, ctx(req, client), { action: "client.email_changed", entityType: "client", entityId: client.id, before: { email: row.email }, after: { email: body.email } });
+        await notifyClient(conn, client.id, { type: "security", title: "Sign-in email changed", body: `Your sign-in email is now ${body.email}. If this was not you, contact support straight away.` });
         await queueEmail(conn, config, {
           to: row.email,
           template: "email_changed",

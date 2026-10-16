@@ -149,6 +149,33 @@ describe.skipIf(!hasDb)("KYC", () => {
     expect(Number(actions?.n)).toBeGreaterThanOrEqual(7);
   });
 
+  it("tells the client and the support service about every decision", async () => {
+    const bell = (await api().get("/api/notifications?per_page=50").set(auth())).body;
+    const titles = bell.data.map((n: { title: string }) => n.title);
+    expect(titles).toContain("Your proof of identity needs another look");
+    expect(bell.data.find((n: { title: string }) => n.title === "Your proof of identity needs another look")).toMatchObject({ type: "kyc", body: "The photo is blurred, please upload a sharper one", link: "/profile", read_at: null });
+    expect(bell.unread_count).toBe(bell.data.length);
+    const events = (await env.db.query("SELECT event FROM webhook_outbox WHERE client_id = ? ORDER BY id", [clientId]))[0] as { event: string }[];
+    expect(events.map((e) => e.event)).toEqual(expect.arrayContaining(["kyc.identity.rejected", "kyc.rejected", "kyc.identity.approved", "kyc.address.approved", "kyc.approved"]));
+    expect(events.filter((e) => e.event === "kyc.approved")).toHaveLength(1);
+  });
+
+  it("asks for a new document after approval, with 2FA, audited and shown to the client", async () => {
+    const approved = (await reviewer.agent.get(`/api/staff/kyc?status=approved`)).body.items.find((i: { category: string }) => i.category === "address");
+    expect((await post(sales, `/api/staff/kyc/${approved.id}/request-new`, { reason: "Please send a bill from this year" })).status).toBe(403);
+    expect((await post(reviewer, `/api/staff/kyc/${approved.id}/request-new`, { reason: "See www.example.com" })).status).toBe(400);
+    const res = await post(reviewer, `/api/staff/kyc/${approved.id}/request-new`, { reason: "Please send a bill from this year" });
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("rejected");
+    expect((await post(reviewer, `/api/staff/kyc/${approved.id}/request-new`, { reason: "Please send a bill from this year" })).status).toBe(400);
+    const seen = (await api().get("/api/kyc").set(auth())).body;
+    expect(seen).toMatchObject({ is_kyc_approved: false, overall_status: "rejected" });
+    expect(seen.address).toMatchObject({ status: 2, can_submit: true, message: "Please send a bill from this year" });
+    expect((await api().get("/api/notifications").set(auth())).body.data[0]).toMatchObject({ title: "Please upload a new proof of address", body: "Please send a bill from this year" });
+    expect(await one(env.db, "SELECT id FROM audit_log WHERE action = 'kyc.new_document_requested' AND entity_id = ?", [String(clientId)])).toBeTruthy();
+    expect(await one(env.db, "SELECT id FROM email_outbox WHERE template = 'kyc_new_document' AND to_email = 'kyc@client.test'")).toBeTruthy();
+  });
+
   it("removes a profile picture when the client asks", async () => {
     await api().post("/api/user/profile-picture").set(auth()).attach("image", png, { filename: "me.png", contentType: "image/png" });
     expect((await api().get("/api/user").set(auth())).body.image_url).toBeTruthy();

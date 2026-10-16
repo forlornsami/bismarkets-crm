@@ -16,6 +16,8 @@ import {
 } from "../../clients/model";
 import { createResetLink } from "../../clients/reset";
 import { createClientSession, revokeClientSessions } from "../../clients/session";
+import { notifyClient } from "../../clients/notifications";
+import { queueSupportEvent } from "../../lib/events";
 import { auditContext, writeAudit } from "../../lib/audit";
 import { exec, one, rows, transaction, type Conn } from "../../lib/db";
 import { badRequest, conflict, forbidden, handler, HttpError, notFound, parse } from "../../lib/http";
@@ -332,7 +334,15 @@ export function staffClientsRouter(deps: AppDeps): Router {
         const before = await loadVisible(conn, req, clientId, true);
         if (before.status === body.status) throw badRequest(`This client is already ${body.status}.`);
         await exec(conn, "UPDATE clients SET status = ?, status_reason = ? WHERE id = ?", [body.status, body.status === "active" ? null : body.reason, clientId]);
-        const revoked = body.status === "closed" ? await revokeClientSessions(conn, clientId, "account_closed") : 0;
+        const revoked = body.status === "closed" ? await revokeClientSessions(conn, config, clientId, "account_closed") : 0;
+        // The support service signs closed accounts out of the app and lets them back in on reopening.
+        if (body.status === "closed") await queueSupportEvent(conn, config, { event: "account.disabled", clientId });
+        if (before.status === "closed") await queueSupportEvent(conn, config, { event: "account.enabled", clientId });
+        if (body.status === "frozen") {
+          await notifyClient(conn, clientId, { type: "account", title: "Your account is restricted", body: "Deposits, withdrawals and transfers are paused on your account. Please contact support for details." });
+        } else if (body.status === "active") {
+          await notifyClient(conn, clientId, { type: "account", title: "Your account is active again", body: "All features of your account are available again." });
+        }
         await writeAudit(conn, ctx(req), {
           action: `client.${body.status === "active" ? "reactivated" : body.status}`, entityType: "client", entityId: clientId,
           before: { status: before.status }, after: { status: body.status }, meta: { reason: body.reason, sessionsRevoked: revoked },
@@ -429,7 +439,7 @@ export function staffClientsRouter(deps: AppDeps): Router {
       const clientId = parse(id, req.params.id);
       const revoked = await transaction(db, async (conn) => {
         await loadVisible(conn, req, clientId, true);
-        const n = await revokeClientSessions(conn, clientId, "staff_revoked");
+        const n = await revokeClientSessions(conn, config, clientId, "staff_revoked");
         await writeAudit(conn, ctx(req), { action: "client.sessions_revoked", entityType: "client", entityId: clientId, meta: { count: n } });
         return n;
       });

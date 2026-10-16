@@ -92,8 +92,19 @@ tokens and Laravel-style errors (`{ message, errors }`), so they work unchanged.
 - Passwords: Argon2id, 8+ characters with upper, lower, digit and symbol, plus
   the breach check. Five wrong passwords lock the account; rate limits per IP
   and per email answer with `429` and `Retry-After`.
-- `GET /api/user` never carries staff flags, so the support service keeps
-  treating every token it sees as a customer.
+- `GET /api/user` never carries staff flags for a client's own session, so the
+  support service treats it as a customer. A staff "view as client" session
+  returns `impersonation`, `read_only` and `is_staff: true`, so the portal can
+  show a view-only banner and the support service refuses it (staff cannot
+  chat as the client).
+- Signed-in devices: `GET /api/sessions` lists the client's own sign-ins (not
+  staff views), identified by the same 32-character `session_id` support sees.
+  `DELETE /api/sessions/{id}` and `DELETE /api/sessions` (all others) revoke
+  them, are audited and tell support so the app signs out too.
+- Notifications: `GET /api/notifications`, `POST /api/notifications/{id}/read`,
+  `POST /api/notifications/mark-all-read`. Rows are written in the same
+  transaction as the change (KYC decisions, password and email changes,
+  account restrictions) and are scoped to the signed-in client.
 - Profile pictures are checked by content (PNG, JPEG, WebP only) and served
   from an unguessable URL that includes part of the image hash.
 - Set `CRM_CLIENT_ORIGINS` to every portal address (for local testing, add
@@ -121,6 +132,23 @@ tokens and Laravel-style errors (`{ message, errors }`), so they work unchanged.
 - The link opens the portal's existing `/impersonate?token=` page, which shows
   who you are about to view and removes the token from the address bar.
 
+## Support service events
+
+KYC decisions, account close and reopen, and every client sign-out are sent to
+bismarkets-support (`POST /api/client-notifications/events/crm`) so the app gets
+push notifications and devices are signed out.
+
+- Events are written to `webhook_outbox` in the same transaction as the change,
+  so nothing is sent for a change that rolled back, and nothing is lost if
+  support is down.
+- Each request is signed `v1=` HMAC-SHA256 over timestamp, method, path, event
+  id and body with `CRM_SUPPORT_EVENTS_SECRET`, which must match support's
+  `CLIENT_NOTIFICATION_CRM_SECRET` and be at least 32 characters. Redirects are
+  refused.
+- Failures retry with backoff (30 seconds up to 6 hours, 12 tries). A 4xx other
+  than 408 or 429 is a permanent failure and is logged.
+- With `CRM_SUPPORT_EVENTS_URL` unset, events are queued and sent once it is set.
+
 ## Email outbox
 
 No mail provider is connected yet, so every email is held in the outbox. The
@@ -135,7 +163,7 @@ tested end to end. Production shows only the blanked copy.
 - Files are encrypted at rest (AES-256-GCM with the data key, bound to the submission and slot), stored with their SHA-256 hash, and never served back to the client. The client API only returns statuses and rejection reasons.
 - Staff need `kyc.view` to see the queue, scoped to their assigned clients unless they also have `client.view_all`. Opening a submission and every document view are written to the audit log. Documents are served with `no-store` and a sandboxing CSP; PDFs and HEIC files download instead of rendering in the CRM.
 - Approving or rejecting needs `kyc.decide` and a fresh 2FA code. A rejection needs a reason, which the client sees and is emailed. The client can resubmit only after a rejection.
-- Not yet wired: the KYC webhook to bismarkets-support. It comes with the webhook work in a later phase.
+- "Ask for a new document" withdraws an approval (needs `kyc.decide` and 2FA, latest submission only). It is audited as `kyc.new_document_requested`, the client is emailed and notified, and their KYC goes back to rejected so they can upload again.
 - Review claims: opening a pending item holds it for 15 minutes (refreshed while open), so two reviewers never decide the same item. A decision is refused while someone else holds it; taking over a review is audited as `kyc.review_taken_over`.
 - Approving needs every checklist item ticked; the ticked checklist is stored with the decision and in the audit entry.
 - The review screen flags under-18 dates of birth, the same file uploaded by another client, identical front and back, profile edits made after the upload, unverified email and non-active accounts.

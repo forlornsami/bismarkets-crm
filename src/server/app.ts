@@ -12,6 +12,7 @@ import { buildAllowList, isAllowed, normalizeIp } from "./lib/ip";
 import { clientErrorMiddleware } from "./clients/errors";
 import { clientAuthRouter } from "./routes/client/auth";
 import { clientKycRouter } from "./routes/client/kyc";
+import { clientAccountRouter } from "./routes/client/account";
 import { staffAuditRouter } from "./routes/staff/audit";
 import { staffAuthRouter } from "./routes/staff/auth";
 import { staffBrandingRouter } from "./routes/staff/branding";
@@ -140,6 +141,7 @@ export function createApp(deps: AppDeps): Express {
   client.use(express.json({ limit: "64kb" }));
   client.use(clientAuthRouter(deps));
   client.use(clientKycRouter(deps));
+  client.use(clientAccountRouter(deps));
   // Later phases add the remaining portal endpoints (accounts, money, IB).
   client.use((_req, _res, next) => next(new HttpError(404, "NOT_AVAILABLE", "This feature is not available yet.")));
   client.use(clientErrorMiddleware(log));

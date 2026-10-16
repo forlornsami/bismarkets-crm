@@ -7,6 +7,8 @@ import { auditContext, writeAudit } from "../../lib/audit";
 import { decryptBytes } from "../../lib/crypto";
 import { exec, one, rows, transaction } from "../../lib/db";
 import { queueEmail } from "../../lib/email";
+import { queueSupportEvent } from "../../lib/events";
+import { notifyClient } from "../../clients/notifications";
 import { badRequest, handler, notFound, parse } from "../../lib/http";
 import { likeTerm, listQuery, toPage } from "../../lib/pagination";
 import { requirePermission, requireStepUp, staffActor, staffOf, type StaffContext } from "../../staff/session";
@@ -325,6 +327,16 @@ export function staffKycRouter(deps: AppDeps): Router {
           meta: { submissionId: row.id, category: row.category, reason: body.reason ?? null, checklist: ticked },
         });
         const what = row.category === "identity" ? "proof of identity" : "proof of address";
+        await queueSupportEvent(conn, config, { event: `kyc.${row.category}.${status}`, clientId: row.client_id, referenceId: row.id });
+        if (overall === "approved" && before?.kyc_status !== "approved") await queueSupportEvent(conn, config, { event: "kyc.approved", clientId: row.client_id, referenceId: row.id });
+        if (status === "rejected") await queueSupportEvent(conn, config, { event: "kyc.rejected", clientId: row.client_id, referenceId: row.id });
+        await notifyClient(
+          conn,
+          row.client_id,
+          status === "approved"
+            ? { type: "kyc", title: `Your ${what} is approved`, body: overall === "approved" ? "Your account is now fully verified." : "Thank you. We will let you know when the rest of your documents are checked.", link: "/profile", linkLabel: "View profile" }
+            : { type: "kyc", title: `Your ${what} needs another look`, body: body.reason ?? "Please upload a new document.", link: "/profile", linkLabel: "Upload again" },
+        );
         await queueEmail(conn, config, {
           to: row.email,
           template: `kyc_${status}`,
@@ -333,6 +345,49 @@ export function staffKycRouter(deps: AppDeps): Router {
             status === "approved"
               ? `Hello ${row.first_name},\n\nYour ${what} has been approved.${overall === "approved" ? " Your account is now fully verified." : ""}\n\nBIS Markets`
               : `Hello ${row.first_name},\n\nWe could not approve your ${what}.\n\nReason: ${body.reason}\n\nPlease upload a new document in the client portal: ${config.portalUrl}/profile\n\nBIS Markets`,
+          clientId: row.client_id,
+        });
+        return loadVisible(req, row.id, conn);
+      });
+      res.json(present(updated));
+    }),
+  );
+
+  // Ask for a new document after approval, for example when an ID has expired.
+  // The approval stays in the audit log; the client sees the reason and can upload again.
+  router.post(
+    "/:id/request-new",
+    requirePermission("kyc.decide"),
+    stepUp,
+    handler(async (req, res) => {
+      const body = parse(
+        z.object({ reason: z.string().trim().min(5, "Tell the client what to upload").max(500) }).strict()
+          .refine((v) => !/[<>{}`\\]|https?:|\bwww\./i.test(v.reason), { message: "Write the reason as plain text, without links or symbols like < > { }", path: ["reason"] }),
+        req.body,
+      );
+      const staff = staffOf(req);
+      const updated = await transaction(db, async (conn) => {
+        const row = await loadVisible(req, parse(id, req.params.id), conn, true);
+        if (row.status !== "approved") throw badRequest("Only an approved document can be requested again. Reject a pending one instead.");
+        const latest = await latestSubmissions(conn, row.client_id);
+        if (latest[row.category]?.id !== row.id) throw badRequest("The client has already sent a newer document.");
+        await exec(conn, "UPDATE kyc_submissions SET status = 'rejected', reject_reason = ?, decided_at = CURRENT_TIMESTAMP(3), decided_by = ? WHERE id = ?", [body.reason, staff.id, row.id]);
+        const overall = overallStatus(await latestSubmissions(conn, row.client_id));
+        await exec(conn, "UPDATE clients SET kyc_status = ?, kyc_approved_at = IF(? = 'approved', kyc_approved_at, NULL) WHERE id = ?", [overall, overall, row.client_id]);
+        await writeAudit(conn, ctx(req), {
+          action: "kyc.new_document_requested", entityType: "client", entityId: row.client_id,
+          before: { status: "approved", decided_by: row.decider_name }, after: { status: "rejected", kyc_status: overall },
+          meta: { submissionId: row.id, category: row.category, reason: body.reason },
+        });
+        const what = row.category === "identity" ? "proof of identity" : "proof of address";
+        await queueSupportEvent(conn, config, { event: `kyc.${row.category}.rejected`, clientId: row.client_id, referenceId: row.id });
+        await queueSupportEvent(conn, config, { event: "kyc.rejected", clientId: row.client_id, referenceId: row.id });
+        await notifyClient(conn, row.client_id, { type: "kyc", title: `Please upload a new ${what}`, body: body.reason, link: "/profile", linkLabel: "Upload now" });
+        await queueEmail(conn, config, {
+          to: row.email,
+          template: "kyc_new_document",
+          subject: `Please upload a new ${what}`,
+          text: `Hello ${row.first_name},\n\nWe need a new ${what} from you.\n\n${body.reason}\n\nPlease upload it in the client portal: ${config.portalUrl}/profile\n\nBIS Markets`,
           clientId: row.client_id,
         });
         return loadVisible(req, row.id, conn);

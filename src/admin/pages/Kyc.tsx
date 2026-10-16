@@ -183,6 +183,61 @@ export function KycReview() {
 }
 
 /** One submission at a time: documents on the left, checks and the decision on the right. */
+/** Takes back an approval when a document has expired or turns out to be wrong; the client is asked to upload again. */
+function RequestNewDocument({ id, clientId, reasons }: { id: number; clientId: number; reasons: string[] }) {
+  const client = useQueryClient();
+  const { toast } = useFeedback();
+  const [open, setOpen] = useState(false);
+  const [reason, setReason] = useState("");
+  const send = useMutation({
+    mutationFn: () => api.post<KycSubmission>(`/api/staff/kyc/${id}/request-new`, { reason: reason.trim() }),
+    onSuccess: (res) => {
+      toast(`Asked ${res.client.name} for a new ${res.documentType}. The client has been told why.`);
+      setOpen(false);
+      setReason("");
+      client.setQueryData(["kyc-detail", id], (old: KycDetail | undefined) => (old ? { ...old, ...res } : old));
+      for (const key of [["kyc"], ["kyc-summary"], ["client", String(clientId)], ["client-kyc", clientId], ["client-activity", String(clientId)]]) void client.invalidateQueries({ queryKey: key });
+    },
+  });
+  if (!open)
+    return (
+      <button type="button" className="button button-small" onClick={() => setOpen(true)}>
+        Ask for a new document
+      </button>
+    );
+  return (
+    <form
+      className="stack"
+      onSubmit={(e) => {
+        e.preventDefault();
+        send.mutate();
+      }}
+    >
+      <p className="muted tight">The approval is withdrawn and the client sees this reason in the portal, by email and in their notifications.</p>
+      <div className="chips">
+        {reasons.map((r) => (
+          <button key={r} type="button" className={`chip${reason === r ? " active" : ""}`} onClick={() => setReason(r)}>
+            {r}
+          </button>
+        ))}
+      </div>
+      <label>
+        Reason shown to the client
+        <textarea value={reason} onChange={(e) => setReason(e.target.value)} rows={3} maxLength={500} autoFocus />
+      </label>
+      {send.error && <ErrorText error={send.error} />}
+      <div className="actions actions-left">
+        <button type="submit" className="button button-danger" disabled={send.isPending || reason.trim().length < 5}>
+          Withdraw approval and ask again
+        </button>
+        <button type="button" className="button button-ghost" onClick={() => setOpen(false)}>
+          Cancel
+        </button>
+      </div>
+    </form>
+  );
+}
+
 export function KycWorkbench({ id }: { id: string }) {
   const can = useCan();
   const session = useSession();
@@ -337,6 +392,7 @@ export function KycWorkbench({ id }: { id: string }) {
               </p>
             </div>
           )}
+          {d.status === "approved" && mayDecide && <RequestNewDocument id={sid} clientId={d.client.id} reasons={d.reasons} />}
           {d.history.length > 0 && (
             <>
               <h3>Earlier attempts</h3>

@@ -44,6 +44,11 @@ const schema = z.object({
   CRM_CLIENT_SESSION_DAYS: z.coerce.number().int().min(1).max(90).default(30),
   CRM_CLIENT_IDLE_DAYS: z.coerce.number().int().min(1).max(90).default(7),
   CRM_IMPERSONATION_MINUTES: z.coerce.number().int().min(5).max(120).default(30),
+  // The support service (bismarkets-support) that receives signed account events.
+  // Leave the URL empty to keep events queued without sending them.
+  CRM_SUPPORT_EVENTS_URL: z.string().url().optional().or(z.literal("").transform(() => undefined)),
+  CRM_SUPPORT_EVENTS_SECRET: z.string().optional().default(""),
+  CRM_SUPPORT_EVENTS_ENVIRONMENT: z.enum(["staging", "production"]).default("production"),
   CRM_LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
 });
 
@@ -70,6 +75,7 @@ export type Config = {
   clientSessionMs: number;
   clientIdleMs: number;
   impersonationMs: number;
+  supportEvents: { url: string | null; secret: string; environment: "staging" | "production" };
 };
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -85,6 +91,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     if (c.CRM_STAFF_ALLOWED_IPS.length === 0) {
       throw new Error("Invalid CRM configuration: CRM_STAFF_ALLOWED_IPS is required in production");
     }
+  }
+  if (c.CRM_SUPPORT_EVENTS_URL && c.CRM_SUPPORT_EVENTS_SECRET.length < 32) {
+    throw new Error("Invalid CRM configuration: CRM_SUPPORT_EVENTS_SECRET must be at least 32 characters when CRM_SUPPORT_EVENTS_URL is set");
   }
   const proxies = c.CRM_TRUSTED_PROXIES.trim();
   return {
@@ -110,5 +119,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     clientSessionMs: c.CRM_CLIENT_SESSION_DAYS * 86_400_000,
     clientIdleMs: c.CRM_CLIENT_IDLE_DAYS * 86_400_000,
     impersonationMs: c.CRM_IMPERSONATION_MINUTES * 60_000,
+    supportEvents: {
+      url: c.CRM_SUPPORT_EVENTS_URL ? c.CRM_SUPPORT_EVENTS_URL.replace(/\/+$/, "") : null,
+      secret: c.CRM_SUPPORT_EVENTS_SECRET,
+      environment: c.CRM_SUPPORT_EVENTS_ENVIRONMENT,
+    },
   };
 }
