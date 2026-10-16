@@ -77,7 +77,7 @@ export interface Page<T> {
 }
 
 export interface SessionInfo {
-  staff: { id: number; email: string; name: string; role: { id: number; slug: string; name: string }; mustChangePassword: boolean };
+  staff: { id: number; email: string; name: string; avatarUrl: string | null; role: { id: number; slug: string; name: string }; mustChangePassword: boolean };
   permissions: string[];
   csrfToken: string;
   expiresAt: string;
@@ -97,6 +97,7 @@ export interface StaffMember {
   lastLoginAt: string | null;
   lastLoginIp: string | null;
   createdAt: string;
+  avatarUrl: string | null;
   activeSessions?: number;
 }
 

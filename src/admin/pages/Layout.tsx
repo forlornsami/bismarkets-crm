@@ -181,7 +181,7 @@ function UserMenu({ onSignedOut }: { onSignedOut: () => void }) {
   return (
     <div className="user-menu" ref={ref}>
       <button type="button" className="user-trigger" aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen(!open)}>
-        <Avatar name={session.staff.name} />
+        <Avatar name={session.staff.name} src={session.staff.avatarUrl} />
         <span className="user-meta">
           <span className="user-name">{session.staff.name}</span>
           <span className="user-role">{session.staff.role.name}</span>

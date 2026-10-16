@@ -1,4 +1,4 @@
-import { Router } from "express";
+import express, { Router, type Request } from "express";
 import { z } from "zod";
 import type { AppDeps } from "../../app";
 import { auditContext, writeAudit } from "../../lib/audit";
@@ -6,6 +6,7 @@ import { exec, one, rows, transaction } from "../../lib/db";
 import { badRequest, conflict, forbidden, handler, notFound, parse } from "../../lib/http";
 import { likeTerm, listQuery, toPage } from "../../lib/pagination";
 import { hashPassword } from "../../lib/passwords";
+import { deletePicture, PICTURE_MAX_BYTES, PICTURE_TYPES, savePicture, sendPicture, staffAvatarUrl } from "../../lib/pictures";
 import { activeSuperAdminCount, assertCanGrantRole, assertCanManageTarget, getRole, temporaryPassword } from "../../staff/guards";
 import { requirePermission, requireStepUp, revokeStaffSessions, staffActor, staffOf } from "../../staff/session";
 
@@ -25,12 +26,14 @@ interface StaffRow {
   last_login_at: Date | null;
   last_login_ip: string | null;
   created_at: Date;
+  avatar_sha: string | null;
 }
 
 const SELECT_STAFF = `SELECT u.id, u.email, u.name, u.status, u.role_id, r.slug AS role_slug, r.name AS role_name,
   u.totp_enabled_at, u.must_change_password, u.locked_until, u.scope_countries, u.scope_desks,
-  u.last_login_at, u.last_login_ip, u.created_at
-  FROM staff_users u JOIN roles r ON r.id = u.role_id`;
+  u.last_login_at, u.last_login_ip, u.created_at, p.sha256 AS avatar_sha
+  FROM staff_users u JOIN roles r ON r.id = u.role_id
+  LEFT JOIN profile_pictures p ON p.owner_type = 'staff' AND p.owner_id = u.id`;
 
 export function presentStaff(r: StaffRow) {
   return {
@@ -46,6 +49,7 @@ export function presentStaff(r: StaffRow) {
     lastLoginAt: r.last_login_at?.toISOString() ?? null,
     lastLoginIp: r.last_login_ip,
     createdAt: r.created_at.toISOString(),
+    avatarUrl: staffAvatarUrl(r.id, r.avatar_sha),
   };
 }
 
@@ -103,6 +107,38 @@ export function staffUsersRouter(deps: AppDeps): Router {
       res.json(toPage(items.map(presentStaff), Number(total?.n ?? 0), query.page, query.pageSize));
     }),
   );
+
+  // Profile pictures. Anyone signed in can change their own; changing someone
+  // else's needs staff.edit and the right to manage that person.
+  const rawImage = express.raw({ type: PICTURE_TYPES, limit: PICTURE_MAX_BYTES });
+
+  async function changeAvatar(req: Request, staffId: number, upload: boolean) {
+    const actor = staffOf(req);
+    return transaction(db, async (conn) => {
+      const target = await loadTarget(conn, staffId, true);
+      if (staffId !== actor.id) assertCanManageTarget(actor, target.role_slug);
+      if (upload) {
+        const saved = await savePicture(conn, "staff", staffId, req);
+        await writeAudit(conn, auditContext(req, staffActor(actor)), {
+          action: "staff.avatar_updated", entityType: "staff", entityId: staffId,
+          after: { sha256: saved.sha256, type: saved.type, width: saved.width, height: saved.height, bytes: saved.bytes },
+        });
+        return staffAvatarUrl(staffId, saved.sha256);
+      }
+      if (await deletePicture(conn, "staff", staffId)) {
+        await writeAudit(conn, auditContext(req, staffActor(actor)), { action: "staff.avatar_removed", entityType: "staff", entityId: staffId });
+      }
+      return null;
+    });
+  }
+
+  router.put("/me/avatar", rawImage, handler(async (req, res) => res.json({ avatarUrl: await changeAvatar(req, staffOf(req).id, true) })));
+  router.delete("/me/avatar", handler(async (req, res) => res.json({ avatarUrl: await changeAvatar(req, staffOf(req).id, false) })));
+  router.put("/:id/avatar", requirePermission("staff.edit"), rawImage, handler(async (req, res) => res.json({ avatarUrl: await changeAvatar(req, parse(id, req.params.id), true) })));
+  router.delete("/:id/avatar", requirePermission("staff.edit"), handler(async (req, res) => res.json({ avatarUrl: await changeAvatar(req, parse(id, req.params.id), false) })));
+
+  // Every signed-in staff member can see colleagues' pictures (they appear in the audit log, menus and lists).
+  router.get("/:id/avatar", handler(async (req, res) => sendPicture(db, "staff", parse(id, req.params.id), req, res)));
 
   router.get(
     "/:id",

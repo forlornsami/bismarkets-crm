@@ -6,6 +6,7 @@ import { decryptField, encryptField, randomToken, sha256 } from "../../lib/crypt
 import { exec, one, transaction } from "../../lib/db";
 import { badRequest, handler, HttpError, parse, unauthorized } from "../../lib/http";
 import { dummyPasswordHash, hashPassword, isBreachedPassword, passwordProblem, verifyPassword } from "../../lib/passwords";
+import { staffAvatarUrl } from "../../lib/pictures";
 import { RateLimiter } from "../../lib/rateLimit";
 import { newTotpSecret, otpauthUrl, verifyTotp } from "../../lib/totp";
 import {
@@ -42,10 +43,11 @@ interface StaffAuthRow {
   must_change_password: number;
 }
 
-export function sessionPayload(staff: ReturnType<typeof staffOf>, csrfToken: string, stepUpMs: number) {
+export function sessionPayload(staff: ReturnType<typeof staffOf>, csrfToken: string, stepUpMs: number, avatarUrl: string | null = null) {
   return {
     staff: {
       id: staff.id,
+      avatarUrl,
       email: staff.email,
       name: staff.name,
       role: { id: staff.roleId, slug: staff.roleSlug, name: staff.roleName },
@@ -197,7 +199,9 @@ export function staffAuthRouter(deps: AppDeps): Router {
     session,
     handler(async (req, res) => {
       const token = readCookie(req.headers.cookie, cookieName(config))!;
-      res.json(sessionPayload(staffOf(req), csrfFor(config, token), config.stepUpMs));
+      const staff = staffOf(req);
+      const picture = await one<{ sha256: string }>(db, "SELECT sha256 FROM profile_pictures WHERE owner_type = 'staff' AND owner_id = ?", [staff.id]);
+      res.json(sessionPayload(staff, csrfFor(config, token), config.stepUpMs, staffAvatarUrl(staff.id, picture?.sha256)));
     }),
   );
 

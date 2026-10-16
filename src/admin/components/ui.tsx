@@ -98,11 +98,15 @@ export const initials = (name: string) =>
     .map((w) => w[0]!.toUpperCase())
     .join("") || "?";
 
-export const Avatar = ({ name, large }: { name: string; large?: boolean }) => (
-  <span className={large ? "avatar avatar-lg" : "avatar"} aria-hidden>
-    {initials(name)}
-  </span>
-);
+export function Avatar({ name, src, large, xl }: { name: string; src?: string | null; large?: boolean; xl?: boolean }) {
+  const [broken, setBroken] = useState<string | null>(null);
+  const cls = `avatar${large ? " avatar-lg" : ""}${xl ? " avatar-xl" : ""}`;
+  return (
+    <span className={cls} aria-hidden>
+      {src && broken !== src ? <img src={src} alt="" onError={() => setBroken(src)} /> : initials(name)}
+    </span>
+  );
+}
 
 export function PasswordInput(props: Omit<React.InputHTMLAttributes<HTMLInputElement>, "type">) {
   const [show, setShow] = useState(false);

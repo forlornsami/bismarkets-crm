@@ -1,4 +1,5 @@
-import { PageHeader, Avatar, ThemeSwitch } from "../components/ui";
+import { AvatarEditor } from "../components/AvatarEditor";
+import { PageHeader, ThemeSwitch } from "../components/ui";
 import { formatDate } from "../lib/api";
 import { useSession } from "../lib/session";
 import { ChangePassword } from "./ChangePassword";
@@ -12,14 +13,12 @@ export function Account() {
       <div className="columns">
         <section className="panel">
           <div className="card-head">
-            <div className="cell-person">
-              <Avatar name={staff.name} large />
-              <div>
-                <h2 className="flush">{staff.name}</h2>
-                <span className="muted">{staff.email}</span>
-              </div>
+            <div>
+              <h2 className="flush">{staff.name}</h2>
+              <span className="muted">{staff.email}</span>
             </div>
           </div>
+          <AvatarEditor staffId="me" name={staff.name} src={staff.avatarUrl} />
           <dl className="details">
             <dt>Role</dt>
             <dd>{staff.role.name}</dd>

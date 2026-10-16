@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, KeyRound, LogOut, MonitorSmartphone, Pencil, Power, ShieldOff, Unlock, UserPlus } from "lucide-react";
 import { useState } from "react";
 import { Link, useLocation } from "wouter";
+import { AvatarEditor } from "../components/AvatarEditor";
 import { DataGrid, gridQuery, type Column, type GridState } from "../components/DataGrid";
 import { Avatar, Badge, CopyBox, Dialog, EmptyState, ErrorText, Field, PageHeader, Spinner, useFeedback } from "../components/ui";
 import { api, formatDate, qs, type Page, type Role, type StaffMember } from "../lib/api";
@@ -22,7 +23,7 @@ const columns: Column<StaffMember>[] = [
     sortable: true,
     render: (s) => (
       <span className="cell-person">
-        <Avatar name={s.name} />
+        <Avatar name={s.name} src={s.avatarUrl} />
         <span>
           <strong>{s.name}</strong>
           <small>{s.email}</small>
@@ -275,6 +276,11 @@ export function StaffDetail({ id }: { id: string }) {
             </form>
           ) : (
             <>
+              {self || can("staff.edit") ? (
+                <AvatarEditor staffId={self ? "me" : s.id} name={s.name} src={s.avatarUrl} onChanged={refresh} />
+              ) : (
+                <Avatar name={s.name} src={s.avatarUrl} xl />
+              )}
               <dl className="details">
                 <dt>Email</dt>
                 <dd>{s.email}</dd>
