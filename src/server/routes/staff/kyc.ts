@@ -1,7 +1,7 @@
 import { Router, type Request } from "express";
 import { z } from "zod";
 import type { AppDeps } from "../../app";
-import { KYC_TYPES, latestSubmissions, overallStatus, subTypeOf, type KycCategory } from "../../clients/kyc";
+import { KYC_CHECKLIST, KYC_REJECT_REASONS, KYC_TYPES, latestSubmissions, overallStatus, subTypeOf, type KycCategory } from "../../clients/kyc";
 import { clientName } from "../../clients/model";
 import { auditContext, writeAudit } from "../../lib/audit";
 import { decryptBytes } from "../../lib/crypto";
@@ -10,6 +10,7 @@ import { queueEmail } from "../../lib/email";
 import { badRequest, handler, notFound, parse } from "../../lib/http";
 import { likeTerm, listQuery, toPage } from "../../lib/pagination";
 import { requirePermission, requireStepUp, staffActor, staffOf, type StaffContext } from "../../staff/session";
+import { activeClaim, assertNotClaimedByOther, claim, CLAIM_MINUTES, release } from "../../lib/review";
 import { kycDocumentContext } from "../client/kyc";
 
 const id = z.coerce.number().int().positive();
@@ -24,6 +25,9 @@ interface Row {
   submitted_at: Date;
   decided_at: Date | null;
   decider_name: string | null;
+  claimed_by: number | null;
+  claimed_until: Date | null;
+  claimer_name: string | null;
   first_name: string;
   last_name: string;
   email: string;
@@ -32,9 +36,9 @@ interface Row {
 }
 
 const SELECT = `SELECT s.id, s.client_id, s.category, s.sub_type, s.status, s.reject_reason, s.submitted_at, s.decided_at,
-  u.name AS decider_name, c.first_name, c.last_name, c.email, c.country,
+  u.name AS decider_name, s.claimed_by, s.claimed_until, cl.name AS claimer_name, c.first_name, c.last_name, c.email, c.country,
   (SELECT COUNT(*) FROM kyc_documents d WHERE d.submission_id = s.id) AS documents
-  FROM kyc_submissions s JOIN clients c ON c.id = s.client_id LEFT JOIN staff_users u ON u.id = s.decided_by`;
+  FROM kyc_submissions s JOIN clients c ON c.id = s.client_id LEFT JOIN staff_users u ON u.id = s.decided_by LEFT JOIN staff_users cl ON cl.id = s.claimed_by`;
 
 const present = (r: Row) => ({
   id: r.id,
@@ -48,7 +52,16 @@ const present = (r: Row) => ({
   decidedAt: r.decided_at?.toISOString() ?? null,
   decidedBy: r.decider_name,
   documents: Number(r.documents),
+  claimedBy: activeClaim(r) ? { id: r.claimed_by!, name: r.claimer_name, until: r.claimed_until!.toISOString() } : null,
 });
+
+const ageOn = (dob: string, now = new Date()) => {
+  const [y = 0, m = 1, d = 1] = dob.split("-").map(Number);
+  let age = now.getUTCFullYear() - y;
+  if (now.getUTCMonth() + 1 < m || (now.getUTCMonth() + 1 === m && now.getUTCDate() < d)) age--;
+  return age;
+};
+type Warning = { tone: "bad" | "warn" | "info"; text: string; clientId?: number };
 
 /** The KYC review queue: open documents, approve or reject, all audited. */
 export function staffKycRouter(deps: AppDeps): Router {
@@ -104,13 +117,82 @@ export function staffKycRouter(deps: AppDeps): Router {
     requirePermission("kyc.view"),
     handler(async (req, res) => {
       const s = scope(staffOf(req));
-      const r = await one<{ pending: number; today: number }>(
+      const me = staffOf(req).id;
+      const r = await one<{ pending: number; overdue: number; oldest: Date | null; today: number; mine: number }>(
         db,
-        `SELECT SUM(s.status = 'pending') AS pending, SUM(s.decided_at >= CURRENT_DATE) AS today
+        `SELECT SUM(s.status = 'pending') AS pending,
+           SUM(s.status = 'pending' AND s.submitted_at < CURRENT_TIMESTAMP(3) - INTERVAL 24 HOUR) AS overdue,
+           MIN(IF(s.status = 'pending', s.submitted_at, NULL)) AS oldest,
+           SUM(s.decided_at >= CURRENT_DATE) AS today,
+           SUM(s.decided_at >= CURRENT_DATE AND s.decided_by = ?) AS mine
          FROM kyc_submissions s JOIN clients c ON c.id = s.client_id WHERE 1 = 1${s.sql}`,
-        s.params,
+        [me, ...s.params],
       );
-      res.json({ pending: Number(r?.pending ?? 0), decidedToday: Number(r?.today ?? 0) });
+      res.json({
+        pending: Number(r?.pending ?? 0),
+        overdue: Number(r?.overdue ?? 0),
+        oldestPendingAt: r?.oldest?.toISOString() ?? null,
+        decidedToday: Number(r?.today ?? 0),
+        decidedTodayByMe: Number(r?.mine ?? 0),
+      });
+    }),
+  );
+
+  // "Start reviewing" and "next": claims the oldest pending item nobody else holds.
+  router.post(
+    "/next",
+    requirePermission("kyc.decide"),
+    handler(async (req, res) => {
+      const body = parse(
+        z.object({ category: z.enum(["identity", "address"]).optional(), skip: z.array(id).max(200).default([]), release: id.optional() }).strict(),
+        req.body ?? {},
+      );
+      const staff = staffOf(req);
+      const s = scope(staff);
+      const next = await transaction(db, async (conn) => {
+        if (body.release) await release(conn, "kyc_submissions", body.release, staff.id);
+        const where = ["s.status = 'pending'", "(s.claimed_by IS NULL OR s.claimed_until < CURRENT_TIMESTAMP(3) OR s.claimed_by = ?)"];
+        const params: unknown[] = [staff.id];
+        if (s.sql) (where.push("c.assigned_staff_id = ?"), params.push(...s.params));
+        if (body.category) (where.push("s.category = ?"), params.push(body.category));
+        if (body.skip.length) (where.push(`s.id NOT IN (${body.skip.map(() => "?").join(",")})`), params.push(...body.skip));
+        const row = await one<{ id: number }>(
+          conn,
+          `SELECT s.id FROM kyc_submissions s JOIN clients c ON c.id = s.client_id WHERE ${where.join(" AND ")} ORDER BY s.submitted_at, s.id LIMIT 1 FOR UPDATE SKIP LOCKED`,
+          params,
+        );
+        if (!row) return null;
+        await claim(conn, "kyc_submissions", row.id, staff.id);
+        return row.id;
+      });
+      res.json({ id: next });
+    }),
+  );
+
+  router.post(
+    "/:id/claim",
+    requirePermission("kyc.decide"),
+    handler(async (req, res) => {
+      const body = parse(z.object({ takeOver: z.boolean().default(false) }).strict(), req.body ?? {});
+      const staff = staffOf(req);
+      const row = await transaction(db, async (conn) => {
+        const r = await loadVisible(req, parse(id, req.params.id), conn, true);
+        const { tookOverFrom } = await claim(conn, "kyc_submissions", r.id, staff.id, body.takeOver);
+        if (tookOverFrom) {
+          await writeAudit(conn, ctx(req), { action: "kyc.review_taken_over", entityType: "client", entityId: r.client_id, meta: { submissionId: r.id, from: tookOverFrom } });
+        }
+        return loadVisible(req, r.id, conn);
+      });
+      res.json({ claimedBy: present(row).claimedBy, minutes: CLAIM_MINUTES });
+    }),
+  );
+
+  router.post(
+    "/:id/release",
+    requirePermission("kyc.decide"),
+    handler(async (req, res) => {
+      await release(db, "kyc_submissions", parse(id, req.params.id), staffOf(req).id);
+      res.json({ ok: true });
     }),
   );
 
@@ -119,24 +201,65 @@ export function staffKycRouter(deps: AppDeps): Router {
     requirePermission("kyc.view"),
     handler(async (req, res) => {
       const row = await loadVisible(req, parse(id, req.params.id));
-      const docs = await rows<{ id: number; slot: number; mime: string; size_bytes: number; file_name: string }>(
+      const docs = await rows<{ id: number; slot: number; mime: string; size_bytes: number; file_name: string; sha256: string }>(
         db,
-        "SELECT id, slot, mime, size_bytes, file_name FROM kyc_documents WHERE submission_id = ? ORDER BY slot",
+        "SELECT id, slot, mime, size_bytes, file_name, sha256 FROM kyc_documents WHERE submission_id = ? ORDER BY slot",
         [row.id],
       );
       // The reviewer compares the documents with what the client entered, so the profile is shown in full here.
-      const profile = await one<{ first_name: string; last_name: string; dob: string | null; country: string | null; city: string | null; address: string | null; zipcode: string | null; phone: string | null; phone_code: string | null }>(
+      const profile = await one<{ first_name: string; last_name: string; dob: string | null; country: string | null; city: string | null; address: string | null; zipcode: string | null; phone: string | null; phone_code: string | null; gender: string | null; status: string; email_verified_at: Date | null }>(
         db,
-        "SELECT first_name, last_name, DATE_FORMAT(dob, '%Y-%m-%d') AS dob, country, city, address, zipcode, phone, phone_code FROM clients WHERE id = ?",
+        "SELECT first_name, last_name, DATE_FORMAT(dob, '%Y-%m-%d') AS dob, country, city, address, zipcode, phone, phone_code, gender, status, email_verified_at FROM clients WHERE id = ?",
         [row.client_id],
       );
       const history = await rows<Row>(db, `${SELECT} WHERE s.client_id = ? AND s.category = ? AND s.id <> ? ORDER BY s.id DESC LIMIT 20`, [row.client_id, row.category, row.id]);
+
+      // Automatic checks the reviewer would otherwise have to work out by hand.
+      const warnings: Warning[] = [];
+      if (profile?.dob) {
+        const age = ageOn(profile.dob);
+        if (age < 18) warnings.push({ tone: "bad", text: `The client is ${age} by the date of birth they entered, under 18.` });
+        else if (age > 100) warnings.push({ tone: "warn", text: `The date of birth makes the client ${age}. Check it carefully.` });
+      }
+      if (profile && profile.status !== "active") warnings.push({ tone: "warn", text: `The account is ${profile.status}.` });
+      if (profile && !profile.email_verified_at) warnings.push({ tone: "warn", text: "The client has not verified their email address." });
+      if (docs.length === 2 && docs[0]!.sha256 === docs[1]!.sha256) warnings.push({ tone: "bad", text: "The front and back are the same file." });
+      if (docs.length) {
+        const dupes = await rows<{ client_id: number; first_name: string; last_name: string }>(
+          db,
+          `SELECT DISTINCT s.client_id, c.first_name, c.last_name FROM kyc_documents d JOIN kyc_submissions s ON s.id = d.submission_id JOIN clients c ON c.id = s.client_id
+           WHERE d.sha256 IN (${docs.map(() => "?").join(",")}) AND s.client_id <> ? LIMIT 5`,
+          [...docs.map((d) => d.sha256), row.client_id],
+        );
+        for (const d of dupes) warnings.push({ tone: "bad", text: `The same file was also uploaded by ${d.first_name} ${d.last_name} (client ${d.client_id}).`, clientId: d.client_id });
+      }
+      const edited = await one<{ n: number }>(
+        db,
+        "SELECT COUNT(*) AS n FROM audit_log WHERE entity_type = 'client' AND entity_id = ? AND action IN ('client.profile_updated', 'client.updated') AND occurred_at > ?",
+        [String(row.client_id), row.submitted_at],
+      );
+      if (Number(edited?.n)) warnings.push({ tone: "info", text: "The profile was edited after these documents were sent. Compare against the details shown here." });
+      const rejected = history.filter((h) => h.status === "rejected").length;
+      if (rejected) warnings.push({ tone: "info", text: `${rejected} earlier attempt${rejected > 1 ? "s were" : " was"} rejected. See the history below.` });
+
+      const s = scope(staffOf(req));
+      const queue = await one<{ pending: number; ahead: number }>(
+        db,
+        `SELECT COUNT(*) AS pending, SUM(s.submitted_at < ?) AS ahead FROM kyc_submissions s JOIN clients c ON c.id = s.client_id WHERE s.status = 'pending'${s.sql}`,
+        [row.submitted_at, ...s.params],
+      );
       await transaction(db, (conn) => writeAudit(conn, ctx(req), { action: "kyc.viewed", entityType: "client", entityId: row.client_id, meta: { submissionId: row.id } }));
       res.json({
         ...present(row),
         files: docs.map((d) => ({ id: d.id, slot: d.slot, type: d.mime, bytes: d.size_bytes, name: d.file_name, url: `/api/staff/kyc/documents/${d.id}` })),
-        profile: profile ? { ...profile, name: `${profile.first_name} ${profile.last_name}` } : null,
+        profile: profile
+          ? { name: `${profile.first_name} ${profile.last_name}`, dob: profile.dob, gender: profile.gender, country: profile.country, city: profile.city, address: profile.address, zipcode: profile.zipcode, phone: profile.phone, phone_code: profile.phone_code }
+          : null,
         history: history.map(present),
+        warnings,
+        checklist: KYC_CHECKLIST[row.category],
+        reasons: KYC_REJECT_REASONS[row.category],
+        queue: { pending: Number(queue?.pending ?? 0), position: Number(queue?.ahead ?? 0) + 1 },
       });
     }),
   );
@@ -172,7 +295,7 @@ export function staffKycRouter(deps: AppDeps): Router {
     handler(async (req, res) => {
       const body = parse(
         z
-          .object({ decision: z.enum(["approve", "reject"]), reason: z.string().trim().max(500).optional() })
+          .object({ decision: z.enum(["approve", "reject"]), reason: z.string().trim().max(500).optional(), checklist: z.array(z.string().max(32)).max(10).default([]) })
           .strict()
           .refine((v) => v.decision === "approve" || (v.reason && v.reason.length >= 5), { message: "Tell the client why, so they can fix it", path: ["reason"] }),
         req.body,
@@ -180,18 +303,24 @@ export function staffKycRouter(deps: AppDeps): Router {
       const staff = staffOf(req);
       const updated = await transaction(db, async (conn) => {
         const row = await loadVisible(req, parse(id, req.params.id), conn, true);
-        if (row.status !== "pending") throw badRequest(`This submission was already ${row.status}.`);
+        if (row.status !== "pending") throw badRequest(`This submission was already ${row.status}${row.decider_name ? ` by ${row.decider_name}` : ""}.`);
+        assertNotClaimedByOther(row, staff.id);
+        const required = KYC_CHECKLIST[row.category].map((c) => c.key);
+        const ticked = required.filter((k) => body.checklist.includes(k));
+        if (body.decision === "approve" && ticked.length !== required.length) throw badRequest("Tick every check before approving.");
         const status = body.decision === "approve" ? "approved" : "rejected";
-        await exec(conn, "UPDATE kyc_submissions SET status = ?, reject_reason = ?, decided_at = CURRENT_TIMESTAMP(3), decided_by = ? WHERE id = ?", [
-          status, status === "rejected" ? body.reason : null, staff.id, row.id,
-        ]);
+        await exec(
+          conn,
+          "UPDATE kyc_submissions SET status = ?, reject_reason = ?, decided_at = CURRENT_TIMESTAMP(3), decided_by = ?, claimed_by = NULL, claimed_until = NULL, checklist = ? WHERE id = ?",
+          [status, status === "rejected" ? body.reason : null, staff.id, JSON.stringify(ticked), row.id],
+        );
         const before = await one<{ kyc_status: string }>(conn, "SELECT kyc_status FROM clients WHERE id = ? FOR UPDATE", [row.client_id]);
         const overall = overallStatus(await latestSubmissions(conn, row.client_id));
         await exec(conn, "UPDATE clients SET kyc_status = ?, kyc_approved_at = IF(? = 'approved', COALESCE(kyc_approved_at, CURRENT_TIMESTAMP(3)), NULL) WHERE id = ?", [overall, overall, row.client_id]);
         await writeAudit(conn, ctx(req), {
           action: `kyc.${status}`, entityType: "client", entityId: row.client_id,
           before: { status: row.status, kyc_status: before?.kyc_status }, after: { status, kyc_status: overall },
-          meta: { submissionId: row.id, category: row.category, reason: body.reason ?? null },
+          meta: { submissionId: row.id, category: row.category, reason: body.reason ?? null, checklist: ticked },
         });
         const what = row.category === "identity" ? "proof of identity" : "proof of address";
         await queueEmail(conn, config, {

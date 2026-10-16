@@ -118,3 +118,38 @@ export async function kycEnvelope(conn: Conn, client: ClientRow) {
 export async function kycStatusOf(conn: Conn, clientId: number) {
   return (await one<{ kyc_status: string }>(conn, "SELECT kyc_status FROM clients WHERE id = ?", [clientId]))?.kyc_status ?? "none";
 }
+
+/** What a reviewer confirms before approving. All items must be ticked to approve. */
+export const KYC_CHECKLIST: Record<KycCategory, { key: string; label: string }[]> = {
+  identity: [
+    { key: "name", label: "Name matches the profile" },
+    { key: "dob", label: "Date of birth matches" },
+    { key: "valid", label: "Document is genuine and not expired" },
+    { key: "clear", label: "Photo is sharp with all four corners visible" },
+  ],
+  address: [
+    { key: "name", label: "Name matches the profile" },
+    { key: "address", label: "Address matches the profile" },
+    { key: "recent", label: "Dated within the last 3 months" },
+    { key: "clear", label: "Whole page is readable" },
+  ],
+};
+
+/** Ready-made rejection reasons. The reviewer can edit them before sending. */
+export const KYC_REJECT_REASONS: Record<KycCategory, string[]> = {
+  identity: [
+    "The photo is blurred. Please upload a sharper photo.",
+    "Part of the document is cut off. Please show all four corners.",
+    "The document has expired. Please upload a valid one.",
+    "The name on the document does not match your profile.",
+    "The date of birth does not match your profile.",
+    "Please upload both the front and the back of the document.",
+  ],
+  address: [
+    "The document is older than 3 months. Please upload a recent one.",
+    "The address does not match your profile.",
+    "The name on the document does not match your profile.",
+    "The document is not readable. Please upload a clearer copy.",
+    "This type of document is not accepted. Please send a bank statement or utility bill.",
+  ],
+};

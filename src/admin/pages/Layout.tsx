@@ -24,6 +24,7 @@ import { Avatar, ThemeSwitch } from "../components/ui";
 import { api } from "../lib/api";
 import { useLogo } from "../lib/branding";
 import { useCan, useSession } from "../lib/session";
+import { useKycSummary } from "./Kyc";
 
 interface NavItem {
   href: string;
@@ -31,6 +32,7 @@ interface NavItem {
   icon: LucideIcon;
   permission?: string;
   soon?: boolean;
+  badge?: "kyc";
 }
 
 const NAV: { title: string; items: NavItem[] }[] = [
@@ -39,7 +41,7 @@ const NAV: { title: string; items: NavItem[] }[] = [
     title: "Clients",
     items: [
       { href: "/clients", label: "Clients", icon: Users, permission: "client.view" },
-      { href: "/kyc", label: "KYC review", icon: BadgeCheck, permission: "kyc.view" },
+      { href: "/kyc", label: "KYC review", icon: BadgeCheck, permission: "kyc.view", badge: "kyc" },
     ],
   },
   {
@@ -81,6 +83,7 @@ function readCollapsed() {
 
 export function Layout({ children, onSignedOut }: { children: ReactNode; onSignedOut: () => void }) {
   const can = useCan();
+  const kycWaiting = useKycSummary(can("kyc.view")).data?.pending ?? 0;
   const [location] = useLocation();
   const logo = useLogo();
   const [collapsed, setCollapsed] = useState(readCollapsed);
@@ -127,6 +130,11 @@ export function Layout({ children, onSignedOut }: { children: ReactNode; onSigne
                     <Link key={n.href} href={n.href} className={isActive(n.href, location) ? "nav-link active" : "nav-link"} title={collapsed ? n.label : undefined} aria-current={isActive(n.href, location) ? "page" : undefined}>
                       <Icon size={18} />
                       <span className="nav-label">{n.label}</span>
+                      {n.badge === "kyc" && kycWaiting > 0 && (
+                        <span className="nav-count" title={`${kycWaiting} waiting for review`}>
+                          {kycWaiting > 99 ? "99+" : kycWaiting}
+                        </span>
+                      )}
                     </Link>
                   );
                 })}

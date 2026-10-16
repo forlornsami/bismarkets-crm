@@ -10,6 +10,7 @@ import { createStaff, hasDb, post, setup, signIn, stepUp, type SignedIn, type Te
 const GOOD = "Sunny-Day-42!";
 const png = readFileSync(new URL("../src/admin/public/brand/apple-touch-icon.png", import.meta.url));
 const pdf = Buffer.from("%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n");
+const ALL = { identity: ["name", "dob", "valid", "clear"], address: ["name", "address", "recent", "clear"] };
 const PROFILE = { phone: "7700900123", countryCode: "44", country: "United Kingdom", city: "London", address: "1 Baker St", zipcode: "W1A 1AA", dob: "1990-04-02", gender: "Female" };
 
 describe("document sniffing", () => {
@@ -23,6 +24,7 @@ describe("document sniffing", () => {
 describe.skipIf(!hasDb)("KYC", () => {
   let env: TestEnv;
   let reviewer: SignedIn;
+  let second: SignedIn;
   let sales: SignedIn;
   let token: string;
   let clientId: number;
@@ -38,8 +40,10 @@ describe.skipIf(!hasDb)("KYC", () => {
     env = await setup();
     await createStaff(env.db, "comp@bis.test", "compliance");
     await createStaff(env.db, "sales@bis.test", "sales_agent");
+    await createStaff(env.db, "comp2@bis.test", "compliance");
     reviewer = await signIn(env, "comp@bis.test");
     sales = await signIn(env, "sales@bis.test");
+    second = await signIn(env, "comp2@bis.test");
     await api().post("/api/send-otp").send({ email: "kyc@client.test" });
     const row = await one<{ body_enc: Buffer; template: string }>(env.db, "SELECT body_enc, template FROM email_outbox ORDER BY id DESC LIMIT 1");
     const code = /code is (\d{6})/.exec(decryptField(env.config.dataKey, row!.body_enc, outboxContext("kyc@client.test", row!.template)))![1];
@@ -104,12 +108,28 @@ describe.skipIf(!hasDb)("KYC", () => {
     expect(file.headers["content-security-policy"]).toContain("sandbox");
     expect(Buffer.compare(file.body as Buffer, png)).toBe(0);
 
+    expect(detail.body.checklist.map((c: { key: string }) => c.key)).toEqual(ALL.identity);
+    expect(detail.body.reasons.length).toBeGreaterThan(3);
+    expect(detail.body.queue).toMatchObject({ pending: 2 });
+    expect(detail.body.warnings.some((w: { text: string }) => w.text.includes("same file"))).toBe(true);
+
     expect((await post(reviewer, `/api/staff/kyc/${identity.id}/decision`, { decision: "approve" })).body.error.code).toBe("STEP_UP_REQUIRED");
     await stepUp(env, reviewer);
+    await stepUp(env, second);
+    // Opening an item claims it; a second reviewer is kept off it and "next" skips it.
+    expect((await post(reviewer, `/api/staff/kyc/${identity.id}/claim`, {})).body.claimedBy.name).toBeTruthy();
+    expect((await post(second, `/api/staff/kyc/${identity.id}/claim`, {})).status).toBe(409);
+    expect((await post(second, `/api/staff/kyc/${identity.id}/decision`, { decision: "reject", reason: "Not readable at all" })).status).toBe(409);
+    const nextForSecond = (await post(second, "/api/staff/kyc/next", {})).body.id;
+    expect(nextForSecond).not.toBe(identity.id);
+    expect(nextForSecond).toBeTruthy();
+    expect((await post(second, "/api/staff/kyc/next", { skip: [nextForSecond], release: nextForSecond })).body.id).toBeNull();
+    // Approving needs every check ticked.
+    expect((await post(reviewer, `/api/staff/kyc/${identity.id}/decision`, { decision: "approve", checklist: ["name"] })).status).toBe(400);
     expect((await post(reviewer, `/api/staff/kyc/${identity.id}/decision`, { decision: "reject" })).status).toBe(400);
     const rejected = await post(reviewer, `/api/staff/kyc/${identity.id}/decision`, { decision: "reject", reason: "The photo is blurred, please upload a sharper one" });
     expect(rejected.body.status).toBe("rejected");
-    expect((await post(reviewer, `/api/staff/kyc/${identity.id}/decision`, { decision: "approve" })).status).toBe(400);
+    expect((await post(reviewer, `/api/staff/kyc/${identity.id}/decision`, { decision: "approve", checklist: ALL.identity })).status).toBe(400);
 
     const seen = (await api().get("/api/kyc").set(auth())).body;
     expect(seen.identity).toMatchObject({ status: 2, status_label: "Rejected", can_submit: true, message: "The photo is blurred, please upload a sharper one" });
@@ -117,7 +137,8 @@ describe.skipIf(!hasDb)("KYC", () => {
 
     expect((await upload(3, 2, [png])).status).toBe(201);
     const again = (await reviewer.agent.get("/api/staff/kyc")).body.items;
-    for (const item of again) expect((await post(reviewer, `/api/staff/kyc/${item.id}/decision`, { decision: "approve" })).status).toBe(200);
+    for (const item of again) expect((await post(reviewer, `/api/staff/kyc/${item.id}/decision`, { decision: "approve", checklist: ALL[item.category as "identity"] })).status).toBe(200);
+    expect((await reviewer.agent.get("/api/staff/kyc/summary")).body).toMatchObject({ pending: 0, decidedTodayByMe: 3 });
     const done = (await api().get("/api/kyc").set(auth())).body;
     expect(done).toMatchObject({ is_kyc_approved: true, overall_status: "approved" });
     const client = await one<{ kyc_status: string; kyc_approved_at: Date | null }>(env.db, "SELECT kyc_status, kyc_approved_at FROM clients WHERE id = ?", [clientId]);

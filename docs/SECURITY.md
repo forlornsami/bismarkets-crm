@@ -136,3 +136,6 @@ tested end to end. Production shows only the blanked copy.
 - Staff need `kyc.view` to see the queue, scoped to their assigned clients unless they also have `client.view_all`. Opening a submission and every document view are written to the audit log. Documents are served with `no-store` and a sandboxing CSP; PDFs and HEIC files download instead of rendering in the CRM.
 - Approving or rejecting needs `kyc.decide` and a fresh 2FA code. A rejection needs a reason, which the client sees and is emailed. The client can resubmit only after a rejection.
 - Not yet wired: the KYC webhook to bismarkets-support. It comes with the webhook work in a later phase.
+- Review claims: opening a pending item holds it for 15 minutes (refreshed while open), so two reviewers never decide the same item. A decision is refused while someone else holds it; taking over a review is audited as `kyc.review_taken_over`.
+- Approving needs every checklist item ticked; the ticked checklist is stored with the decision and in the audit entry.
+- The review screen flags under-18 dates of birth, the same file uploaded by another client, identical front and back, profile edits made after the upload, unverified email and non-active accounts.
