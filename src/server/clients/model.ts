@@ -12,6 +12,9 @@ export interface ClientRow {
   password_hash: string | null;
   status: "active" | "frozen" | "closed";
   status_reason: string | null;
+  kyc_status: "none" | "pending" | "approved" | "rejected";
+  kyc_approved_at: Date | null;
+  important_notice: string | null;
   email_verified_at: Date | null;
   phone: string | null;
   phone_code: string | null;
@@ -36,7 +39,7 @@ export interface ClientRow {
   picture_sha: string | null;
 }
 
-export const SELECT_CLIENT = `SELECT c.id, c.email, c.first_name, c.last_name, c.password_hash, c.status, c.status_reason,
+export const SELECT_CLIENT = `SELECT c.id, c.email, c.first_name, c.last_name, c.password_hash, c.status, c.status_reason, c.kyc_status, c.kyc_approved_at, c.important_notice,
   c.email_verified_at, c.phone, c.phone_code, c.country, c.city, c.address, c.zipcode,
   DATE_FORMAT(c.dob, '%Y-%m-%d') AS dob, c.gender, c.bio, c.business_name, c.referral_code, c.referred_by, c.source,
   c.assigned_staff_id, c.failed_login_count, c.locked_until, c.last_login_at, c.last_login_ip, c.created_at, c.updated_at,
@@ -81,7 +84,8 @@ export function presentForPortal(config: Config, c: ClientRow, sessionId?: strin
     profile_picture: picture,
     referral_code: c.referral_code,
     status: c.status,
-    important_notice: null,
+    important_notice: c.important_notice,
+    kyc_status: c.kyc_status,
     session_id: sessionId ? sessionId.slice(0, 32) : undefined,
     created_at: c.created_at.toISOString(),
   };
@@ -94,7 +98,9 @@ export const optionalText = (max: number) =>
   z
     .union([z.string(), z.null()])
     .optional()
-    .transform((v) => (v === undefined ? undefined : v === null || v.trim() === "" ? null : v.trim()))
+    // An empty string means "not filled in on this form" and leaves the stored
+    // value alone (the portal and app send every field on every save); null clears it.
+    .transform((v) => (v === undefined || (v !== null && v.trim() === "") ? undefined : v === null ? null : v.trim()))
     .refine((v) => v === undefined || v === null || v.length <= max, `Must be at most ${max} characters.`);
 
 export const emailField = z
@@ -118,7 +124,7 @@ const realDate = (v: string) => {
 };
 
 export const profileFields = {
-  phone: optionalText(32).refine((v) => !v || /^[0-9 ()-]{4,32}$/.test(v), "The phone number may only contain digits."),
+  phone: optionalText(32).refine((v) => !v || (/^\+?[0-9 ().-]+$/.test(v) && v.replace(/\D/g, "").length >= 4 && v.replace(/\D/g, "").length <= 17), "The phone number may only contain digits."),
   countryCode: optionalText(6)
     .transform((v) => (v ? v.replace(/^\+/, "") : v))
     .refine((v) => !v || /^[0-9]{1,4}$/.test(v), "The country code must be the dialling code, such as 44."),
@@ -126,7 +132,12 @@ export const profileFields = {
   city: optionalText(80),
   address: optionalText(255),
   zipcode: optionalText(20),
-  gender: z.union([z.enum(["Male", "Female"]), z.literal(""), z.null()]).optional().transform((v) => (v === "" ? null : v)),
+  gender: z
+    .union([z.string(), z.null()])
+    .optional()
+    .transform((v) => (v === undefined || v === "" ? undefined : v === null ? null : v.toLowerCase() === "male" ? "Male" : v.toLowerCase() === "female" ? "Female" : "invalid"))
+    .refine((v) => v !== "invalid", "The gender must be Male or Female.")
+    .transform((v) => v as "Male" | "Female" | null | undefined),
   dob: optionalText(10).refine((v) => {
     if (!v) return true;
     if (!/^\d{4}-\d{2}-\d{2}$/.test(v) || !realDate(v)) return false;

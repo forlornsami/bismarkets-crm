@@ -28,7 +28,7 @@ import { exec, one, transaction } from "../../lib/db";
 import { queueEmail } from "../../lib/email";
 import { handler, HttpError } from "../../lib/http";
 import { dummyPasswordHash, hashPassword, isBreachedPassword, verifyPassword } from "../../lib/passwords";
-import { PICTURE_MAX_BYTES, savePicture, sendPicture } from "../../lib/pictures";
+import { deletePicture, PICTURE_MAX_BYTES, savePicture, sendPicture } from "../../lib/pictures";
 import { RateLimiter } from "../../lib/rateLimit";
 
 const OK_RESET = "If this email is registered, we have sent a password reset link.";
@@ -388,6 +388,22 @@ export function clientAuthRouter(deps: AppDeps): Router {
       const row = (await loadClient(db, client.id))!;
       const user = presentForPortal(config, row);
       res.json({ message: "Profile picture updated.", image_url: user.image_url, image_name: user.image_name, user, sha256: saved.sha256 });
+    }),
+  );
+
+  router.delete(
+    "/user/profile-picture",
+    auth,
+    noImpersonation,
+    handler(async (req, res) => {
+      const client = clientOf(req);
+      await transaction(db, async (conn) => {
+        if (await deletePicture(conn, "client", client.id)) {
+          await writeAudit(conn, ctx(req, client), { action: "client.picture_removed_by_client", entityType: "client", entityId: client.id });
+        }
+      });
+      const row = (await loadClient(db, client.id))!;
+      res.json({ message: "Profile picture removed.", user: presentForPortal(config, row) });
     }),
   );
 

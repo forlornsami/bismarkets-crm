@@ -33,3 +33,20 @@ export function decryptField(key: Buffer, sealed: Buffer, context: string): stri
   decipher.setAuthTag(sealed.subarray(13, 29));
   return Buffer.concat([decipher.update(sealed.subarray(29)), decipher.final()]).toString("utf8");
 }
+
+/** Same layout as encryptField, for binary content such as uploaded documents. */
+export function encryptBytes(key: Buffer, plaintext: Buffer, context: string): Buffer {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  cipher.setAAD(Buffer.from(context));
+  const body = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  return Buffer.concat([Buffer.from([VERSION]), iv, cipher.getAuthTag(), body]);
+}
+
+export function decryptBytes(key: Buffer, sealed: Buffer, context: string): Buffer {
+  if (sealed.length < 29 || sealed[0] !== VERSION) throw new Error("Unsupported encrypted field");
+  const decipher = createDecipheriv("aes-256-gcm", key, sealed.subarray(1, 13));
+  decipher.setAAD(Buffer.from(context));
+  decipher.setAuthTag(sealed.subarray(13, 29));
+  return Buffer.concat([decipher.update(sealed.subarray(29)), decipher.final()]);
+}

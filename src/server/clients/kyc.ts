@@ -1,0 +1,120 @@
+import type { Conn } from "../lib/db";
+import { one, rows } from "../lib/db";
+import type { ClientRow } from "./model";
+
+// The document types the portal and app offer. Ids and names match what both
+// front ends send and look up (type 3 = identity, 4 = proof of address).
+export const KYC_TYPES = {
+  identity: {
+    type: 3,
+    label: "Identity",
+    subTypes: [
+      { id: 1, name: "ID Card", documents: 2 },
+      { id: 2, name: "Passport", documents: 1 },
+      { id: 3, name: "Driving License", documents: 2 },
+    ],
+  },
+  address: {
+    type: 4,
+    label: "Proof of address",
+    subTypes: [
+      { id: 1, name: "Bank Statement", documents: 1 },
+      { id: 2, name: "Utility Bill", documents: 1 },
+      { id: 3, name: "Credit Card Statement", documents: 1 },
+      { id: 4, name: "ID Card Back", documents: 1 },
+    ],
+  },
+} as const;
+
+export type KycCategory = keyof typeof KYC_TYPES;
+export const categoryForType = (type: number): KycCategory | null => (type === 3 ? "identity" : type === 4 ? "address" : null);
+export const subTypeOf = (category: KycCategory, id: number) => KYC_TYPES[category].subTypes.find((s) => s.id === id);
+
+export const KYC_MAX_BYTES = 10 * 1024 * 1024;
+
+/** What a document really is, judged by its first bytes. Only images and PDFs are accepted. */
+export function documentType(bytes: Buffer): string | null {
+  if (bytes.length < 12) return null;
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+  if (bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
+  if (bytes.subarray(0, 4).toString("latin1") === "RIFF" && bytes.subarray(8, 12).toString("latin1") === "WEBP") return "image/webp";
+  if (bytes.subarray(0, 5).toString("latin1") === "%PDF-") return "application/pdf";
+  if (bytes.subarray(4, 8).toString("latin1") === "ftyp" && /^(heic|heix|mif1|msf1|heif)$/.test(bytes.subarray(8, 12).toString("latin1"))) return "image/heic";
+  return null;
+}
+
+/** Profile fields a client must fill in before sending documents. */
+export const REQUIRED_PROFILE_FIELDS = ["first_name", "last_name", "phone", "country", "city", "address", "zipcode", "dob"] as const;
+export const missingProfileFields = (c: ClientRow) => REQUIRED_PROFILE_FIELDS.filter((f) => !c[f]);
+
+interface SubmissionRow {
+  id: number;
+  category: KycCategory;
+  sub_type: number;
+  status: "pending" | "approved" | "rejected";
+  reject_reason: string | null;
+  submitted_at: Date;
+}
+
+export async function latestSubmissions(conn: Conn, clientId: number) {
+  const list = await rows<SubmissionRow>(
+    conn,
+    `SELECT s.id, s.category, s.sub_type, s.status, s.reject_reason, s.submitted_at FROM kyc_submissions s
+     JOIN (SELECT category, MAX(id) AS id FROM kyc_submissions WHERE client_id = ? GROUP BY category) l ON l.id = s.id`,
+    [clientId],
+  );
+  return { identity: list.find((s) => s.category === "identity") ?? null, address: list.find((s) => s.category === "address") ?? null };
+}
+
+/** The client's overall KYC state, kept on the client row for lists and later money checks. */
+export function overallStatus(latest: Awaited<ReturnType<typeof latestSubmissions>>): "none" | "pending" | "approved" | "rejected" {
+  const states = [latest.identity?.status, latest.address?.status];
+  if (states.every((s) => s === "approved")) return "approved";
+  if (states.includes("rejected")) return "rejected";
+  if (states.includes("pending")) return "pending";
+  return "none";
+}
+
+const STATUS_CODE = { pending: 0, approved: 1, rejected: 2 } as const;
+const STATUS_LABEL = { pending: "Pending", approved: "Approved", rejected: "Rejected" } as const;
+
+/** GET /api/kyc: the status envelope the portal and app parse. Document links are never exposed. */
+export async function kycEnvelope(conn: Conn, client: ClientRow) {
+  const latest = await latestSubmissions(conn, client.id);
+  const missing = missingProfileFields(client);
+  const category = (key: KycCategory) => {
+    const s = latest[key];
+    const def = KYC_TYPES[key];
+    if (!s) {
+      return { type: def.type, status: null, status_label: "Not submitted", can_submit: true, sub_type: null, sub_type_label: null, message: null, submitted_at: null, document1_url: null, document2_url: null };
+    }
+    return {
+      type: def.type,
+      status: STATUS_CODE[s.status],
+      status_label: STATUS_LABEL[s.status],
+      can_submit: s.status === "rejected",
+      sub_type: s.sub_type,
+      sub_type_label: subTypeOf(key, s.sub_type)?.name ?? null,
+      message: s.status === "rejected" ? s.reject_reason : null,
+      reason: s.status === "rejected" ? s.reject_reason : null,
+      submitted_at: s.submitted_at.toISOString(),
+      document1_url: null,
+      document2_url: null,
+    };
+  };
+  const overall = overallStatus(latest);
+  return {
+    success: true,
+    email_verified: client.email_verified_at !== null,
+    profile_complete: missing.length === 0,
+    missing_profile_fields: missing,
+    is_kyc_approved: overall === "approved",
+    overall_status: overall === "none" ? "not_submitted" : overall,
+    identity: category("identity"),
+    address: category("address"),
+  };
+}
+
+export async function kycStatusOf(conn: Conn, clientId: number) {
+  return (await one<{ kyc_status: string }>(conn, "SELECT kyc_status FROM clients WHERE id = ?", [clientId]))?.kyc_status ?? "none";
+}

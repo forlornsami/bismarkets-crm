@@ -96,6 +96,9 @@ tokens and Laravel-style errors (`{ message, errors }`), so they work unchanged.
   treating every token it sees as a customer.
 - Profile pictures are checked by content (PNG, JPEG, WebP only) and served
   from an unguessable URL that includes part of the image hash.
+- Set `CRM_CLIENT_ORIGINS` to every portal address (for local testing, add
+  `http://localhost:5173`) and `CRM_PUBLIC_URL` to the address the portal
+  reaches the CRM on, since picture links are built from it.
 
 ## Staff access to clients
 
@@ -124,3 +127,12 @@ No mail provider is connected yet, so every email is held in the outbox. The
 readable copy has codes and links blanked; the full text is stored encrypted.
 On a non-production server the outbox shows the full text so sign-up can be
 tested end to end. Production shows only the blanked copy.
+
+## KYC documents
+
+- Clients upload identity (ID card front and back, passport, or driving licence) and proof of address through `POST /api/kyc`, the same call the portal and app already make. Staff "view as client" sessions cannot upload, and frozen or closed accounts cannot either.
+- Each file is checked by its bytes, not its name or declared type: only JPEG, PNG, WebP, HEIC and PDF, up to 10 MB each. Uploads are rate limited per client.
+- Files are encrypted at rest (AES-256-GCM with the data key, bound to the submission and slot), stored with their SHA-256 hash, and never served back to the client. The client API only returns statuses and rejection reasons.
+- Staff need `kyc.view` to see the queue, scoped to their assigned clients unless they also have `client.view_all`. Opening a submission and every document view are written to the audit log. Documents are served with `no-store` and a sandboxing CSP; PDFs and HEIC files download instead of rendering in the CRM.
+- Approving or rejecting needs `kyc.decide` and a fresh 2FA code. A rejection needs a reason, which the client sees and is emailed. The client can resubmit only after a rejection.
+- Not yet wired: the KYC webhook to bismarkets-support. It comes with the webhook work in a later phase.

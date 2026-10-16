@@ -11,11 +11,13 @@ import { errorMiddleware, HttpError, notFound } from "./lib/http";
 import { buildAllowList, isAllowed, normalizeIp } from "./lib/ip";
 import { clientErrorMiddleware } from "./clients/errors";
 import { clientAuthRouter } from "./routes/client/auth";
+import { clientKycRouter } from "./routes/client/kyc";
 import { staffAuditRouter } from "./routes/staff/audit";
 import { staffAuthRouter } from "./routes/staff/auth";
 import { staffBrandingRouter } from "./routes/staff/branding";
 import { staffClientsRouter } from "./routes/staff/clients";
 import { staffEmailsRouter } from "./routes/staff/emails";
+import { staffKycRouter } from "./routes/staff/kyc";
 import { staffRolesRouter } from "./routes/staff/roles";
 import { staffUsersRouter } from "./routes/staff/users";
 import { staffSession } from "./staff/session";
@@ -111,6 +113,7 @@ export function createApp(deps: AppDeps): Express {
   staff.use("/audit", staffAuditRouter(deps));
   staff.use("/clients", staffClientsRouter(deps));
   staff.use("/emails", staffEmailsRouter(deps));
+  staff.use("/kyc", staffKycRouter(deps));
   app.use("/api/staff", staff);
 
   // ---- Client API: what the client portal and app call, with Bearer tokens. ----
@@ -136,6 +139,7 @@ export function createApp(deps: AppDeps): Express {
   });
   client.use(express.json({ limit: "64kb" }));
   client.use(clientAuthRouter(deps));
+  client.use(clientKycRouter(deps));
   // Later phases add the remaining portal endpoints (accounts, money, IB).
   client.use((_req, _res, next) => next(new HttpError(404, "NOT_AVAILABLE", "This feature is not available yet.")));
   client.use(clientErrorMiddleware(log));

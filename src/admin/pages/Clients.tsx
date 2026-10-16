@@ -24,6 +24,8 @@ import { DataGrid, gridQuery, type Column, type GridState } from "../components/
 import { Avatar, Badge, Dialog, EmptyState, ErrorText, Field, PageHeader, Spinner, useFeedback } from "../components/ui";
 import { api, formatDate, qs, type Page } from "../lib/api";
 import { useCan, useSession } from "../lib/session";
+import { COUNTRIES } from "../../shared/countries";
+import { ClientKyc, KycStatusBadge } from "./Kyc";
 
 export interface Client {
   id: number;
@@ -53,6 +55,9 @@ export interface Client {
   lastLoginIp: string | null;
   createdAt: string;
   pictureUrl: string | null;
+  kycStatus: "none" | "pending" | "approved" | "rejected";
+  kycApprovedAt: string | null;
+  importantNotice: string | null;
   activeSessions?: number;
   notesCount?: number;
   referrals?: number;
@@ -102,6 +107,7 @@ const columns: Column<Client>[] = [
   { key: "id", header: "Client ID", sortable: true, render: (c) => <span className="mono">{c.id}</span> },
   { key: "country", header: "Country", render: (c) => c.country ?? <span className="muted">Not given</span> },
   { key: "status", header: "Status", render: (c) => <ClientStatus c={c} /> },
+  { key: "kyc", header: "KYC", render: (c) => <KycStatusBadge status={c.kycStatus} /> },
   { key: "assigned", header: "Assigned to", render: (c) => c.assigned?.name ?? <span className="muted">Nobody</span> },
   { key: "created_at", header: "Joined", sortable: true, render: (c) => formatDate(c.createdAt) },
   { key: "last_login_at", header: "Last sign-in", sortable: true, render: (c) => formatDate(c.lastLoginAt) },
@@ -167,6 +173,7 @@ export function ClientsList() {
         searchPlaceholder="Search name, email, client ID or referral code"
         filters={[
           { key: "status", label: "Status", options: [{ value: "active", label: "Active" }, { value: "frozen", label: "Frozen" }, { value: "closed", label: "Closed" }] },
+          { key: "kyc", label: "KYC", options: [{ value: "none", label: "Not submitted" }, { value: "pending", label: "Waiting for review" }, { value: "approved", label: "Approved" }, { value: "rejected", label: "Rejected" }] },
           { key: "assigned", label: "Assigned", options: [{ value: "me", label: "To me" }, { value: "none", label: "Nobody" }] },
           { key: "country", label: "Country", options: (s?.countries ?? []).map((c) => ({ value: c, label: c })) },
           { key: "source", label: "Joined via", options: Object.entries(SOURCE_LABEL).map(([value, label]) => ({ value, label })) },
@@ -236,7 +243,7 @@ function NewClientDialog({ open, onClose, onCreated }: { open: boolean; onClose:
             </span>
           </Field>
           <Field label="Country">
-            <input className="input" value={form.country} onChange={(e) => set({ country: e.target.value })} placeholder="United Arab Emirates" />
+            <CountrySelect value={form.country} onChange={(country, dial) => set({ country, countryCode: form.countryCode || dial })} />
           </Field>
           <Field label="City">
             <input className="input" value={form.city} onChange={(e) => set({ city: e.target.value })} />
@@ -333,7 +340,35 @@ const ACTION_LABEL: Record<string, string> = {
   "client.pii_revealed": "Personal details viewed by staff",
   "client.impersonation_started": "Staff opened the portal as this client",
   "client.impersonation_ended": "Staff view of the portal ended",
+  "client.picture_removed_by_client": "Removed their picture",
+  "kyc.submitted": "Sent documents for verification",
+  "kyc.viewed": "KYC submission opened by staff",
+  "kyc.document_viewed": "KYC document viewed by staff",
+  "kyc.approved": "KYC document approved",
+  "kyc.rejected": "KYC document rejected",
 };
+
+function CountrySelect({ value, onChange }: { value: string; onChange: (country: string, dial: string) => void }) {
+  const known = COUNTRIES.some((c) => c.name === value);
+  return (
+    <select
+      className="input"
+      value={value}
+      onChange={(e) => {
+        const c = COUNTRIES.find((x) => x.name === e.target.value);
+        onChange(e.target.value, c?.dial.replace(/\D/g, "") ?? "");
+      }}
+    >
+      <option value="">Not given</option>
+      {!known && value && <option value={value}>{value}</option>}
+      {COUNTRIES.map((c) => (
+        <option key={c.iso2} value={c.name}>
+          {c.name}
+        </option>
+      ))}
+    </select>
+  );
+}
 
 export function ClientDetail({ id }: { id: string }) {
   const can = useCan();
@@ -567,6 +602,15 @@ export function ClientDetail({ id }: { id: string }) {
       </div>
 
       <div className="columns columns-wide">
+        <ClientKyc clientId={d.id} status={d.kycStatus} />
+        <section className="panel">
+          <div className="card-head">
+            <h2 className="flush">Notice for the client</h2>
+          </div>
+          {d.importantNotice ? <p>{d.importantNotice}</p> : <p className="muted">None. Staff who can edit clients can add one under Edit details; the client sees it on their profile.</p>}
+        </section>
+      </div>
+      <div className="columns columns-wide">
         <Notes id={id} />
         <Sessions id={id} />
       </div>
@@ -705,6 +749,7 @@ function EditClientDialog({ c, onClose, onSaved }: { c: Client; onClose: () => v
     city: c.city ?? "",
     gender: c.gender ?? "",
     business_name: c.businessName ?? "",
+    importantNotice: c.importantNotice ?? "",
   });
   const set = (patch: Partial<typeof form>) => setForm({ ...form, ...patch });
   const save = useMutation({
@@ -717,6 +762,7 @@ function EditClientDialog({ c, onClose, onSaved }: { c: Client; onClose: () => v
         city: form.city,
         gender: form.gender,
         business_name: form.business_name,
+        importantNotice: form.importantNotice.trim() || null,
       }),
     onSuccess: () => {
       toast("Client updated.");
@@ -750,7 +796,7 @@ function EditClientDialog({ c, onClose, onSaved }: { c: Client; onClose: () => v
             </select>
           </Field>
           <Field label="Country">
-            <input className="input" value={form.country} onChange={(e) => set({ country: e.target.value })} />
+            <CountrySelect value={form.country} onChange={(country) => set({ country })} />
           </Field>
           <Field label="City">
             <input className="input" value={form.city} onChange={(e) => set({ city: e.target.value })} />
@@ -759,6 +805,9 @@ function EditClientDialog({ c, onClose, onSaved }: { c: Client; onClose: () => v
             <input className="input" value={form.business_name} onChange={(e) => set({ business_name: e.target.value })} />
           </Field>
         </div>
+        <Field label="Notice shown to the client" hint="Appears at the top of their portal and app profile. Leave empty for none.">
+          <textarea className="input" rows={2} maxLength={500} value={form.importantNotice} onChange={(e) => set({ importantNotice: e.target.value })} />
+        </Field>
         <p className="muted tight">Phone, address and date of birth are changed by the client in the portal, or after verifying their identity.</p>
         <ErrorText error={save.error} />
         <div className="actions">

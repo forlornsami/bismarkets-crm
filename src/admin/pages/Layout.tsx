@@ -39,7 +39,7 @@ const NAV: { title: string; items: NavItem[] }[] = [
     title: "Clients",
     items: [
       { href: "/clients", label: "Clients", icon: Users, permission: "client.view" },
-      { href: "/kyc", label: "KYC review", icon: BadgeCheck, permission: "kyc.view", soon: true },
+      { href: "/kyc", label: "KYC review", icon: BadgeCheck, permission: "kyc.view" },
     ],
   },
   {

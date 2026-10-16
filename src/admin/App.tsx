@@ -9,6 +9,7 @@ import { useFavicon, useLogo } from "./lib/branding";
 import { SessionProvider, useCan } from "./lib/session";
 import { ClientDetail, ClientsList } from "./pages/Clients";
 import { Emails } from "./pages/Emails";
+import { KycReview } from "./pages/Kyc";
 import { Account } from "./pages/Account";
 import { AuditLog } from "./pages/Audit";
 import { BrandingSettings } from "./pages/Branding";
@@ -119,6 +120,11 @@ export function App() {
                 <ClientDetail id={params.id} />
               </Guarded>
             )}
+          </Route>
+          <Route path="/kyc">
+            <Guarded permission="kyc.view">
+              <KycReview />
+            </Guarded>
           </Route>
           <Route path="/emails">
             <Guarded permission="comms.view">

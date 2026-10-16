@@ -59,6 +59,9 @@ export function staffClientsRouter(deps: AppDeps): Router {
     emailVerified: r.email_verified_at !== null,
     status: r.status,
     statusReason: r.status_reason,
+    kycStatus: r.kyc_status,
+    kycApprovedAt: r.kyc_approved_at?.toISOString() ?? null,
+    importantNotice: r.important_notice,
     country: r.country,
     city: r.city,
     gender: r.gender,
@@ -106,6 +109,7 @@ export function staffClientsRouter(deps: AppDeps): Router {
           assigned: z.string().regex(/^(me|none|\d+)$/).optional().or(z.literal("").transform(() => undefined)),
           source: z.enum(["portal", "app", "staff", "import"]).optional().or(z.literal("").transform(() => undefined)),
           verified: z.enum(["yes", "no"]).optional().or(z.literal("").transform(() => undefined)),
+          kyc: z.enum(["none", "pending", "approved", "rejected"]).optional().or(z.literal("").transform(() => undefined)),
           country: z.string().trim().max(80).optional(),
         }),
         req.query,
@@ -124,6 +128,7 @@ export function staffClientsRouter(deps: AppDeps): Router {
       }
       if (query.status) (where.push("c.status = ?"), params.push(query.status));
       if (query.source) (where.push("c.source = ?"), params.push(query.source));
+      if (query.kyc) (where.push("c.kyc_status = ?"), params.push(query.kyc));
       if (query.country) (where.push("c.country = ?"), params.push(query.country));
       if (query.verified) where.push(query.verified === "yes" ? "c.email_verified_at IS NOT NULL" : "c.email_verified_at IS NULL");
       if (query.assigned === "me") (where.push("c.assigned_staff_id = ?"), params.push(staff.id));
@@ -265,6 +270,7 @@ export function staffClientsRouter(deps: AppDeps): Router {
       firstName: nameField("first name").optional(),
       lastName: nameField("last name").optional(),
       email: emailField.optional(),
+      importantNotice: z.string().trim().max(500).nullable().optional(),
       ...profileFields,
     })
     .strict()
@@ -272,7 +278,7 @@ export function staffClientsRouter(deps: AppDeps): Router {
 
   // Fields whose old and new values may go in the audit log; the rest are
   // personal data, so the log records only that they changed.
-  const PLAIN_FIELDS = new Set(["first_name", "last_name", "email", "country", "city", "gender", "business_name", "phone_code"]);
+  const PLAIN_FIELDS = new Set(["first_name", "last_name", "email", "country", "city", "gender", "business_name", "phone_code", "important_notice"]);
 
   router.patch(
     "/:id",
@@ -283,6 +289,7 @@ export function staffClientsRouter(deps: AppDeps): Router {
       const updated = await transaction(db, async (conn) => {
         const before = await loadVisible(conn, req, clientId, true);
         const columns = profileColumns({ ...body, first_name: body.firstName, last_name: body.lastName });
+        if (body.importantNotice !== undefined) columns.push(["important_notice", body.importantNotice || null]);
         if (body.email && body.email !== before.email) {
           // Changing where a client signs in is sensitive: fresh 2FA, and the old address is told.
           const at = staffOf(req).stepUpAt;
