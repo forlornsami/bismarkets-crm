@@ -6,7 +6,7 @@ import { exec, one, rows, transaction } from "../../lib/db";
 import { badRequest, conflict, forbidden, handler, notFound, parse } from "../../lib/http";
 import { likeTerm, listQuery, toPage } from "../../lib/pagination";
 import { hashPassword } from "../../lib/passwords";
-import { deletePicture, PICTURE_MAX_BYTES, PICTURE_TYPES, savePicture, sendPicture, staffAvatarUrl } from "../../lib/pictures";
+import { deletePicture, PICTURE_MAX_BYTES, PICTURE_TYPES, savePicture, sendPicture, staffAvatarUrl, uploadedImage } from "../../lib/pictures";
 import { activeSuperAdminCount, assertCanGrantRole, assertCanManageTarget, getRole, temporaryPassword } from "../../staff/guards";
 import { requirePermission, requireStepUp, revokeStaffSessions, staffActor, staffOf } from "../../staff/session";
 
@@ -118,7 +118,7 @@ export function staffUsersRouter(deps: AppDeps): Router {
       const target = await loadTarget(conn, staffId, true);
       if (staffId !== actor.id) assertCanManageTarget(actor, target.role_slug);
       if (upload) {
-        const saved = await savePicture(conn, "staff", staffId, req);
+        const saved = await savePicture(conn, "staff", staffId, uploadedImage(req));
         await writeAudit(conn, auditContext(req, staffActor(actor)), {
           action: "staff.avatar_updated", entityType: "staff", entityId: staffId,
           after: { sha256: saved.sha256, type: saved.type, width: saved.width, height: saved.height, bytes: saved.bytes },

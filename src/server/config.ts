@@ -35,6 +35,15 @@ const schema = z.object({
   CRM_LOGIN_LOCK_MINUTES: z.coerce.number().int().min(1).max(1440).default(15),
   CRM_PASSWORD_BREACH_CHECK: boolean(true),
   CRM_SERVE_ADMIN: boolean(true),
+  // Sites allowed to call the client API from a browser (the client portal).
+  CRM_CLIENT_ORIGINS: csv,
+  // The client portal, used in password-reset and log-in-as-client links.
+  CRM_PORTAL_URL: z.string().url().default("https://bismarkets.global"),
+  // This CRM's own public address, used for absolute picture URLs.
+  CRM_PUBLIC_URL: z.string().url().default("https://crmbismarkets.com"),
+  CRM_CLIENT_SESSION_DAYS: z.coerce.number().int().min(1).max(90).default(30),
+  CRM_CLIENT_IDLE_DAYS: z.coerce.number().int().min(1).max(90).default(7),
+  CRM_IMPERSONATION_MINUTES: z.coerce.number().int().min(5).max(120).default(30),
   CRM_LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
 });
 
@@ -55,6 +64,12 @@ export type Config = {
   passwordBreachCheck: boolean;
   serveAdmin: boolean;
   logLevel: string;
+  clientOrigins: string[];
+  portalUrl: string;
+  publicUrl: string;
+  clientSessionMs: number;
+  clientIdleMs: number;
+  impersonationMs: number;
 };
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -89,5 +104,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     passwordBreachCheck: c.CRM_PASSWORD_BREACH_CHECK,
     serveAdmin: c.CRM_SERVE_ADMIN,
     logLevel: c.CRM_LOG_LEVEL,
+    clientOrigins: (c.CRM_CLIENT_ORIGINS.length ? c.CRM_CLIENT_ORIGINS : [c.CRM_PORTAL_URL]).map((o) => new URL(o).origin),
+    portalUrl: c.CRM_PORTAL_URL.replace(/\/+$/, ""),
+    publicUrl: c.CRM_PUBLIC_URL.replace(/\/+$/, ""),
+    clientSessionMs: c.CRM_CLIENT_SESSION_DAYS * 86_400_000,
+    clientIdleMs: c.CRM_CLIENT_IDLE_DAYS * 86_400_000,
+    impersonationMs: c.CRM_IMPERSONATION_MINUTES * 60_000,
   };
 }

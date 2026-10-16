@@ -23,6 +23,12 @@ export class RateLimiter {
     return entry.count <= this.limit;
   }
 
+  /** Whole seconds until the key's window resets (for a Retry-After header). */
+  retryAfter(key: string, now = Date.now()): number {
+    const entry = this.hits.get(key);
+    return entry ? Math.max(1, Math.ceil((entry.resetAt - now) / 1000)) : 1;
+  }
+
   private sweep(now: number) {
     for (const [key, entry] of this.hits) if (entry.resetAt <= now) this.hits.delete(key);
   }

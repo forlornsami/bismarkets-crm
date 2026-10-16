@@ -11,7 +11,6 @@ const greeting = () => {
 };
 
 const UPCOMING = [
-  { icon: Users, label: "Clients", phase: "Phase 2" },
   { icon: BadgeCheck, label: "KYC review", phase: "Phase 2" },
   { icon: ArrowDownToLine, label: "Deposits", phase: "Phase 3" },
   { icon: ArrowUpFromLine, label: "Withdrawals", phase: "Phase 3" },
@@ -37,13 +36,32 @@ export function Dashboard() {
     queryFn: () => api.get<Page<unknown>>("/api/staff/audit?pageSize=1").then((p) => p.total),
     enabled: can("audit.view"),
   });
+  const clients = useQuery({
+    queryKey: ["clients-summary"],
+    queryFn: () => api.get<{ total: number; newThisWeek: number; newToday: number }>("/api/staff/clients/summary"),
+    enabled: can("client.view"),
+  });
   const show = (n: number | undefined) => (n === undefined ? "–" : n.toLocaleString());
 
   return (
     <>
       <PageHeader title={`${greeting()}, ${session.staff.name.split(" ")[0]}`} description="Here is how the CRM looks today. Client, money, MT5 and IB modules switch on as each build phase ships." />
-      {can("staff.view") && (
+      {(can("staff.view") || can("client.view")) && (
         <div className="tiles">
+          {can("client.view") && (
+            <Link href="/clients" className="tile tile-button">
+              <span className="tile-icon">
+                <Users size={20} />
+              </span>
+              <div>
+                <div className="tile-label">Clients</div>
+                <div className="tile-value">{show(clients.data?.total)}</div>
+                <div className="tile-foot">{show(clients.data?.newThisWeek)} new this week</div>
+              </div>
+            </Link>
+          )}
+          {can("staff.view") && (
+            <>
           <div className="tile">
             <span className="tile-icon">
               <UserCog size={20} />
@@ -64,6 +82,8 @@ export function Dashboard() {
               <div className="tile-foot">{pending2fa.data ? "They set it up at first sign-in" : "Everyone is protected"}</div>
             </div>
           </div>
+            </>
+          )}
           {can("audit.view") && (
             <div className="tile">
               <span className="tile-icon info">

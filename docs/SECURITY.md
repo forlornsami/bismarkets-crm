@@ -76,3 +76,51 @@ and money controls on top of the same foundations.
 - Files are stored in MySQL and served with `Content-Security-Policy:
   default-src 'none'; sandbox`, `nosniff` and `inline`, so a file can never run
   as a page.
+
+## Client portal API (Phase 2)
+
+The portal and app call the same `/api/*` paths as the old CRM, with Bearer
+tokens and Laravel-style errors (`{ message, errors }`), so they work unchanged.
+
+- Browsers may call it only from `CRM_CLIENT_ORIGINS` (CORS). There are no
+  cookies, so there is nothing for another site to ride on.
+- Tokens are random 256-bit values stored only as SHA-256 digests. Sessions end
+  after `CRM_CLIENT_IDLE_DAYS` idle or `CRM_CLIENT_SESSION_DAYS` in total, on
+  logout, on a password reset, and when staff close the account.
+- Sign-up needs a 6-digit email code. Codes are stored as HMACs, expire after
+  10 minutes, die after 5 wrong guesses, and a new code cancels the old one.
+- Passwords: Argon2id, 8+ characters with upper, lower, digit and symbol, plus
+  the breach check. Five wrong passwords lock the account; rate limits per IP
+  and per email answer with `429` and `Retry-After`.
+- `GET /api/user` never carries staff flags, so the support service keeps
+  treating every token it sees as a customer.
+- Profile pictures are checked by content (PNG, JPEG, WebP only) and served
+  from an unguessable URL that includes part of the image hash.
+
+## Staff access to clients
+
+- Staff without `client.view_all` see only the clients assigned to them.
+- Phone, address, postcode and date of birth are masked everywhere. Showing them
+  needs `client.pii.reveal` and writes an audit entry each time.
+- The audit log records old and new values for names, email, country and city;
+  for personal data it records only which fields changed.
+- Freezing, closing or reactivating needs `client.status`, a reason and a fresh
+  2FA code. Changing a client's sign-in email needs a fresh code and tells the
+  old address.
+
+## Log in as client
+
+- Needs `client.impersonate` (Super Admin by default), a fresh 2FA code and a
+  written reason. The reason, the staff member and the expiry go in the audit
+  log and show on the client's page.
+- It creates a separate session that lasts `CRM_IMPERSONATION_MINUTES` and is
+  **view-only**: every change (profile, picture, email, codes) is refused.
+- The link opens the portal's existing `/impersonate?token=` page, which shows
+  who you are about to view and removes the token from the address bar.
+
+## Email outbox
+
+No mail provider is connected yet, so every email is held in the outbox. The
+readable copy has codes and links blanked; the full text is stored encrypted.
+On a non-production server the outbox shows the full text so sign-up can be
+tested end to end. Production shows only the blanked copy.

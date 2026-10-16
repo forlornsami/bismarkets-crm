@@ -9,9 +9,13 @@ import type { Config } from "./config";
 import type { Db } from "./lib/db";
 import { errorMiddleware, HttpError, notFound } from "./lib/http";
 import { buildAllowList, isAllowed, normalizeIp } from "./lib/ip";
+import { clientErrorMiddleware } from "./clients/errors";
+import { clientAuthRouter } from "./routes/client/auth";
 import { staffAuditRouter } from "./routes/staff/audit";
 import { staffAuthRouter } from "./routes/staff/auth";
 import { staffBrandingRouter } from "./routes/staff/branding";
+import { staffClientsRouter } from "./routes/staff/clients";
+import { staffEmailsRouter } from "./routes/staff/emails";
 import { staffRolesRouter } from "./routes/staff/roles";
 import { staffUsersRouter } from "./routes/staff/users";
 import { staffSession } from "./staff/session";
@@ -105,9 +109,37 @@ export function createApp(deps: AppDeps): Express {
   staff.use("/users", staffUsersRouter(deps));
   staff.use("/roles", staffRolesRouter(deps));
   staff.use("/audit", staffAuditRouter(deps));
+  staff.use("/clients", staffClientsRouter(deps));
+  staff.use("/emails", staffEmailsRouter(deps));
   app.use("/api/staff", staff);
 
-  // The client API (the portal and app's 58 endpoints) arrives in Phase 2.
+  // ---- Client API: what the client portal and app call, with Bearer tokens. ----
+  // No cookies, so no CSRF; browsers may call it only from the portal's origin.
+  const clientOrigins = new Set(config.clientOrigins);
+  const client = express.Router();
+  client.use((req, res, next) => {
+    const origin = req.get("origin");
+    if (origin && clientOrigins.has(origin)) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Vary", "Origin");
+      res.setHeader("Access-Control-Expose-Headers", "Retry-After");
+      if (req.method === "OPTIONS") {
+        res.setHeader("Access-Control-Allow-Methods", "GET, POST, PATCH, PUT, DELETE");
+        res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept");
+        res.setHeader("Access-Control-Max-Age", "600");
+        return void res.status(204).end();
+      }
+    } else if (req.method === "OPTIONS") {
+      return void res.status(204).end();
+    }
+    next();
+  });
+  client.use(express.json({ limit: "64kb" }));
+  client.use(clientAuthRouter(deps));
+  // Later phases add the remaining portal endpoints (accounts, money, IB).
+  client.use((_req, _res, next) => next(new HttpError(404, "NOT_AVAILABLE", "This feature is not available yet.")));
+  client.use(clientErrorMiddleware(log));
+  app.use("/api", (req, res, next) => (req.path.startsWith("/staff/") || req.path === "/staff" ? next() : client(req, res, next)));
   app.use("/api", (_req, _res, next) => next(notFound()));
 
   if (config.serveAdmin) {

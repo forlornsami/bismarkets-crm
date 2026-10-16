@@ -14,6 +14,7 @@ import {
   UserCog,
   UserRound,
   Users,
+  Mail,
   Wallet,
   type LucideIcon,
 } from "lucide-react";
@@ -37,7 +38,7 @@ const NAV: { title: string; items: NavItem[] }[] = [
   {
     title: "Clients",
     items: [
-      { href: "/clients", label: "Clients", icon: Users, permission: "client.view", soon: true },
+      { href: "/clients", label: "Clients", icon: Users, permission: "client.view" },
       { href: "/kyc", label: "KYC review", icon: BadgeCheck, permission: "kyc.view", soon: true },
     ],
   },
@@ -61,6 +62,7 @@ const NAV: { title: string; items: NavItem[] }[] = [
       { href: "/staff", label: "Staff", icon: UserCog, permission: "staff.view" },
       { href: "/roles", label: "Roles", icon: Shield, permission: "role.view" },
       { href: "/audit", label: "Audit log", icon: ScrollText, permission: "audit.view" },
+      { href: "/emails", label: "Email outbox", icon: Mail, permission: "comms.view" },
       { href: "/settings/branding", label: "Branding", icon: Palette, permission: "settings.view" },
     ],
   },

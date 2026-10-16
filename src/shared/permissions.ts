@@ -39,6 +39,7 @@ export const PERMISSION_GROUPS = {
       "client.pii.reveal": "Reveal masked personal data",
       "client.export": "Export client lists",
       "client.portal_password": "Send client password resets",
+      "client.impersonate": "Log in to the client portal as a client (view only)",
     },
   },
   kyc: {

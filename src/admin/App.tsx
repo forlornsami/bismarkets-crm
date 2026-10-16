@@ -7,6 +7,8 @@ import { EmptyState, PageHeader, Spinner } from "./components/ui";
 import { ApiError, api, onSessionLost, setCsrf, type SessionInfo } from "./lib/api";
 import { useFavicon, useLogo } from "./lib/branding";
 import { SessionProvider, useCan } from "./lib/session";
+import { ClientDetail, ClientsList } from "./pages/Clients";
+import { Emails } from "./pages/Emails";
 import { Account } from "./pages/Account";
 import { AuditLog } from "./pages/Audit";
 import { BrandingSettings } from "./pages/Branding";
@@ -105,6 +107,23 @@ export function App() {
                 <StaffDetail id={params.id} />
               </Guarded>
             )}
+          </Route>
+          <Route path="/clients">
+            <Guarded permission="client.view">
+              <ClientsList />
+            </Guarded>
+          </Route>
+          <Route path="/clients/:id">
+            {(params) => (
+              <Guarded permission="client.view">
+                <ClientDetail id={params.id} />
+              </Guarded>
+            )}
+          </Route>
+          <Route path="/emails">
+            <Guarded permission="comms.view">
+              <Emails />
+            </Guarded>
           </Route>
           <Route path="/roles">
             <Guarded permission="role.view">

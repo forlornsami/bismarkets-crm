@@ -1,4 +1,5 @@
 import type { StaffContext } from "./staff/session";
+import type { ClientContext } from "./clients/session";
 
 declare global {
   namespace Express {
@@ -7,6 +8,8 @@ declare global {
       clientIp: string;
       /** Set by the staff session middleware on authenticated staff requests. */
       staff?: StaffContext;
+      /** Set by the client token middleware on authenticated client API requests. */
+      client?: ClientContext;
     }
   }
 }
