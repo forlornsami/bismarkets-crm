@@ -1,24 +1,50 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { Lock } from "lucide-react";
 import { useEffect } from "react";
 import { Route, Switch } from "wouter";
 import { StepUpHost } from "./components/StepUp";
+import { EmptyState, PageHeader, Spinner } from "./components/ui";
 import { ApiError, api, onSessionLost, setCsrf, type SessionInfo } from "./lib/api";
+import { useFavicon, useLogo } from "./lib/branding";
 import { SessionProvider, useCan } from "./lib/session";
+import { Account } from "./pages/Account";
 import { AuditLog } from "./pages/Audit";
+import { BrandingSettings } from "./pages/Branding";
 import { ChangePassword } from "./pages/ChangePassword";
 import { Dashboard } from "./pages/Dashboard";
 import { Layout } from "./pages/Layout";
-import { Login } from "./pages/Login";
+import { AuthScreen, Login } from "./pages/Login";
 import { Roles } from "./pages/Roles";
 import { StaffDetail, StaffList } from "./pages/Staff";
 
 function Guarded({ permission, children }: { permission: string; children: React.ReactNode }) {
   const can = useCan();
-  return can(permission) ? <>{children}</> : <p>You do not have access to this page.</p>;
+  return can(permission) ? (
+    <>{children}</>
+  ) : (
+    <div className="panel">
+      <EmptyState icon={<Lock size={36} />} title="No access">
+        Your role does not include this page. Ask a Super Admin if you need it.
+      </EmptyState>
+    </div>
+  );
+}
+
+function Splash({ children }: { children: React.ReactNode }) {
+  const logo = useLogo();
+  return (
+    <div className="center-screen">
+      <div>
+        <img src={logo} alt="BIS CRM" />
+        <div>{children}</div>
+      </div>
+    </div>
+  );
 }
 
 export function App() {
   const client = useQueryClient();
+  useFavicon();
   const session = useQuery({
     queryKey: ["session"],
     queryFn: async () => {
@@ -35,7 +61,7 @@ export function App() {
     refetchOnWindowFocus: true,
   });
   const reload = () => {
-    client.clear();
+    client.removeQueries({ predicate: (q) => q.queryKey[0] !== "branding" });
     void session.refetch();
   };
 
@@ -44,14 +70,19 @@ export function App() {
     return () => onSessionLost(null);
   }, [client]);
 
-  if (session.isLoading) return <p className="center">Loading…</p>;
-  if (session.error) return <p className="center error-text">The CRM is not reachable right now. Try again shortly.</p>;
+  if (session.isLoading)
+    return (
+      <Splash>
+        <Spinner size={22} />
+      </Splash>
+    );
+  if (session.error) return <Splash>The CRM is not reachable right now. Try again shortly.</Splash>;
   if (!session.data) return <Login onSignedIn={reload} />;
   if (session.data.staff.mustChangePassword) {
     return (
-      <main className="login">
+      <AuthScreen>
         <ChangePassword forced onDone={reload} />
-      </main>
+      </AuthScreen>
     );
   }
 
@@ -85,12 +116,16 @@ export function App() {
               <AuditLog />
             </Guarded>
           </Route>
+          <Route path="/settings/branding">
+            <Guarded permission="settings.view">
+              <BrandingSettings />
+            </Guarded>
+          </Route>
           <Route path="/account">
-            <h1>My account</h1>
-            <ChangePassword forced={false} onDone={() => undefined} />
+            <Account />
           </Route>
           <Route>
-            <p>Page not found.</p>
+            <PageHeader title="Page not found" description="This address does not match any page in the CRM." />
           </Route>
         </Switch>
       </Layout>

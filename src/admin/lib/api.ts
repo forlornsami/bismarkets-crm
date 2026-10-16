@@ -34,9 +34,11 @@ export const onSessionLost = (fn: (() => void) | null) => {
 
 async function send<T>(method: string, url: string, body?: unknown, retried = false): Promise<T> {
   const headers: Record<string, string> = { Accept: "application/json" };
-  if (body !== undefined) headers["Content-Type"] = "application/json";
+  // Files go up as raw bytes with their own type; everything else is JSON.
+  const isFile = body instanceof Blob;
+  if (body !== undefined) headers["Content-Type"] = isFile ? body.type : "application/json";
   if (method !== "GET") headers["X-CSRF-Token"] = csrfToken;
-  const res = await fetch(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), credentials: "same-origin" });
+  const res = await fetch(url, { method, headers, body: body === undefined ? undefined : isFile ? body : JSON.stringify(body), credentials: "same-origin" });
   if (res.status === 204) return undefined as T;
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
@@ -56,6 +58,7 @@ export const api = {
   post: <T>(url: string, body: unknown = {}) => send<T>("POST", url, body),
   patch: <T>(url: string, body: unknown) => send<T>("PATCH", url, body),
   del: <T>(url: string) => send<T>("DELETE", url),
+  upload: <T>(url: string, file: Blob) => send<T>("PUT", url, file),
 };
 
 export const qs = (params: Record<string, string | number | undefined | null>) => {

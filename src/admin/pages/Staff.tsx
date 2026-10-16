@@ -1,8 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ArrowLeft, KeyRound, LogOut, MonitorSmartphone, Pencil, Power, ShieldOff, Unlock, UserPlus } from "lucide-react";
 import { useState } from "react";
-import { useLocation } from "wouter";
+import { Link, useLocation } from "wouter";
 import { DataGrid, gridQuery, type Column, type GridState } from "../components/DataGrid";
-import { Badge, CopyBox, Dialog, ErrorText, Field } from "../components/ui";
+import { Avatar, Badge, CopyBox, Dialog, EmptyState, ErrorText, Field, PageHeader, Spinner, useFeedback } from "../components/ui";
 import { api, formatDate, qs, type Page, type Role, type StaffMember } from "../lib/api";
 import { useCan, useSession } from "../lib/session";
 
@@ -15,7 +16,20 @@ export function StatusBadge({ s }: { s: StaffMember }) {
 }
 
 const columns: Column<StaffMember>[] = [
-  { key: "name", header: "Name", sortable: true, render: (s) => <strong>{s.name}</strong> },
+  {
+    key: "name",
+    header: "Name",
+    sortable: true,
+    render: (s) => (
+      <span className="cell-person">
+        <Avatar name={s.name} />
+        <span>
+          <strong>{s.name}</strong>
+          <small>{s.email}</small>
+        </span>
+      </span>
+    ),
+  },
   { key: "email", header: "Email", sortable: true, render: (s) => s.email },
   { key: "role", header: "Role", render: (s) => s.role.name },
   { key: "status", header: "Status", render: (s) => <StatusBadge s={s} /> },
@@ -37,7 +51,17 @@ export function StaffList() {
   });
   return (
     <>
-      <h1>Staff</h1>
+      <PageHeader
+        title="Staff"
+        description="People who can sign in to the CRM, their roles and their security status."
+        actions={
+          can("staff.create") && (
+            <button type="button" className="button button-primary" onClick={() => setCreating(true)}>
+              <UserPlus size={16} /> Add staff
+            </button>
+          )
+        }
+      />
       <DataGrid
         columns={columns}
         rows={list.data?.items}
@@ -55,13 +79,7 @@ export function StaffList() {
           { key: "roleId", label: "Role", options: (roles.data ?? []).map((r) => ({ value: String(r.id), label: r.name })) },
           { key: "twoFactor", label: "2FA", options: [{ value: "enabled", label: "On" }, { value: "pending", label: "Not set up" }] },
         ]}
-        toolbar={
-          can("staff.create") && (
-            <button type="button" className="button button-primary" onClick={() => setCreating(true)}>
-              Add staff
-            </button>
-          )
-        }
+        emptyText="Add the first staff member to get started."
       />
       <NewStaffDialog open={creating} onClose={() => setCreating(false)} roles={roles.data ?? []} />
     </>
@@ -128,7 +146,7 @@ function NewStaffDialog({ open, onClose, roles }: { open: boolean; onClose: () =
               Cancel
             </button>
             <button type="submit" className="button button-primary" disabled={create.isPending}>
-              Create account
+              {create.isPending && <Spinner />} Create account
             </button>
           </div>
         </form>
@@ -141,6 +159,7 @@ export function StaffDetail({ id }: { id: string }) {
   const can = useCan();
   const session = useSession();
   const client = useQueryClient();
+  const { toast, confirm } = useFeedback();
   const roles = useRoles();
   const member = useQuery({ queryKey: ["staff-member", id], queryFn: () => api.get<StaffMember>(`/api/staff/users/${id}`) });
   const sessions = useQuery({
@@ -165,35 +184,60 @@ export function StaffDetail({ id }: { id: string }) {
       }),
     onSuccess: () => {
       setEdit(null);
+      toast("Changes saved.");
       refresh();
     },
   });
   const action = useMutation({
     mutationFn: ({ path, body }: { path: string; body?: unknown; label: string }) => api.post<{ temporaryPassword?: string }>(`/api/staff/users/${id}/${path}`, body ?? {}),
     onSuccess: (res, vars) => {
-      setNotice({ text: vars.label, password: res?.temporaryPassword });
+      if (res?.temporaryPassword) setNotice({ text: vars.label, password: res.temporaryPassword });
+      else toast(vars.label);
       refresh();
     },
+    onError: (err) => toast(err instanceof Error ? err.message : "That did not work.", "bad"),
   });
 
   const s = member.data;
   if (member.error) return <ErrorText error={member.error} />;
-  if (!s) return <p>Loading…</p>;
+  if (!s)
+    return (
+      <div className="center-screen loading-block">
+        <Spinner size={22} />
+      </div>
+    );
   const self = s.id === session.staff.id;
-  const run = (path: string, label: string, body?: unknown, confirmText?: string) => {
-    if (confirmText && !window.confirm(confirmText)) return;
+  const run = async (path: string, label: string, body?: unknown, ask?: { title: string; body: string; confirmLabel: string; danger?: boolean }) => {
+    if (ask && !(await confirm(ask))) return;
     setNotice(null);
     action.mutate({ path, body, label });
   };
 
   return (
     <>
-      <h1>
-        {s.name} <StatusBadge s={s} />
-      </h1>
+      <Link href="/staff" className="back-link">
+        <ArrowLeft size={15} /> All staff
+      </Link>
+      <PageHeader
+        title={s.name}
+        badge={<StatusBadge s={s} />}
+        description={`${s.role.name} · ${s.email}`}
+        actions={
+          can("staff.edit") &&
+          !edit && (
+            <button
+              type="button"
+              className="button"
+              onClick={() => setEdit({ name: s.name, roleId: String(s.role.id), countries: s.scope.countries.join(", "), desks: s.scope.desks.join(", ") })}
+            >
+              <Pencil size={15} /> Edit details
+            </button>
+          )
+        }
+      />
       <div className="columns">
         <section className="panel">
-          <h2>Details</h2>
+          <h2>Profile</h2>
           {edit ? (
             <form
               onSubmit={(e) => {
@@ -225,7 +269,7 @@ export function StaffDetail({ id }: { id: string }) {
                   Cancel
                 </button>
                 <button type="submit" className="button button-primary" disabled={save.isPending}>
-                  Save
+                  {save.isPending && <Spinner />} Save changes
                 </button>
               </div>
             </form>
@@ -250,95 +294,127 @@ export function StaffDetail({ id }: { id: string }) {
                 <dt>Created</dt>
                 <dd>{formatDate(s.createdAt)}</dd>
               </dl>
-              {can("staff.edit") && (
-                <button
-                  type="button"
-                  className="button"
-                  onClick={() => setEdit({ name: s.name, roleId: String(s.role.id), countries: s.scope.countries.join(", "), desks: s.scope.desks.join(", ") })}
-                >
-                  Edit
-                </button>
-              )}
             </>
           )}
         </section>
         {(can("staff.disable") || can("staff.security")) && (
           <section className="panel">
-            <h2>Security</h2>
-            <p className="muted">Each action here asks for your 2FA code and signs this person out of every device.</p>
+            <div className="card-head">
+              <div>
+                <h2>Security</h2>
+                <p>Each action asks for your 2FA code and signs this person out of every device.</p>
+              </div>
+            </div>
             <div className="stack">
-              {can("staff.disable") && !self && (
-                <button
-                  type="button"
-                  className={s.status === "active" ? "button button-danger" : "button"}
-                  onClick={() =>
-                    run("status", s.status === "active" ? "Account disabled." : "Account enabled.", { status: s.status === "active" ? "disabled" : "active" }, s.status === "active" ? `Disable ${s.email}?` : undefined)
-                  }
-                >
-                  {s.status === "active" ? "Disable account" : "Enable account"}
+              {can("staff.security") && !self && s.lockedUntil && (
+                <button type="button" className="button" onClick={() => run("unlock", "Account unlocked.")}>
+                  <Unlock size={16} /> Unlock sign-in
                 </button>
               )}
               {can("staff.security") && !self && (
                 <>
-                  {s.lockedUntil && (
-                    <button type="button" className="button" onClick={() => run("unlock", "Account unlocked.")}>
-                      Unlock sign-in
-                    </button>
-                  )}
-                  <button type="button" className="button" onClick={() => run("reset-password", "Temporary password created. Share it privately; it is shown only once.", undefined, "Create a new temporary password?")}>
-                    Reset password
+                  <button
+                    type="button"
+                    className="button"
+                    onClick={() =>
+                      run("reset-password", "Temporary password created. Share it privately; it is shown only once.", undefined, {
+                        title: "Reset password?",
+                        body: `${s.name} gets a new temporary password and must choose their own at next sign-in.`,
+                        confirmLabel: "Reset password",
+                      })
+                    }
+                  >
+                    <KeyRound size={16} /> Reset password
                   </button>
-                  <button type="button" className="button" onClick={() => run("reset-2fa", "2FA reset. They will set it up again at next sign-in.", undefined, "Reset 2FA for this person?")}>
-                    Reset 2FA
+                  <button
+                    type="button"
+                    className="button"
+                    onClick={() =>
+                      run("reset-2fa", "2FA reset. They will set it up again at next sign-in.", undefined, {
+                        title: "Reset 2FA?",
+                        body: `${s.name} will scan a new QR code at next sign-in. Use this when they lose their phone.`,
+                        confirmLabel: "Reset 2FA",
+                      })
+                    }
+                  >
+                    <ShieldOff size={16} /> Reset 2FA
                   </button>
                 </>
               )}
               {can("staff.security") && (
                 <button type="button" className="button" onClick={() => run("revoke-sessions", "Signed out of all other sessions.")}>
-                  Sign out everywhere
+                  <LogOut size={16} /> Sign out everywhere
+                </button>
+              )}
+              {can("staff.disable") && !self && (
+                <button
+                  type="button"
+                  className={s.status === "active" ? "button button-danger" : "button"}
+                  onClick={() =>
+                    run(
+                      "status",
+                      s.status === "active" ? "Account disabled." : "Account enabled.",
+                      { status: s.status === "active" ? "disabled" : "active" },
+                      s.status === "active"
+                        ? { title: "Disable this account?", body: `${s.email} is signed out at once and cannot sign in until someone enables the account again.`, confirmLabel: "Disable account", danger: true }
+                        : undefined,
+                    )
+                  }
+                >
+                  <Power size={16} /> {s.status === "active" ? "Disable account" : "Enable account"}
                 </button>
               )}
             </div>
-            <ErrorText error={action.error} />
             {notice && (
               <div className="notice">
-                <p>{notice.text}</p>
-                {notice.password && <CopyBox value={notice.password} />}
+                <KeyRound size={16} />
+                <div>
+                  <p>{notice.text}</p>
+                  {notice.password && <CopyBox value={notice.password} />}
+                </div>
               </div>
             )}
           </section>
         )}
       </div>
       {can("staff.security") && (
-        <section className="panel">
-          <h2>Active sessions</h2>
-          <table className="table">
-            <thead>
-              <tr>
-                <th>Signed in</th>
-                <th>Last active</th>
-                <th>IP</th>
-                <th>Device</th>
-              </tr>
-            </thead>
-            <tbody>
-              {(sessions.data?.items ?? []).map((x) => (
-                <tr key={x.createdAt + x.ip}>
-                  <td>{formatDate(x.createdAt)}</td>
-                  <td>{formatDate(x.lastSeenAt)}</td>
-                  <td>{x.ip}</td>
-                  <td className="truncate">{x.userAgent}</td>
-                </tr>
-              ))}
-              {sessions.data?.items.length === 0 && (
+        <section className="grid">
+          <div className="grid-toolbar">
+            <h2 className="flush">Active sessions</h2>
+          </div>
+          <div className="grid-scroll">
+            <table className="table">
+              <thead>
                 <tr>
-                  <td colSpan={4} className="empty">
-                    No active sessions.
-                  </td>
+                  <th>Signed in</th>
+                  <th>Last active</th>
+                  <th>IP address</th>
+                  <th>Device</th>
                 </tr>
-              )}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {(sessions.data?.items ?? []).map((x) => (
+                  <tr key={x.createdAt + x.ip}>
+                    <td>{formatDate(x.createdAt)}</td>
+                    <td>{formatDate(x.lastSeenAt)}</td>
+                    <td>
+                      <code>{x.ip}</code>
+                    </td>
+                    <td className="truncate" title={x.userAgent}>
+                      {x.userAgent}
+                    </td>
+                  </tr>
+                ))}
+                {sessions.data?.items.length === 0 && (
+                  <tr>
+                    <td colSpan={4} className="empty">
+                      <EmptyState icon={<MonitorSmartphone size={32} />} title="No active sessions" />
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
         </section>
       )}
     </>

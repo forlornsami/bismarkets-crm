@@ -11,6 +11,7 @@ import { errorMiddleware, HttpError, notFound } from "./lib/http";
 import { buildAllowList, isAllowed, normalizeIp } from "./lib/ip";
 import { staffAuditRouter } from "./routes/staff/audit";
 import { staffAuthRouter } from "./routes/staff/auth";
+import { staffBrandingRouter } from "./routes/staff/branding";
 import { staffRolesRouter } from "./routes/staff/roles";
 import { staffUsersRouter } from "./routes/staff/users";
 import { staffSession } from "./staff/session";
@@ -98,6 +99,8 @@ export function createApp(deps: AppDeps): Express {
   const staff = express.Router();
   staff.use(staffNetwork, sameOrigin, express.json({ limit: "64kb" }));
   staff.use("/auth", staffAuthRouter(deps));
+  // Logos are public to the staff network (the sign-in page shows them); changes check the session inside.
+  staff.use("/branding", staffBrandingRouter(deps));
   staff.use(staffSession(db, config));
   staff.use("/users", staffUsersRouter(deps));
   staff.use("/roles", staffRolesRouter(deps));

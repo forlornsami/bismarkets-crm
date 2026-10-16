@@ -1,16 +1,17 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
+import { CalendarRange, Download, ShieldCheck, ShieldAlert } from "lucide-react";
 import { useState } from "react";
 import { DataGrid, gridQuery, type Column, type GridState } from "../components/DataGrid";
-import { Badge, ErrorText } from "../components/ui";
+import { Badge, ErrorText, PageHeader, Spinner, useFeedback } from "../components/ui";
 import { api, formatDate, qs, requestStepUp, type AuditItem, type Page } from "../lib/api";
 import { useCan } from "../lib/session";
 
 const columns: Column<AuditItem>[] = [
   { key: "time", header: "When", render: (a) => formatDate(a.occurredAt), width: "170px" },
-  { key: "actor", header: "Who", render: (a) => (a.actor.type === "staff" ? a.actor.label : `${a.actor.type}${a.actor.label ? `: ${a.actor.label}` : ""}`) },
-  { key: "action", header: "Action", render: (a) => <code>{a.action}</code> },
+  { key: "actor", header: "Who", render: (a) => (a.actor.type === "staff" ? <strong>{a.actor.label}</strong> : <Badge tone="neutral">{`${a.actor.type}${a.actor.label ? `: ${a.actor.label}` : ""}`}</Badge>) },
+  { key: "action", header: "Action", render: (a) => <code className="audit-action">{a.action}</code> },
   { key: "entity", header: "Record", render: (a) => (a.entity.type ? `${a.entity.type} #${a.entity.id}` : "") },
-  { key: "ip", header: "IP", render: (a) => a.ip },
+  { key: "ip", header: "IP", render: (a) => <span className="muted">{a.ip}</span> },
 ];
 
 export function AuditLog() {
@@ -28,7 +29,11 @@ export function AuditLog() {
     queryFn: () => api.get<Page<AuditItem>>(`/api/staff/audit${qs(params)}`),
     placeholderData: (prev) => prev,
   });
-  const verify = useMutation({ mutationFn: () => api.post<{ ok: boolean; checked: number; brokenAtId: number | null; reason: string | null }>("/api/staff/audit/verify") });
+  const { toast } = useFeedback();
+  const verify = useMutation({
+    mutationFn: () => api.post<{ ok: boolean; checked: number; brokenAtId: number | null; reason: string | null }>("/api/staff/audit/verify"),
+    onSuccess: (r) => toast(r.ok ? `Audit chain intact: ${r.checked.toLocaleString()} entries checked.` : `Audit chain broken at entry ${r.brokenAtId}.`, r.ok ? "good" : "bad"),
+  });
   const exportCsv = useMutation({
     mutationFn: async () => {
       const download = () => fetch(`/api/staff/audit/export${qs(params)}`, { credentials: "same-origin" });
@@ -54,34 +59,34 @@ export function AuditLog() {
 
   return (
     <>
-      <h1>Audit log</h1>
-      <p className="muted">Every sign-in, permission change and staff action is recorded here. Entries cannot be edited or deleted, and each one is chained to the one before it.</p>
-      <div className="grid-toolbar">
-        <label className="inline-field">
-          From <input className="input" type="date" value={from} onChange={(e) => setFrom(e.target.value)} />
-        </label>
-        <label className="inline-field">
-          To <input className="input" type="date" value={to} onChange={(e) => setTo(e.target.value)} />
-        </label>
-        {can("audit.verify") && (
-          <button type="button" className="button" onClick={() => verify.mutate()} disabled={verify.isPending}>
-            Verify chain
-          </button>
-        )}
-        {can("audit.export") && (
-          <button type="button" className="button" onClick={() => exportCsv.mutate()} disabled={exportCsv.isPending}>
-            Export CSV
-          </button>
-        )}
-        {verify.data &&
+      <PageHeader
+        title="Audit log"
+        description="Every sign-in, permission change and staff action is recorded here. Entries cannot be edited or deleted, and each one is chained to the one before it."
+        badge={
+          verify.data &&
           (verify.data.ok ? (
-            <Badge tone="good">Intact: {verify.data.checked} entries checked</Badge>
+            <Badge tone="good">Chain intact</Badge>
           ) : (
             <Badge tone="bad">
               Broken at entry {verify.data.brokenAtId}: {verify.data.reason}
             </Badge>
-          ))}
-      </div>
+          ))
+        }
+        actions={
+          <>
+            {can("audit.verify") && (
+              <button type="button" className="button" onClick={() => verify.mutate()} disabled={verify.isPending}>
+                {verify.isPending ? <Spinner /> : verify.data && !verify.data.ok ? <ShieldAlert size={16} /> : <ShieldCheck size={16} />} Verify chain
+              </button>
+            )}
+            {can("audit.export") && (
+              <button type="button" className="button" onClick={() => exportCsv.mutate()} disabled={exportCsv.isPending}>
+                {exportCsv.isPending ? <Spinner /> : <Download size={16} />} Export CSV
+              </button>
+            )}
+          </>
+        }
+      />
       <ErrorText error={verify.error ?? exportCsv.error} />
       <DataGrid
         columns={columns}
@@ -120,6 +125,14 @@ export function AuditLog() {
               </p>
             </div>
           ) : null
+        }
+        toolbar={
+          <span className="inline-field">
+            <CalendarRange size={16} />
+            <input className="input input-small" type="date" aria-label="From date" value={from} onChange={(e) => setFrom(e.target.value)} />
+            <span>to</span>
+            <input className="input input-small" type="date" aria-label="To date" value={to} onChange={(e) => setTo(e.target.value)} />
+          </span>
         }
         filters={[
           {

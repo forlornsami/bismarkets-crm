@@ -1,4 +1,6 @@
+import { ArrowDown, ArrowUp, ArrowUpDown, ChevronLeft, ChevronRight, Inbox, Search, X } from "lucide-react";
 import type { ReactNode } from "react";
+import { EmptyState } from "./ui";
 
 export interface Column<T> {
   key: string;
@@ -43,40 +45,45 @@ interface Props<T> {
   error?: unknown;
   toolbar?: ReactNode;
   expanded?: (row: T) => ReactNode | null;
+  emptyText?: string;
 }
 
 /** Server-side grid: search, dropdown filters, sortable headers and pagination all round-trip to the API. */
 export function DataGrid<T>(props: Props<T>) {
   const { columns, rows, total, pages, state, onChange, rowKey, onRowClick, filters = [], loading, error } = props;
   const set = (patch: Partial<GridState>) => onChange({ ...state, page: 1, ...patch });
-  const sortBy = (key: string) =>
-    set({ sort: key, dir: state.sort === key && state.dir === "desc" ? "asc" : "desc" });
+  const sortBy = (key: string) => set({ sort: key, dir: state.sort === key && state.dir === "desc" ? "asc" : "desc" });
   const first = total === 0 ? 0 : (state.page - 1) * state.pageSize + 1;
   const last = Math.min(total, state.page * state.pageSize);
+  const filtered = Boolean(state.q) || Object.values(state.filters).some(Boolean);
 
   return (
     <div className="grid">
       <div className="grid-toolbar">
         {props.searchPlaceholder !== undefined && (
-          <input
-            type="search"
-            className="input grid-search"
-            placeholder={props.searchPlaceholder}
-            defaultValue={state.q ?? ""}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") set({ q: (e.target as HTMLInputElement).value.trim() || undefined });
-            }}
-            onBlur={(e) => {
-              const q = e.target.value.trim() || undefined;
-              if (q !== state.q) set({ q });
-            }}
-            aria-label="Search"
-          />
+          <span className="input-icon grid-search">
+            <Search size={16} />
+            <input
+              key={state.q ?? ""}
+              type="search"
+              className="input input-small"
+              placeholder={props.searchPlaceholder}
+              defaultValue={state.q ?? ""}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") set({ q: (e.target as HTMLInputElement).value.trim() || undefined });
+              }}
+              onBlur={(e) => {
+                const q = e.target.value.trim() || undefined;
+                if (q !== state.q) set({ q });
+              }}
+              aria-label="Search"
+            />
+          </span>
         )}
         {filters.map((f) => (
           <select
             key={f.key}
-            className="input grid-filter"
+            className="input input-small filter-chip"
             aria-label={f.label}
             value={state.filters[f.key] ?? ""}
             onChange={(e) => set({ filters: { ...state.filters, [f.key]: e.target.value } })}
@@ -89,19 +96,28 @@ export function DataGrid<T>(props: Props<T>) {
             ))}
           </select>
         ))}
+        {filtered && (
+          <button type="button" className="button button-ghost button-small" onClick={() => set({ q: undefined, filters: {} })}>
+            <X size={14} /> Clear
+          </button>
+        )}
         <div className="grid-toolbar-end">{props.toolbar}</div>
       </div>
-      {Boolean(error) && <p className="error-text">{error instanceof Error ? error.message : "Could not load data."}</p>}
+      {Boolean(error) && (
+        <p className="error-text grid-error" role="alert">
+          {error instanceof Error ? error.message : "Could not load data."}
+        </p>
+      )}
       <div className="grid-scroll">
         <table className="table">
           <thead>
             <tr>
               {columns.map((c) => (
-                <th key={c.key} style={c.width ? { width: c.width } : undefined}>
+                <th key={c.key} style={c.width ? { width: c.width } : undefined} aria-sort={c.sortable && state.sort === c.key ? (state.dir === "asc" ? "ascending" : "descending") : undefined}>
                   {c.sortable ? (
-                    <button type="button" className="sort-button" onClick={() => sortBy(c.key)} aria-sort={state.sort === c.key ? (state.dir === "asc" ? "ascending" : "descending") : "none"}>
+                    <button type="button" className="sort-button" onClick={() => sortBy(c.key)}>
                       {c.header}
-                      <span className="sort-mark">{state.sort === c.key ? (state.dir === "asc" ? "▲" : "▼") : ""}</span>
+                      {state.sort === c.key ? state.dir === "asc" ? <ArrowUp size={13} /> : <ArrowDown size={13} /> : <ArrowUpDown size={13} opacity={0.4} />}
                     </button>
                   ) : (
                     c.header
@@ -114,7 +130,14 @@ export function DataGrid<T>(props: Props<T>) {
             {rows?.map((row) => {
               const extra = props.expanded?.(row);
               return [
-                <tr key={rowKey(row)} className={onRowClick ? "row-link" : undefined} onClick={onRowClick ? () => onRowClick(row) : undefined}>
+                <tr
+                  key={rowKey(row)}
+                  className={onRowClick ? "row-link" : undefined}
+                  onClick={onRowClick ? () => onRowClick(row) : undefined}
+                  onKeyDown={onRowClick ? (e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), onRowClick(row)) : undefined}
+                  tabIndex={onRowClick ? 0 : undefined}
+                  aria-expanded={props.expanded ? Boolean(extra) : undefined}
+                >
                   {columns.map((c) => (
                     <td key={c.key}>{c.render(row)}</td>
                   ))}
@@ -129,40 +152,48 @@ export function DataGrid<T>(props: Props<T>) {
             {rows && rows.length === 0 && (
               <tr>
                 <td colSpan={columns.length} className="empty">
-                  Nothing matches these filters.
+                  <EmptyState icon={<Inbox size={36} />} title={filtered ? "No matches" : "Nothing here yet"}>
+                    {filtered ? "Try a different search or clear the filters." : props.emptyText}
+                  </EmptyState>
                 </td>
               </tr>
             )}
-            {!rows && loading && (
-              <tr>
-                <td colSpan={columns.length} className="empty">
-                  Loading…
-                </td>
-              </tr>
-            )}
+            {!rows &&
+              loading &&
+              Array.from({ length: 6 }, (_, i) => (
+                <tr key={`sk-${i}`}>
+                  {columns.map((c) => (
+                    <td key={c.key}>
+                      <span className="skeleton" style={{ width: `${50 + ((i * 17 + c.key.length * 7) % 40)}%` }} />
+                    </td>
+                  ))}
+                </tr>
+              ))}
           </tbody>
         </table>
       </div>
       <div className="grid-footer">
         <span>
-          {first}–{last} of {total}
+          {total === 0 ? "No results" : `Showing ${first.toLocaleString()}–${last.toLocaleString()} of ${total.toLocaleString()}`}
         </span>
-        <select className="input input-small" aria-label="Rows per page" value={state.pageSize} onChange={(e) => set({ pageSize: Number(e.target.value) })}>
-          {[10, 25, 50, 100].map((n) => (
-            <option key={n} value={n}>
-              {n} per page
-            </option>
-          ))}
-        </select>
-        <button type="button" className="button button-small" disabled={state.page <= 1} onClick={() => onChange({ ...state, page: state.page - 1 })}>
-          Previous
-        </button>
-        <span>
-          Page {state.page} of {pages}
-        </span>
-        <button type="button" className="button button-small" disabled={state.page >= pages} onClick={() => onChange({ ...state, page: state.page + 1 })}>
-          Next
-        </button>
+        <div className="grid-footer-pages">
+          <select className="input input-small" aria-label="Rows per page" value={state.pageSize} onChange={(e) => set({ pageSize: Number(e.target.value) })}>
+            {[10, 25, 50, 100].map((n) => (
+              <option key={n} value={n}>
+                {n} per page
+              </option>
+            ))}
+          </select>
+          <button type="button" className="icon-button" aria-label="Previous page" disabled={state.page <= 1} onClick={() => onChange({ ...state, page: state.page - 1 })}>
+            <ChevronLeft size={18} />
+          </button>
+          <span>
+            Page {state.page} of {Math.max(pages, 1)}
+          </span>
+          <button type="button" className="icon-button" aria-label="Next page" disabled={state.page >= pages} onClick={() => onChange({ ...state, page: state.page + 1 })}>
+            <ChevronRight size={18} />
+          </button>
+        </div>
       </div>
     </div>
   );

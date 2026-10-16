@@ -63,4 +63,16 @@ and money controls on top of the same foundations.
 - Logs never contain cookies, auth headers, request bodies or query strings.
 - Strict security headers: a CSP allowing only the CRM's own scripts and styles,
   no framing, HSTS, no referrer.
-- API responses are never cached.
+- API responses are never cached, except uploaded logos, whose URLs carry their
+  content hash.
+
+## Branding uploads
+
+- Logos and the browser icon can be changed under Branding by roles with
+  `settings.manage`, after a fresh 2FA code. Every change and reset is audited.
+- Only PNG, JPEG and WebP up to 1 MB are accepted. The type is read from the
+  file's own bytes and must match what the browser declared; SVG is refused
+  because it can carry scripts.
+- Files are stored in MySQL and served with `Content-Security-Policy:
+  default-src 'none'; sandbox`, `nosniff` and `inline`, so a file can never run
+  as a page.
