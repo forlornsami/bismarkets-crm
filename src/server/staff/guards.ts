@@ -36,9 +36,19 @@ export function assertHoldsAll(actor: StaffContext, permissions: Permission[]) {
   }
 }
 
-/** Only a Super Admin may change another Super Admin's account. */
-export function assertCanManageTarget(actor: StaffContext, targetRoleSlug: string) {
-  if (targetRoleSlug === SUPER_ADMIN_SLUG && !actor.isSuperAdmin) throw forbidden("Only a Super Admin can change a Super Admin account.");
+/**
+ * Nobody can take over an account with more power than their own: changing
+ * another person's account (details, status, password, 2FA, sessions, picture)
+ * requires the actor to hold every permission of that person's role. Only a
+ * Super Admin may change another Super Admin's account.
+ */
+export async function assertCanManageTarget(conn: Conn, actor: StaffContext, target: { role_id: number; role_slug: string }) {
+  if (target.role_slug === SUPER_ADMIN_SLUG && !actor.isSuperAdmin) throw forbidden("Only a Super Admin can change a Super Admin account.");
+  const held = await loadPermissions(conn, target.role_id, target.role_slug);
+  const missing = [...held].filter((p) => !actor.permissions.has(p));
+  if (missing.length > 0) {
+    throw forbidden(`You cannot change an account with permissions you do not hold yourself: ${missing.slice(0, 5).join(", ")}${missing.length > 5 ? "…" : ""}`);
+  }
 }
 
 export async function activeSuperAdminCount(conn: Conn): Promise<number> {

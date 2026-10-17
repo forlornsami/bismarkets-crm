@@ -1,5 +1,5 @@
-import { AlertTriangle, ArrowLeft, Check, ChevronLeft, ChevronRight, Download, FileText, Info, Keyboard, Maximize2, RotateCcw, RotateCw, SkipForward, X, ZoomIn, ZoomOut } from "lucide-react";
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { AlertTriangle, ArrowLeft, Check, ChevronLeft, ChevronRight, Download, FileText, Info, Keyboard, Maximize2, Minimize2, RotateCcw, RotateCw, SkipForward, X, ZoomIn, ZoomOut } from "lucide-react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type ReactNode, type RefObject } from "react";
 import type { PDFDocumentProxy, RenderTask } from "pdfjs-dist";
 import { ApiError, api } from "../lib/api";
 import { Dialog, ErrorText, Spinner } from "./ui";
@@ -29,8 +29,8 @@ export interface ReviewWarning {
 
 const kb = (n: number) => (n > 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : `${Math.ceil(n / 1024)} KB`);
 const isPdf = (t: string) => t === "application/pdf";
-// HEIC is converted to JPEG when it is uploaded; only older uploads are still HEIC, which browsers cannot draw.
-const isImage = (t: string) => t.startsWith("image/") && t !== "image/heic" && t !== "image/heif";
+// HEIC is converted to JPEG when it is uploaded, and the server sends older HEIC uploads as JPEG too.
+const isImage = (t: string) => t.startsWith("image/");
 // Only fields that take text count as typing; a focused checkbox must not swallow the shortcuts.
 const TEXT_ENTRY = 'textarea, select, [contenteditable=""], [contenteditable="true"], input:not([type=checkbox]):not([type=radio]):not([type=button]):not([type=submit]):not([type=reset])';
 const typing = (e: KeyboardEvent) => {
@@ -92,9 +92,11 @@ export function useShortcutsSetting(): [boolean, (on: boolean) => void] {
 /**
  * Keyboard shortcuts that stay quiet while the reviewer is typing, while any
  * dialog (such as the 2FA prompt) is open, and, for letters, digits and
- * symbols, when the reviewer has switched single-key shortcuts off.
+ * symbols, when the reviewer has switched single-key shortcuts off. While
+ * something is full screen, only shortcuts whose `scope` is inside it work, so
+ * nothing hidden behind it (such as the decision) is changed unseen.
  */
-export function useShortcuts(map: Record<string, (e: KeyboardEvent) => void>, enabled = true) {
+export function useShortcuts(map: Record<string, (e: KeyboardEvent) => void>, enabled = true, scope?: RefObject<HTMLElement | null>) {
   const ref = useRef(map);
   ref.current = map;
   const [on] = useShortcutsSetting();
@@ -105,6 +107,8 @@ export function useShortcuts(map: Record<string, (e: KeyboardEvent) => void>, en
     const onKey = (e: KeyboardEvent) => {
       if (e.ctrlKey || e.metaKey || e.altKey || e.isComposing || e.defaultPrevented) return;
       if (document.querySelector("dialog[open]")) return;
+      const full = document.fullscreenElement;
+      if (full && !(scope?.current && full.contains(scope.current))) return;
       if (e.key.length === 1 && !onRef.current) return;
       if (typing(e) && e.key !== "Escape") return;
       const fn = ref.current[e.key] ?? ref.current[e.key.toLowerCase()];
@@ -135,7 +139,8 @@ const loadPdfjs = () =>
       throw e;
     }));
 
-type Opened = { kind: "image"; bitmap: ImageBitmap } | { kind: "pdf"; doc: PDFDocumentProxy } | { kind: "failed"; message: string };
+/** `fileProblem`: the file itself cannot be read (not the connection), so rejecting it is offered. */
+type Opened = { kind: "image"; bitmap: ImageBitmap } | { kind: "pdf"; doc: PDFDocumentProxy } | { kind: "failed"; message: string; fileProblem: boolean };
 
 const dispose = (o: Opened) => {
   if (o.kind === "image") o.bitmap.close();
@@ -147,10 +152,13 @@ const dispose = (o: Opened) => {
  * records as "viewed", so this runs only for the page on screen, never ahead.
  */
 async function openFile(file: ReviewFile): Promise<Opened> {
+  // Only a failure while reading the file itself says the file is bad; fetching it or loading pdf.js is the connection.
+  let reading = false;
   try {
     const data = await api.bytes(file.url);
     if (isPdf(file.type)) {
       const lib = await loadPdfjs();
+      reading = true;
       // Drawn to a canvas only: no text, annotation, form or script layer, and
       // nothing in the file is ever run as code. pdf.js 6 dropped eval entirely;
       // isEvalSupported stays false for any older build.
@@ -166,20 +174,17 @@ async function openFile(file: ReviewFile): Promise<Opened> {
       } as Parameters<typeof lib.getDocument>[0];
       return { kind: "pdf", doc: await lib.getDocument(options).promise };
     }
-    return { kind: "image", bitmap: await createImageBitmap(new Blob([data], { type: file.type }), { imageOrientation: "from-image" }) };
+    reading = true;
+    return { kind: "image", bitmap: await createImageBitmap(new Blob([data], { type: file.type === "image/heic" ? "image/jpeg" : file.type }), { imageOrientation: "from-image" }) };
   } catch (e) {
     const name = (e as { name?: string })?.name;
-    const message =
-      name === "PasswordException"
-        ? "This PDF is protected with a password."
-        : name === "InvalidPDFException"
-          ? "This file is damaged or is not a real PDF."
-          : e instanceof ApiError
-            ? e.message
-            : e instanceof Error && /fetch|network/i.test(e.message)
-              ? "The document could not be loaded. Check your connection and try again."
-              : "The browser could not read this file.";
-    return { kind: "failed", message };
+    const failed = (message: string, fileProblem: boolean): Opened => ({ kind: "failed", message, fileProblem });
+    if (name === "PasswordException") return failed("This PDF is protected with a password.", true);
+    if (name === "InvalidPDFException") return failed("This file is damaged or is not a real PDF.", true);
+    if (e instanceof ApiError) return failed(e.message, e.code === "UNREADABLE");
+    // pdf.js starts its worker when the first file is read; a worker that fails to load is not the file's fault.
+    if (!reading || (e instanceof Error && /worker/i.test(e.message))) return failed("The document could not be loaded. Check your connection and try again.", false);
+    return failed("The browser could not read this file.", true);
   }
 }
 
@@ -193,6 +198,7 @@ function PageCanvas({
 }: { opened: Exclude<Opened, { kind: "failed" }>; page: number; turn: number; zoom: number; box: { w: number; h: number }; label: string; onDrawn?: (page: number) => void; fallback?: ReactNode }) {
   const ref = useRef<HTMLCanvasElement>(null);
   const [error, setError] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState(0);
   const drawn = useRef(onDrawn);
   drawn.current = onDrawn;
   const rotation = ((turn % 360) + 360) % 360;
@@ -250,20 +256,27 @@ function PageCanvas({
         off.width = off.height = 0;
         drawn.current?.(page);
       } catch (e) {
-        if (!cancelled && (e as { name?: string })?.name !== "RenderingCancelledException") setError("This page could not be drawn.");
+        if (!cancelled && (e as { name?: string })?.name !== "RenderingCancelledException") setError(`Page ${page} could not be shown.`);
       }
     })();
     return () => {
       cancelled = true;
       task?.cancel();
     };
-  }, [opened, page, rotation, zoom, box.w, box.h]);
+  }, [opened, page, rotation, zoom, box.w, box.h, attempt]);
   return (
     <>
       {error && (
-        <p className="viewer-note error-text">
-          {error} {fallback}
-        </p>
+        <div className="viewer-file">
+          <AlertTriangle size={40} />
+          <strong>{error}</strong>
+          <span className="actions">
+            <button type="button" className="button" onClick={() => setAttempt((a) => a + 1)}>
+              Try again
+            </button>
+            {fallback}
+          </span>
+        </div>
       )}
       {/* Kept while the error shows, so the next page, zoom or turn draws again. */}
       <canvas ref={ref} className="viewer-page" role="img" aria-label={label} style={error ? { display: "none" } : undefined} />
@@ -273,12 +286,13 @@ function PageCanvas({
 
 /**
  * Large document viewer: photos and PDFs drawn to fit, with zoom, rotate,
- * front/back and page switching. Tabs show which documents are not opened yet.
- * A photo counts as opened once it is on screen (`onViewed`); a PDF page by
- * page (`onPageViewed`), or as a whole when it is downloaded.
+ * full screen, front/back and page switching. Tabs show which documents are not
+ * opened yet. A photo counts as opened once it is on screen (`onViewed`); a PDF
+ * page by page (`onPageViewed`). Documents are only ever drawn inside the page:
+ * nothing is offered to open in a tab or save, except the audited download.
  */
 export function DocumentViewer({
-  files, viewed, pagesSeen, onViewed, onPageViewed, banner,
+  files, viewed, pagesSeen, onViewed, onPageViewed, onDownload, onUnreadable, banner,
 }: {
   files: ReviewFile[];
   viewed?: ReadonlySet<number>;
@@ -286,6 +300,10 @@ export function DocumentViewer({
   pagesSeen?: ReadonlyMap<number, ReadonlySet<number>>;
   onViewed?: (fileId: number) => void;
   onPageViewed?: (fileId: number, page: number, pages: number) => void;
+  /** Saves the original file; given only to staff who may download documents. */
+  onDownload?: (file: ReviewFile) => void;
+  /** Starts rejecting the submission as unreadable, offered when a document cannot be shown. */
+  onUnreadable?: () => void;
   banner?: ReactNode;
 }) {
   const [index, setIndex] = useState(0);
@@ -295,7 +313,10 @@ export function DocumentViewer({
   const [opened, setOpened] = useState<Record<number, Opened>>({});
   const [box, setBox] = useState({ w: 0, h: 0 });
   const [shortcutsOn] = useShortcutsSetting();
+  const root = useRef<HTMLDivElement>(null);
   const stage = useRef<HTMLDivElement>(null);
+  const [full, setFull] = useState(false);
+  const canFullscreen = typeof document !== "undefined" && document.fullscreenEnabled;
   const loading = useRef(new Set<number>());
   const all = useRef(opened);
   all.current = opened;
@@ -329,6 +350,15 @@ export function DocumentViewer({
     setZoom(1);
     setTurn(0);
   }, [file?.id]);
+  useEffect(() => {
+    const onChange = () => setFull(!!root.current && document.fullscreenElement === root.current);
+    document.addEventListener("fullscreenchange", onChange);
+    return () => document.removeEventListener("fullscreenchange", onChange);
+  }, []);
+  const toggleFull = () => {
+    if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined);
+    else void root.current?.requestFullscreen().catch(() => undefined);
+  };
   useEffect(() => {
     const el = stage.current;
     if (!el) return;
@@ -375,7 +405,8 @@ export function DocumentViewer({
     "]": () => setTurn((t) => t + 90),
     ArrowRight: () => go(1),
     ArrowLeft: () => go(-1),
-  });
+    f: () => canFullscreen && toggleFull(),
+  }, true, root);
 
   // Drag to move around a zoomed page with the mouse; touch screens scroll natively.
   const drag = useRef<{ x: number; y: number; left: number; top: number } | null>(null);
@@ -397,20 +428,26 @@ export function DocumentViewer({
 
   if (!file) return <div className="viewer viewer-empty muted">No documents were attached.</div>;
   const drawable = current && current.kind !== "failed";
-  // A download counts as opening every page: the reviewer reads the whole file elsewhere.
-  const downloadUrl = `${file.url}?download=1`;
-  const download = (text: ReactNode, hint: ReactNode, icon: ReactNode = <FileText size={44} />) => (
-    <a className="viewer-file" href={downloadUrl} download onClick={() => onViewed?.(file.id)}>
-      {icon}
-      <strong>{text}</strong>
-      <span className="muted">{hint}</span>
-      <span className="button">
-        <Download size={15} /> Download ({kb(file.bytes)})
-      </span>
-    </a>
+  const rejectButton = onUnreadable && (
+    <button
+      type="button"
+      className="button button-danger"
+      onClick={() => {
+        // The reason is filled in beside the document, so leave full screen first.
+        if (full) toggleFull();
+        onUnreadable();
+      }}
+    >
+      <X size={15} /> Reject as unreadable
+    </button>
+  );
+  const saveButton = onDownload && (
+    <button type="button" className="button button-ghost" onClick={() => onDownload(file)}>
+      <Download size={15} /> Download the original
+    </button>
   );
   return (
-    <div className="viewer">
+    <div className="viewer" ref={root}>
       <div className="viewer-bar">
         {files.length > 1 && (
           <div className="viewer-pages" role="tablist" aria-label="Documents">
@@ -480,14 +517,15 @@ export function DocumentViewer({
             <button type="button" className="icon-button" title="Turn right (])" aria-label="Turn right" onClick={() => setTurn((t) => t + 90)}>
               <RotateCw size={17} />
             </button>
-            {isPdf(file.type) ? (
-              <a className="icon-button" title="Download the original PDF" aria-label="Download the original PDF" href={downloadUrl} download onClick={() => onViewed?.(file.id)}>
+            {canFullscreen && (
+              <button type="button" className="icon-button" title={full ? "Leave full screen (F)" : "Full screen (F)"} aria-label={full ? "Leave full screen" : "Full screen"} onClick={toggleFull}>
+                {full ? <Minimize2 size={17} /> : <Maximize2 size={17} />}
+              </button>
+            )}
+            {onDownload && (
+              <button type="button" className="icon-button" title="Download the original (recorded in the audit log)" aria-label="Download the original" onClick={() => onDownload(file)}>
                 <Download size={17} />
-              </a>
-            ) : (
-              <a className="icon-button" title="Open full size in a new tab" aria-label="Open full size in a new tab" href={file.url} target="_blank" rel="noreferrer">
-                <Maximize2 size={17} />
-              </a>
+              </button>
             )}
           </span>
         )}
@@ -502,9 +540,21 @@ export function DocumentViewer({
         onPointerMove={onPointerMove}
         onPointerUp={endDrag}
         onPointerCancel={endDrag}
+        // No "Save image as" on a drawn page: originals leave the CRM only through the audited download.
+        onContextMenu={(e) => e.preventDefault()}
       >
         {!isPdf(file.type) && !isImage(file.type) ? (
-          download(file.type === "image/heic" ? "HEIC photo" : "Document", "This older upload is in a format browsers cannot show. Download it to view.")
+          <div className="viewer-file">
+            <FileText size={44} />
+            <strong>This type of file cannot be shown here</strong>
+            <span className="muted">Ask the client for a photo or a PDF instead.</span>
+            {(rejectButton || saveButton) && (
+              <span className="actions">
+                {rejectButton}
+                {saveButton}
+              </span>
+            )}
+          </div>
         ) : !current ? (
           <div className="viewer-note muted">
             <Spinner /> Opening the document…
@@ -512,15 +562,17 @@ export function DocumentViewer({
         ) : current.kind === "failed" ? (
           <div className="viewer-file">
             <AlertTriangle size={40} />
-            <strong>This document could not be shown here</strong>
-            <span className="muted">{current.message}</span>
-            <span className="actions actions-left">
+            <strong>This document could not be shown</strong>
+            <span className="muted">
+              {current.message}
+              {current.fileProblem && rejectButton ? " If it still does not open, reject it so the client sends it again." : ""}
+            </span>
+            <span className="actions">
               <button type="button" className="button" onClick={() => retry(file.id)}>
                 Try again
               </button>
-              <a className="button button-ghost" href={downloadUrl} download onClick={() => onViewed?.(file.id)}>
-                <Download size={15} /> Download
-              </a>
+              {current.fileProblem && rejectButton}
+              {saveButton}
             </span>
           </div>
         ) : (
@@ -534,16 +586,15 @@ export function DocumentViewer({
             label={pages > 1 ? `${file.label}, page ${page} of ${pages}` : file.label}
             onDrawn={current.kind === "pdf" ? (p) => pageViewedRef.current?.(file.id, p, pages) : undefined}
             fallback={
-              current.kind === "pdf" && (
-                <a className="button button-ghost button-small" href={downloadUrl} download onClick={() => onViewed?.(file.id)}>
-                  <Download size={15} /> Download the PDF
-                </a>
-              )
+              <>
+                {rejectButton}
+                {saveButton}
+              </>
             }
           />
         )}
       </div>
-      {shortcutsOn && <p className="muted tight viewer-hint shortcut-hint">← → pages · + − zoom · 0 fit · [ ] turn · double-click to zoom, drag to move</p>}
+      {shortcutsOn && <p className="muted tight viewer-hint shortcut-hint">← → pages · + − zoom · 0 fit · [ ] turn · F full screen · double-click to zoom, drag to move</p>}
     </div>
   );
 }
@@ -585,6 +636,8 @@ export interface ReviewDecisionProps {
   /** What the reviewer has not opened yet, ready to read ("the back", "page 2 of the document"); approving waits for them. */
   unopened?: string[];
   approveLabel?: string;
+  /** Opens the rejection with this reason filled in; each new `key` opens it again. */
+  rejectWith?: { reason: string; key: number } | null;
   onApprove: (ticked: string[], internalNote?: string) => void;
   onReject: (reason: string, ticked: string[], internalNote?: string) => void;
   onSkip?: () => void;
@@ -614,6 +667,13 @@ export function ReviewDecision(props: ReviewDecisionProps) {
   useEffect(() => {
     if (rejecting) reasonRef.current?.focus();
   }, [rejecting]);
+  const rejectWith = props.rejectWith;
+  useEffect(() => {
+    if (!rejectWith || !canDecide) return;
+    setReason(rejectWith.reason);
+    setRejecting(true);
+    reasonRef.current?.focus();
+  }, [rejectWith?.key]);
   const allTicked = checklist.every((c) => ticked.includes(c.key));
   const mayApprove = canDecide && !props.approveBlocked && unopened.length === 0;
   const internalNote = note.trim() || undefined;
@@ -754,6 +814,7 @@ export function ReviewDecision(props: ReviewDecisionProps) {
           <dt><kbd>←</kbd> <kbd>→</kbd></dt><dd>Pages, front and back of the document</dd>
           <dt><kbd>+</kbd> <kbd>−</kbd> <kbd>0</kbd></dt><dd>Zoom in, out, fit to the screen</dd>
           <dt><kbd>[</kbd> <kbd>]</kbd></dt><dd>Turn left or right</dd>
+          <dt><kbd>F</kbd></dt><dd>Show the document full screen, or leave full screen</dd>
           <dt><kbd>Esc</kbd></dt><dd>Back to the queue</dd>
         </dl>
       </Dialog>

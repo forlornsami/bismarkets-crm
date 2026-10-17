@@ -3,7 +3,7 @@ import { CalendarRange, Download, ShieldCheck, ShieldAlert } from "lucide-react"
 import { useState } from "react";
 import { DataGrid, gridQuery, type Column, type GridState } from "../components/DataGrid";
 import { Badge, ErrorText, PageHeader, Spinner, useFeedback } from "../components/ui";
-import { api, formatDate, qs, requestStepUp, type AuditItem, type Page } from "../lib/api";
+import { api, formatDate, qs, type AuditItem, type Page } from "../lib/api";
 import { actionLabel } from "../lib/audit-labels";
 import { useCan } from "../lib/session";
 
@@ -45,24 +45,7 @@ export function AuditLog() {
     onSuccess: (r) => toast(r.ok ? `Audit chain intact: ${r.checked.toLocaleString()} entries checked.` : `Audit chain broken at entry ${r.brokenAtId}.`, r.ok ? "good" : "bad"),
   });
   const exportCsv = useMutation({
-    mutationFn: async () => {
-      const download = () => fetch(`/api/staff/audit/export${qs(params)}`, { credentials: "same-origin" });
-      let res = await download();
-      if (res.status === 403) {
-        const body = await res.clone().json().catch(() => ({}));
-        if (body?.error?.code === "STEP_UP_REQUIRED" && (await requestStepUp())) res = await download();
-      }
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body?.error?.message ?? "Export failed.");
-      }
-      const url = URL.createObjectURL(await res.blob());
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `audit-${new Date().toISOString().slice(0, 10)}.csv`;
-      a.click();
-      URL.revokeObjectURL(url);
-    },
+    mutationFn: () => api.saveFile(`/api/staff/audit/export${qs(params)}`, `audit-${new Date().toISOString().slice(0, 10)}.csv`),
   });
 
   const actionPrefixes = [...new Set((actions.data?.items ?? []).map((a) => `${a.split(".")[0]}.`))];

@@ -116,7 +116,7 @@ export function staffUsersRouter(deps: AppDeps): Router {
     const actor = staffOf(req);
     return transaction(db, async (conn) => {
       const target = await loadTarget(conn, staffId, true);
-      if (staffId !== actor.id) assertCanManageTarget(actor, target.role_slug);
+      if (staffId !== actor.id) await assertCanManageTarget(conn, actor, target);
       if (upload) {
         const saved = await savePicture(conn, "staff", staffId, uploadedImage(req));
         await writeAudit(conn, auditContext(req, staffActor(actor)), {
@@ -213,7 +213,7 @@ export function staffUsersRouter(deps: AppDeps): Router {
       );
       const updated = await transaction(db, async (conn) => {
         const before = await loadTarget(conn, staffId, true);
-        assertCanManageTarget(actor, before.role_slug);
+        if (staffId !== actor.id) await assertCanManageTarget(conn, actor, before);
         if (body.roleId !== undefined && body.roleId !== before.role_id) {
           if (staffId === actor.id) throw forbidden("You cannot change your own role.");
           const role = await getRole(conn, body.roleId);
@@ -256,7 +256,7 @@ export function staffUsersRouter(deps: AppDeps): Router {
       if (staffId === actor.id) throw forbidden("You cannot change the status of your own account.");
       const updated = await transaction(db, async (conn) => {
         const before = await loadTarget(conn, staffId, true);
-        assertCanManageTarget(actor, before.role_slug);
+        await assertCanManageTarget(conn, actor, before);
         if (before.status === status) return before;
         if (status === "disabled" && before.role_slug === "super_admin" && (await activeSuperAdminCount(conn)) <= 1) {
           throw badRequest("This is the last active Super Admin and cannot be disabled.");
@@ -286,7 +286,7 @@ export function staffUsersRouter(deps: AppDeps): Router {
         if (staffId === actor.id && action !== "staff.sessions_revoked") throw forbidden("Use your own account settings for this.");
         const extra = await transaction(db, async (conn) => {
           const target = await loadTarget(conn, staffId, true);
-          assertCanManageTarget(actor, target.role_slug);
+          if (staffId !== actor.id) await assertCanManageTarget(conn, actor, target);
           const result = await work(staffId, conn);
           await revokeStaffSessions(conn, staffId, action.replace("staff.", ""), staffId === actor.id ? actor.sessionId : undefined);
           await writeAudit(conn, auditContext(req, staffActor(actor)), { action, entityType: "staff", entityId: staffId });

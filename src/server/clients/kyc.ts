@@ -352,6 +352,9 @@ const ID_CARD_BACK_CHECKLIST = [
 export const checklistFor = (category: KycCategory, subType: number) =>
   category === "address" && subType === ID_CARD_BACK ? ID_CARD_BACK_CHECKLIST : KYC_CHECKLIST[category];
 
+/** For a document the review screen cannot show at all. */
+export const KYC_UNREADABLE_REASON = "The file could not be opened. Please upload it again as a clear photo or a PDF.";
+
 /** Ready-made rejection reasons. The reviewer can edit them before sending. */
 export const KYC_REJECT_REASONS: Record<KycCategory, string[]> = {
   identity: [
@@ -361,6 +364,7 @@ export const KYC_REJECT_REASONS: Record<KycCategory, string[]> = {
     "The name on the document does not match your profile.",
     "The date of birth does not match your profile.",
     "Please upload both the front and the back of the document.",
+    KYC_UNREADABLE_REASON,
   ],
   address: [
     "The document is older than 3 months. Please upload a recent one.",
@@ -368,5 +372,6 @@ export const KYC_REJECT_REASONS: Record<KycCategory, string[]> = {
     "The name on the document does not match your profile.",
     "The document is not readable. Please upload a clearer copy.",
     "This type of document is not accepted. Please choose one of the document types listed on your profile page.",
+    KYC_UNREADABLE_REASON,
   ],
 };

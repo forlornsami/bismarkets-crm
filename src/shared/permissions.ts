@@ -47,6 +47,7 @@ export const PERMISSION_GROUPS = {
     permissions: {
       "kyc.view": "View the KYC queue and each client's KYC status",
       "kyc.documents": "Open KYC submissions, documents and the client details they are checked against",
+      "kyc.download": "Download original KYC documents to this computer (needs a recent 2FA code; every download is recorded)",
       "kyc.decide": "Approve or reject KYC, and change a decision later",
       "kyc.upload": "Upload KYC documents on behalf of a client",
       "kyc.override": "Approve KYC without documents, and change client details already checked against documents",
@@ -184,6 +185,8 @@ const viewOnly = ALL_PERMISSIONS.filter(
 
 // System roles are seeded by `cli seed-roles`. Super Admin always holds every
 // permission and cannot be edited; the others can be adjusted by a Super Admin.
+// KYC documents are reviewed inside the CRM, so only a Super Admin downloads
+// them (kyc.download) unless they add it to a role.
 export const DEFAULT_ROLES: readonly DefaultRole[] = [
   {
     slug: "super_admin",
@@ -195,7 +198,7 @@ export const DEFAULT_ROLES: readonly DefaultRole[] = [
     slug: "admin",
     name: "Admin",
     description: "Runs the brokerage day to day; cannot change roles or MT5 server credentials.",
-    permissions: ALL_PERMISSIONS.filter((p) => !["role.manage", "mt5.servers", "settings.manage", "audit.export"].includes(p)),
+    permissions: ALL_PERMISSIONS.filter((p) => !["role.manage", "mt5.servers", "settings.manage", "audit.export", "kyc.download"].includes(p)),
   },
   {
     slug: "compliance",

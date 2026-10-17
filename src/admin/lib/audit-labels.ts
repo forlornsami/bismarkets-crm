@@ -30,6 +30,7 @@ const ACTION_LABEL: Record<string, string> = {
   "kyc.viewed": "KYC submission opened by staff",
   "kyc.document_viewed": "KYC document viewed by staff",
   "kyc.document_page_viewed": "KYC document page viewed by staff",
+  "kyc.document_downloaded": "KYC document downloaded by staff",
   "kyc.approved": "KYC document approved",
   "kyc.rejected": "KYC document rejected",
   "kyc.new_document_requested": "Approval withdrawn, new document requested",

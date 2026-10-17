@@ -67,6 +67,27 @@ describe.skipIf(!hasDb)("staff, roles and audit", () => {
     expect(editBoss.status).toBe(403);
   });
 
+  it("stops anyone taking over an account with more power than their own", async () => {
+    // A Super Admin gave a desk role kyc.download, which Admin does not hold.
+    await exec(env.db, "INSERT INTO roles (slug, name) VALUES ('document_desk', 'Document desk')");
+    await exec(
+      env.db,
+      "INSERT INTO role_permissions (role_id, permission) SELECT r.id, p.name FROM roles r JOIN (SELECT 'kyc.view' AS name UNION SELECT 'kyc.documents' UNION SELECT 'kyc.download') p WHERE r.slug = 'document_desk'",
+    );
+    await createStaff(env.db, "desk@bis.test", "document_desk");
+    const desk = (await one<{ id: number }>(env.db, "SELECT id FROM staff_users WHERE email = 'desk@bis.test'"))!.id;
+    await stepUp(env, admin);
+    const refused = "You cannot change an account with permissions you do not hold yourself: kyc.download";
+    for (const action of ["reset-password", "reset-2fa", "unlock", "revoke-sessions"]) {
+      expect((await post(admin, `/api/staff/users/${desk}/${action}`)).body.error.message).toBe(refused);
+    }
+    expect((await post(admin, `/api/staff/users/${desk}/status`, { status: "disabled" })).body.error.message).toBe(refused);
+    expect((await patch(admin, `/api/staff/users/${desk}`, { name: "Renamed" })).body.error.message).toBe(refused);
+    expect((await post(admin, "/api/staff/users", { email: "desk2@bis.test", name: "Desk Two", roleId: await roleId("document_desk") })).status).toBe(403);
+    // Accounts within the Admin's own power are still theirs to manage.
+    expect((await patch(admin, `/api/staff/users/${support.staffId}`, { name: "Support Agent" })).status).toBe(200);
+  });
+
   it("requires a fresh 2FA code for sensitive actions", async () => {
     const target = await one<{ id: number }>(env.db, "SELECT id FROM staff_users WHERE email = 'new.agent@bis.test'");
     const blocked = await post(boss, `/api/staff/users/${target!.id}/status`, { status: "disabled" });

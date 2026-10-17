@@ -42,6 +42,9 @@ and money controls on top of the same foundations.
 - Nobody can grant permissions they do not hold, edit their own role, change
   their own role, or touch a Super Admin unless they are one. The last active
   Super Admin cannot be disabled or demoted.
+- Nobody can take over an account with more power than their own: changing
+  another person's details, role, status, password, 2FA, sessions or picture
+  needs every permission of that person's role.
 - Sensitive actions need a fresh 2FA code (valid 5 minutes): disabling staff,
   resetting 2FA or passwords, signing people out, editing roles, exporting the
   audit log.
@@ -207,7 +210,7 @@ waiting marketing emails and is audited. Account emails are unaffected.
 - Frozen accounts may upload (a freeze pauses money, not verification); closed accounts and staff "view as client" sessions cannot.
 - Each file is checked by its bytes, not its name or declared type: only JPEG, PNG, WebP, HEIC and PDF, up to 10 MB each.
 - Photos are decoded and re-encoded before they are stored. That drops EXIF and XMP (GPS location, device), applies the camera's rotation, refuses decompression bombs over 50 megapixels and photos under 400 pixels on the short side. HEIC is converted to JPEG so every reviewer's browser shows it; the conversion runs in a worker thread, two at a time, so a large photo never blocks other requests. The original photo is not kept.
-- PDFs are stored as sent, but one that needs a password to open is refused. Bank statements with only owner restrictions (no password to open) are accepted.
+- PDFs are stored as sent once pdf.js opens every page of them. One that needs a password to open, one it cannot open (damaged, or not really a PDF) and one over 20 pages are refused with a message saying what to send instead, so every stored document can be read in the review screen. Bank statements with only owner restrictions (no password to open) are accepted.
 - The SHA-256 used for duplicate checks is taken from the file as sent.
 - At most 10 stored uploads per client per hour, checked before the body is read; failed attempts do not use them up (a looser 30 attempts an hour stops hammering). Throttled requests get `429` with `Retry-After`. A retry that repeats a pending upload exactly (same type, same files) is answered `201` without storing it twice.
 - A client can take back their own pending upload (`POST /api/kyc/withdraw`) until a reviewer opens it. The submission is kept as `withdrawn` for the record and audited as `kyc.withdrawn_by_client`. Uploads staff made for them cannot be taken back.
@@ -217,13 +220,14 @@ waiting marketing emails and is audited. Account emails are unaffected.
 
 - `kyc.view` gives the queue, the counts and each client's KYC status, scoped to assigned clients unless the role also has `client.view_all`.
 - `kyc.documents` is needed to open a submission, its documents and the profile details they are checked against (full name, date of birth and address; the phone number is not shown). Built-in roles with it: Super Admin, Admin, Compliance and Auditor. Sales and support roles do not have it.
-- Every opened submission and every document view is audited. Documents are served with `no-store`, `nosniff` and a sandboxing CSP. PDFs are sent as attachments and never opened by the browser's own viewer; the review screen draws them with pdf.js served from the CRM itself (no eval, no CDN).
+- Every opened submission and every document view is audited. Documents are served with `no-store`, `nosniff` and a sandboxing CSP, and only to the review screen's own requests, which carry an `X-CRM-Viewer` header: a link, a download, an image, a frame or the address bar cannot send it, so they are refused. The review screen draws photos and PDFs on a canvas inside the page (PDFs with pdf.js served from the CRM itself, no eval, no CDN), with zoom, rotate and full screen, and no "save image" menu. HEIC photos stored before uploads were converted are sent as JPEG, after the same size checks as an upload. Reviewing never needs a download; a document that cannot be shown offers "Reject as unreadable" with a ready-made reason. Whoever may open a document can still copy what is on screen; the audit log records who opened what.
+- Saving an original to a computer is its own permission, `kyc.download`. Only a Super Admin holds it unless they add it to a role. It needs a recent 2FA code, is audited as `kyc.document_downloaded`, and never counts as reviewing.
 - Warnings never name a client the reviewer could not open: a match outside their scope is shown as "another client".
 
 **Decisions.**
 
 - Approving or rejecting needs `kyc.decide`, `kyc.documents` and a fresh 2FA code. Changing a decision and asking for a new document need the same; claiming and "next" need the two permissions. A rejection needs a plain-text reason, which the client sees and is emailed. A decision can carry an internal note (plain text, at most 500 characters) that goes to the audit log and the decision history, never to the client.
-- Approving needs every checklist item ticked (the checklist depends on the document type: the back of an ID card is checked for expiry, not a recent date) and every document opened by the approving reviewer. A photo counts once fetched; a PDF counts when the review screen drew every page (each page is reported once and audited as `kyc.document_page_viewed`; the server counts the pages with pdf.js at upload, in a short-lived worker thread with a 10 second and 256 MB limit, so a crafted PDF cannot stall the server; one it cannot read in time is kept for download) or when the reviewer downloaded it. The ticked checklist is stored with the decision.
+- Approving needs every checklist item ticked (the checklist depends on the document type: the back of an ID card is checked for expiry, not a recent date) and every document opened by the approving reviewer. A photo counts once fetched; a PDF counts when the review screen drew every page (each page is reported once and audited as `kyc.document_page_viewed`; the server counts the pages with pdf.js at upload, in a short-lived worker thread with a 10 second and 256 MB limit, so a crafted PDF cannot stall the server; one it cannot read in time is refused). A download never counts as opening a document. The ticked checklist is stored with the decision.
 - Four eyes: whoever uploaded documents for a client can never approve them, whatever their role, and "next" never hands them their own uploads.
 - `POST /api/staff/kyc/:id/change` only approves a rejected document (latest submission only, with a reason). Taking back an approval is "Ask for a new document" (`/request-new`), which tells the client what to send; it is audited as `kyc.new_document_requested`.
 - Approving without documents needs `kyc.override` (Super Admin and Admin), 2FA and a reason, and is audited as `kyc.approved_without_documents`. Approving any document-less item later also needs `kyc.override`. The client is told their proof was confirmed.

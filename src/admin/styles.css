@@ -547,6 +547,8 @@ kbd { display: inline-block; min-width: 18px; padding: 0 5px; border-radius: 5px
 .viewer-file { margin: auto; display: grid; justify-items: center; gap: 10px; text-align: center; color: inherit; text-decoration: none; max-width: 340px; padding: 30px; border: 1px dashed var(--border-strong); border-radius: var(--radius); background: var(--surface); }
 .viewer-file .actions { justify-content: center; margin: 0; }
 .viewer-hint { padding: 8px 14px; border-top: 1px solid var(--border); font-size: 12.5px; }
+.viewer:fullscreen { background: var(--surface); }
+.viewer:fullscreen .viewer-stage { flex: 1; height: auto; min-height: 0; }
 .review-ok { display: flex; gap: 8px; align-items: center; color: var(--good); font-weight: 600; font-size: 14px; }
 .review-warnings { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
 .review-warning { display: flex; gap: 8px; align-items: flex-start; padding: 9px 11px; border-radius: var(--radius-sm); font-size: 13.5px; line-height: 1.4; }

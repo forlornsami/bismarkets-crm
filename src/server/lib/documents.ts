@@ -5,14 +5,18 @@ import sharp, { type Metadata } from "sharp";
 // KYC photos are decoded and re-encoded before they are stored: that drops
 // EXIF (GPS location, device), applies the camera's rotation, refuses
 // decompression bombs and photos too small to read, and turns HEIC into JPEG
-// so every reviewer's browser can show it. PDFs are stored as sent, except
-// that ones needing a password to open are refused; their pages are counted so
-// approving can require every page to be opened.
+// so every reviewer's browser can show it. PDFs are stored as sent once every
+// page opens; ones needing a password, damaged ones and long ones are refused,
+// so a reviewer can always read the whole file in the CRM. Their pages are
+// counted so approving can require every page to be opened.
 
 export const DOCUMENT_RULES = "Use a JPG, PNG, WebP or HEIC photo, or a PDF, up to 10 MB.";
 const UNREADABLE = `This photo could not be opened. ${DOCUMENT_RULES}`;
 export const MAX_DOCUMENT_PIXELS = 50_000_000;
 export const MIN_SHORT_SIDE = 400;
+/** Every page is opened before approving, so a PDF carries only the pages needed. */
+export const MAX_PDF_PAGES = 20;
+const UNREADABLE_PDF = "This PDF could not be opened. It may be damaged. Save it again as a PDF, or upload a photo of the document.";
 
 export type DocumentMime = "image/jpeg" | "image/png" | "image/webp" | "image/heic" | "application/pdf";
 
@@ -27,6 +31,8 @@ export async function prepareDocument(bytes: Buffer, mime: DocumentMime): Promis
   if (mime === "application/pdf") {
     const pdf = await inspectPdf(bytes);
     if (pdf.needsPassword) throw new DocumentProblem("Remove the password from the PDF and upload it again.");
+    if (!pdf.pages || pdf.brokenPage) throw new DocumentProblem(UNREADABLE_PDF);
+    if (pdf.pages > MAX_PDF_PAGES) throw new DocumentProblem(`This PDF has ${pdf.pages} pages, and the most we accept is ${MAX_PDF_PAGES}. Upload only the pages that show your details.`);
     return { bytes, mime, pages: pdf.pages };
   }
   let meta: Metadata;
@@ -63,21 +69,22 @@ export async function prepareDocument(bytes: Buffer, mime: DocumentMime): Promis
 }
 
 /**
- * Opens a PDF the way the review screen will. `pages` is null when pdf.js
- * cannot read the file in time (the reviewer then downloads it). Many bank
- * statements are encrypted with an empty user password (owner restrictions
- * only); those open without a prompt and are accepted.
+ * Opens a PDF the way the review screen will, and every page of it up to
+ * MAX_PDF_PAGES. `pages` is null when pdf.js cannot read the file in time;
+ * `brokenPage` is set when the file opens but one of its pages does not. Many
+ * bank statements are encrypted with an empty user password (owner
+ * restrictions only); those open without a prompt and are accepted.
  */
-export async function inspectPdf(bytes: Buffer, timeoutMs = PDF_TIMEOUT_MS): Promise<{ needsPassword: boolean; pages: number | null }> {
+export async function inspectPdf(bytes: Buffer, timeoutMs = PDF_TIMEOUT_MS): Promise<{ needsPassword: boolean; pages: number | null; brokenPage: boolean }> {
   // pdf.js has no worker of its own in Node and parses on the calling thread,
   // where a crafted PDF could block every request or exhaust the heap. So it
   // runs in a short-lived worker with a time and memory limit; giving up only
   // means the page count is unknown.
   try {
-    const m = await inWorker<{ pages?: number; password?: boolean; error?: string }>(PDF_WORKER, { module: requireHere.resolve("pdfjs-dist/legacy/build/pdf.mjs"), bytes }, timeoutMs, 256);
-    return { needsPassword: m.password === true, pages: typeof m.pages === "number" ? m.pages : null };
+    const m = await inWorker<{ pages?: number; broken?: boolean; password?: boolean; error?: string }>(PDF_WORKER, { module: requireHere.resolve("pdfjs-dist/legacy/build/pdf.mjs"), bytes }, timeoutMs, 256);
+    return { needsPassword: m.password === true, pages: typeof m.pages === "number" ? m.pages : null, brokenPage: m.broken === true };
   } catch {
-    return { needsPassword: false, pages: null };
+    return { needsPassword: false, pages: null, brokenPage: false };
   }
 }
 
@@ -98,7 +105,13 @@ const { pathToFileURL } = require("node:url");
 import(pathToFileURL(workerData.module).href).then(async (pdfjs) => {
   const task = pdfjs.getDocument({ data: workerData.bytes, disableFontFace: true, useSystemFonts: false, verbosity: 0 });
   try {
-    parentPort.postMessage({ pages: (await task.promise).numPages });
+    const doc = await task.promise;
+    // A page that does not open could not be shown to the reviewer either. The count stays what the file says.
+    let broken = false;
+    if (doc.numPages <= ${MAX_PDF_PAGES}) {
+      for (let p = 1; p <= doc.numPages && !broken; p++) await doc.getPage(p).catch(() => (broken = true));
+    }
+    parentPort.postMessage({ pages: doc.numPages, broken });
   } catch (error) {
     parentPort.postMessage({ password: !!error && error.name === "PasswordException" });
   } finally {
@@ -142,6 +155,15 @@ async function inWorker<T extends { error?: string }>(code: string, workerData: 
     if (next) next();
     else running--;
   }
+}
+
+/** A HEIC photo stored before uploads were converted, as a JPEG the review screen can show. */
+export async function heicAsJpeg(bytes: Buffer): Promise<Buffer> {
+  // These were stored before photos were checked at upload, so get the same checks as an upload first.
+  const meta = await sharp(bytes).metadata();
+  if (!meta.width || !meta.height || meta.width * meta.height > MAX_DOCUMENT_PIXELS) throw new DocumentProblem(UNREADABLE);
+  const input = meta.compression === "av1" ? bytes : await heicToPng(bytes);
+  return sharp(input, { limitInputPixels: MAX_DOCUMENT_PIXELS, autoOrient: true }).flatten({ background: "#ffffff" }).jpeg({ quality: 90 }).toBuffer();
 }
 
 export async function heicToPng(bytes: Buffer): Promise<Buffer> {

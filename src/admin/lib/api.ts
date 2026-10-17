@@ -25,7 +25,6 @@ export const onStepUpRequired = (fn: StepUpHandler | null) => {
 };
 
 /** Asks for a 2FA code directly, for requests that do not go through `api` (such as file downloads). */
-export const requestStepUp = async () => (stepUpHandler ? stepUpHandler() : false);
 
 let sessionLostHandler: (() => void) | null = null;
 export const onSessionLost = (fn: (() => void) | null) => {
@@ -54,18 +53,42 @@ async function send<T>(method: string, url: string, body?: unknown, retried = fa
   return data as T;
 }
 
+// KYC documents are only sent to requests carrying this header, which links, images and tabs cannot send.
+const VIEWER = { "X-CRM-Viewer": "1" };
+
 /**
  * Reads a file the staff API serves as raw bytes (KYC documents), with the same
  * session cookie and error handling as `api`, so the page can draw it itself.
  */
 async function bytes(url: string): Promise<ArrayBuffer> {
-  const res = await fetch(url, { credentials: "same-origin", cache: "no-store" });
+  const res = await fetch(url, { credentials: "same-origin", cache: "no-store", headers: VIEWER });
   if (!res.ok) {
     const err = (await res.json().catch(() => ({})))?.error ?? {};
     if (res.status === 401) sessionLostHandler?.();
     throw new ApiError(res.status, err.code ?? "ERROR", err.message ?? "Could not open the file.", err.details);
   }
   return res.arrayBuffer();
+}
+
+/**
+ * Saves a file the staff API sends as a download, asking for a 2FA code first
+ * when the server wants a fresh one. The name comes from the server when given.
+ */
+async function saveFile(url: string, fallbackName: string, retried = false): Promise<void> {
+  const res = await fetch(url, { credentials: "same-origin", cache: "no-store", headers: VIEWER });
+  if (!res.ok) {
+    const err = (await res.json().catch(() => ({})))?.error ?? {};
+    if (err.code === "STEP_UP_REQUIRED" && !retried && stepUpHandler && (await stepUpHandler())) return saveFile(url, fallbackName, true);
+    if (res.status === 401) sessionLostHandler?.();
+    throw new ApiError(res.status, err.code ?? "ERROR", err.message ?? "The file could not be downloaded.", err.details);
+  }
+  const name = /filename="([^"]+)"/.exec(res.headers.get("Content-Disposition") ?? "")?.[1] ?? fallbackName;
+  const href = URL.createObjectURL(await res.blob());
+  const a = document.createElement("a");
+  a.href = href;
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(href), 1000);
 }
 
 /**
@@ -89,6 +112,7 @@ function sendOnExit(url: string, body: unknown = {}) {
 export const api = {
   get: <T>(url: string) => send<T>("GET", url),
   bytes,
+  saveFile,
   sendOnExit,
   post: <T>(url: string, body: unknown = {}) => send<T>("POST", url, body),
   patch: <T>(url: string, body: unknown) => send<T>("PATCH", url, body),

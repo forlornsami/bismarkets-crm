@@ -74,6 +74,8 @@ interface KycDetail extends KycSubmission {
   warnings: (ReviewWarning & { clientId?: number })[];
   checklist: { key: string; label: string }[];
   reasons: string[];
+  /** The ready-made reason for a document that cannot be shown at all. */
+  unreadableReason?: string;
   queue: { pending: number; position: number };
   mayApprove?: boolean;
   approveBlockedReason?: string | null;
@@ -557,6 +559,13 @@ export function KycWorkbench({ id }: { id: string }) {
   const mounted = useRef(true);
   useEffect(() => () => void (mounted.current = false), []);
   const [showOther, setShowOther] = useState(false);
+  const [rejectWith, setRejectWith] = useState<{ reason: string; key: number } | null>(null);
+  // Saving an original needs kyc.download and a recent 2FA code; the server records each download.
+  const download = useCallback((f: ReviewFile) => {
+    api.saveFile(`${f.url}/download`, f.label).catch((e: unknown) => {
+      if (!(e instanceof ApiError && e.code === "STEP_UP_REQUIRED")) toastRef.current(e instanceof ApiError ? e.message : "The file could not be downloaded.", "bad");
+    });
+  }, []);
   const decided = useRef(false);
   const lastActive = useRef(Date.now());
   const lastRenew = useRef(0);
@@ -587,7 +596,7 @@ export function KycWorkbench({ id }: { id: string }) {
           const passing = !(e instanceof ApiError) || e.status >= 500 || e.status === 429;
           if (passing && attempt < 3) return void setTimeout(() => mounted.current && send(attempt + 1), 1000 * 2 ** attempt);
           reported.current.delete(key);
-          toastRef.current(`Page ${page} could not be marked as opened. Zoom or turn the page to try again, or download the PDF.`, "bad");
+          toastRef.current(`Page ${page} could not be marked as opened. Zoom or turn the page to try again.`, "bad");
         },
       );
     void send(0);
@@ -778,6 +787,10 @@ export function KycWorkbench({ id }: { id: string }) {
           pagesSeen={showingOther ? undefined : pagesSeen}
           onViewed={showingOther ? undefined : markViewed}
           onPageViewed={showingOther ? undefined : markPage}
+          onDownload={can("kyc.download") ? download : undefined}
+          onUnreadable={
+            !showingOther && pending && mayDecide && !heldBy && !away && !closed && d.unreadableReason ? () => setRejectWith({ reason: d.unreadableReason!, key: Date.now() }) : undefined
+          }
           banner={
             showingOther &&
             other && (
@@ -866,6 +879,7 @@ export function KycWorkbench({ id }: { id: string }) {
                 blockedText={blocked}
                 approveBlocked={approveBlocked}
                 unopened={unopened}
+                rejectWith={rejectWith}
                 onApprove={(checklist, internalNote) => decide.mutate({ decision: "approve", checklist, internalNote })}
                 onReject={(reason, checklist, internalNote) => decide.mutate({ decision: "reject", reason, checklist, internalNote })}
                 onSkip={mayDecide ? skip : undefined}

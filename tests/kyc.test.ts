@@ -7,7 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { clientErrorMiddleware } from "../src/server/clients/errors";
 import { documentType, kycDocumentContext, kycRequired } from "../src/server/clients/kyc";
 import { createClientSession } from "../src/server/clients/session";
-import { decryptBytes, decryptField, sha256 } from "../src/server/lib/crypto";
+import { decryptBytes, decryptField, encryptBytes, sha256 } from "../src/server/lib/crypto";
 import { exec, one, rows } from "../src/server/lib/db";
 import { DocumentProblem, inspectPdf, prepareDocument } from "../src/server/lib/documents";
 import { outboxContext } from "../src/server/lib/email";
@@ -27,12 +27,17 @@ const pdfOf = (pages: number) => {
 };
 const pdf = pdfOf(2);
 const brokenPdf = Buffer.from("%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n");
+/** Counts two pages, but the second one is missing. */
+const missingPagePdf = Buffer.from("%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R 9 0 R]/Count 2>>endobj\n3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n");
+const UNREADABLE_PDF = "This PDF could not be opened. It may be damaged. Save it again as a PDF, or upload a photo of the document.";
 /** A plain photo big enough to read; each colour gives a different file. */
 const photo = (background: string, width = 640, height = 440) => sharp({ create: { width, height, channels: 3, background } }).png().toBuffer();
 const [front, back, passport, other] = await Promise.all([photo("#336699"), photo("#993366"), photo("#669933"), photo("#cc9900")]);
 const HTML = Buffer.from("<html><script>alert(1)</script></html>");
 const RULES = "Use a JPG, PNG, WebP or HEIC photo, or a PDF, up to 10 MB.";
 const LOCKED = "This was checked with your documents. Contact support to change it.";
+/** A document request as the review screen sends it. */
+const view = (s: SignedIn, url: string) => s.agent.get(url).set("X-CRM-Viewer", "1");
 const ALL = { identity: ["name", "dob", "valid", "clear"], address: ["name", "address", "recent", "clear"] };
 const PROFILE = { phone: "7700900123", countryCode: "44", country: "United Kingdom", city: "London", address: "1 Baker St", zipcode: "W1A 1AA", dob: "1990-04-02", gender: "Female" };
 
@@ -84,12 +89,16 @@ describe("document handling", () => {
     expect(await problem(prepareDocument(junk, "image/jpeg"))).toBe(`This photo could not be opened. ${RULES}`);
   });
 
-  it("refuses PDFs that need a password, but keeps ones with only owner restrictions", async () => {
+  it("refuses PDFs that need a password, are damaged or are too long, but keeps ones with only owner restrictions", async () => {
     expect(await problem(prepareDocument(lockedPdf, "application/pdf"))).toBe("Remove the password from the PDF and upload it again.");
     expect(await prepareDocument(ownerPdf, "application/pdf")).toMatchObject({ bytes: ownerPdf, pages: 1 });
-    // Pages are counted so approving can require every one; a PDF pdf.js cannot read is kept for download.
+    // Pages are counted so approving can require every one.
     expect(await prepareDocument(pdf, "application/pdf")).toMatchObject({ bytes: pdf, pages: 2 });
-    expect(await prepareDocument(brokenPdf, "application/pdf")).toMatchObject({ bytes: brokenPdf, pages: null });
+    expect(await prepareDocument(pdfOf(20), "application/pdf")).toMatchObject({ pages: 20 });
+    // Every document is read inside the CRM, so one the review screen could not show is refused.
+    expect(await problem(prepareDocument(brokenPdf, "application/pdf"))).toBe(UNREADABLE_PDF);
+    expect(await problem(prepareDocument(missingPagePdf, "application/pdf"))).toBe(UNREADABLE_PDF);
+    expect(await problem(prepareDocument(pdfOf(21), "application/pdf"))).toBe("This PDF has 21 pages, and the most we accept is 20. Upload only the pages that show your details.");
   });
 
   it("reads PDFs off the main thread and gives up on one that would hang it", async () => {
@@ -98,7 +107,7 @@ describe("document handling", () => {
     let ticks = 0;
     const timer = setInterval(() => ticks++, 50);
     const started = Date.now();
-    expect(await inspectPdf(hang, 1000)).toEqual({ needsPassword: false, pages: null });
+    expect(await inspectPdf(hang, 1000)).toEqual({ needsPassword: false, pages: null, brokenPage: false });
     clearInterval(timer);
     expect(Date.now() - started).toBeLessThan(5000);
     expect(ticks).toBeGreaterThan(10);
@@ -156,7 +165,7 @@ describe.skipIf(!hasDb)("KYC", () => {
   async function openAll(s: SignedIn, submissionId: number) {
     const detail = (await s.agent.get(`/api/staff/kyc/${submissionId}`)).body;
     for (const f of detail.files) {
-      expect((await s.agent.get(f.url)).status).toBe(200);
+      expect((await view(s, f.url)).status).toBe(200);
       if (f.type === "application/pdf") for (let page = 1; page <= f.pages; page++) expect((await post(s, `/api/staff/kyc/documents/${f.id}/pages`, { page })).status).toBe(204);
     }
     return detail as { checklist: { key: string }[] };
@@ -227,6 +236,7 @@ describe.skipIf(!hasDb)("KYC", () => {
     expect(html.status).toBe(422);
     expect(html.body.errors.document1).toEqual([RULES]);
     expect((await upload(3, 2, [lockedPdf])).body.errors.document1).toEqual(["Remove the password from the PDF and upload it again."]);
+    expect((await upload(3, 2, [brokenPdf])).body.errors.document1).toEqual([UNREADABLE_PDF]);
     expect((await upload(3, 2, [await photo("#000000", 300, 300)])).body.errors.document1).toEqual(["This photo is too small to read. Take it closer or use a scan."]);
     expect((await upload(9, 1, [front])).body.errors.type).toBeDefined();
     expect((await upload(3, 1, [front, back])).status).toBe(201);
@@ -276,7 +286,7 @@ describe.skipIf(!hasDb)("KYC", () => {
     expect((await post(support, "/api/staff/kyc/next", {})).status).toBe(403);
     // A reviewer limited to their own clients cannot open other clients' documents.
     expect((await scoped.agent.get(`/api/staff/kyc/${identity.id}`)).status).toBe(404);
-    expect((await scoped.agent.get(`/api/staff/kyc/documents/${docId}`)).status).toBe(404);
+    expect((await view(scoped, `/api/staff/kyc/documents/${docId}`)).status).toBe(404);
     expect(await one(env.db, "SELECT id FROM audit_log WHERE action = 'kyc.document_viewed'")).toBeUndefined();
   });
 
@@ -299,17 +309,22 @@ describe.skipIf(!hasDb)("KYC", () => {
     expect(detail.reasons.length).toBeGreaterThan(3);
     expect(detail.queue).toMatchObject({ pending: 2 });
 
-    const file = await reviewer.agent.get(detail.files[0].url);
+    const file = await view(reviewer, detail.files[0].url);
     expect(file.headers["content-type"]).toBe("image/png");
     expect(file.headers["content-security-policy"]).toContain("sandbox");
     expect(file.headers["content-disposition"]).toBe("inline");
     expect(file.headers["x-content-type-options"]).toBe("nosniff");
     expect(await sharp(file.body as Buffer).metadata()).toMatchObject({ format: "png", width: 640, height: 440 });
-    // PDFs download instead of opening in the CRM's own origin.
-    const bill = await reviewer.agent.get(detail.other.files[0].url);
+    // Files are only for the review screen to draw: never sent as a download, and refused to a link, image or tab.
+    const bill = await view(reviewer, detail.other.files[0].url);
     expect(bill.headers["content-type"]).toBe("application/pdf");
-    expect(bill.headers["content-disposition"]).toBe(`attachment; filename="client-${clientId}-address-1.pdf"`);
+    expect(bill.headers["content-disposition"]).toBe("inline");
+    expect(bill.headers["content-security-policy"]).toContain("sandbox");
     expect(bill.headers["x-content-type-options"]).toBe("nosniff");
+    const opened = await reviewer.agent.get(detail.files[1].url).set("Sec-Fetch-Dest", "empty").set("Sec-Fetch-Mode", "navigate");
+    expect(opened.status).toBe(403);
+    expect(opened.body.error.message).toBe("Open KYC documents from the review screen. If it is already open, reload it.");
+    expect(detail.reasons).toContain(detail.unreadableReason);
     expect(detail.other.files[0]).toMatchObject({ pages: 2, viewedByMe: false, viewedPages: [] });
     expect(detail.files[0]).toMatchObject({ pages: 1 });
     expect(detail.files[0]).not.toHaveProperty("viewedPages");
@@ -384,8 +399,22 @@ describe.skipIf(!hasDb)("KYC", () => {
     const pageViews = await one<{ n: number }>(env.db, "SELECT COUNT(*) AS n FROM audit_log WHERE action = 'kyc.document_page_viewed' AND entity_id = ?", [String(clientId)]);
     expect(Number(pageViews!.n)).toBe(2);
     expect((await reviewer.agent.get(`/api/staff/clients/${clientId}/activity`)).body.items.some((a: { action: string }) => a.action === "kyc.document_page_viewed")).toBe(false);
-    expect((await boss.agent.get(`${(await billFile(boss)).url}?download=1`)).status).toBe(200);
-    expect(await billFile(boss)).toMatchObject({ viewedByMe: true, viewedPages: [] });
+    // Saving the original is its own permission, with a fresh 2FA code, and recorded on its own. It never counts as reviewing.
+    const billUrl = (await billFile(boss)).url;
+    expect((await view(support, `${billUrl}/download`)).status).toBe(403);
+    // Reviewers do not download by default, compliance included: only a Super Admin, or a role a Super Admin gave it to.
+    expect((await view(scoped, `${billUrl}/download`)).body.error.code).toBe("FORBIDDEN");
+    expect((await view(reviewer, `${billUrl}/download`)).body.error.code).toBe("FORBIDDEN");
+    expect((await view(boss, `${billUrl}/download`)).body.error.code).toBe("STEP_UP_REQUIRED");
+    await stepUp(env, boss);
+    expect((await boss.agent.get(`${billUrl}/download`)).status).toBe(403);
+    const saved = await view(boss, `${billUrl}/download`);
+    expect(saved.status).toBe(200);
+    expect(saved.headers["content-disposition"]).toBe(`attachment; filename="client-${clientId}-address-1.pdf"`);
+    expect(Buffer.compare(saved.body as Buffer, pdf)).toBe(0);
+    expect(await billFile(boss)).toMatchObject({ viewedByMe: false, viewedPages: [] });
+    const downloads = await rows<{ actor_id: number; meta_json: { documentId: number } }>(env.db, "SELECT actor_id, meta_json FROM audit_log WHERE action = 'kyc.document_downloaded' AND entity_id = ?", [String(clientId)]);
+    expect(downloads).toEqual([expect.objectContaining({ actor_id: boss.staffId, meta_json: expect.objectContaining({ documentId: billId }) })]);
 
     for (const item of (await reviewer.agent.get("/api/staff/kyc")).body.items) expect((await approve(reviewer, item.id)).status).toBe(200);
     expect((await reviewer.agent.get("/api/staff/kyc/summary")).body).toMatchObject({ pending: 0, decidedTodayByMe: 3 });
@@ -691,6 +720,24 @@ describe.skipIf(!hasDb)("KYC", () => {
     expect(logged!.meta_json.files).toEqual([
       { type: "image/jpeg", bytes: kept.length, sha256: sha256(kept), sent: { type: "image/heic", bytes: heic.length, sha256: sha256(heic) } },
     ]);
+    // A HEIC photo stored before uploads were converted reaches the review screen as a JPEG.
+    await exec(env.db, "UPDATE kyc_documents SET mime = 'image/heic', bytes_enc = ? WHERE submission_id = ? AND slot = 1", [encryptBytes(env.config.dataKey, heic, kycDocumentContext(sub, 1)), sub]);
+    const shown = await view(reviewer, (await reviewer.agent.get(`/api/staff/kyc/${sub}`)).body.files[0].url);
+    expect(shown.headers["content-type"]).toBe("image/jpeg");
+    expect((await sharp(shown.body as Buffer).metadata()).format).toBe("jpeg");
+    // A PDF stored before pages were counted is counted when first opened, broken pages included, so all stay required.
+    // One the server cannot read stays uncounted, and can then only be rejected.
+    const legacyPdf = async (bytes: Buffer) => {
+      await exec(env.db, "UPDATE kyc_documents SET mime = 'application/pdf', pages = NULL, bytes_enc = ? WHERE submission_id = ? AND slot = 1", [encryptBytes(env.config.dataKey, bytes, kycDocumentContext(sub, 1)), sub]);
+      const f = (await reviewer.agent.get(`/api/staff/kyc/${sub}`)).body.files[0];
+      expect((await view(reviewer, f.url)).status).toBe(200);
+      return { id: f.id as number, pages: (await one<{ pages: number | null }>(env.db, "SELECT pages FROM kyc_documents WHERE id = ?", [f.id]))!.pages };
+    };
+    expect((await legacyPdf(missingPagePdf)).pages).toBe(2);
+    const unread = await legacyPdf(brokenPdf);
+    expect(unread.pages).toBeNull();
+    expect((await post(reviewer, `/api/staff/kyc/documents/${unread.id}/pages`, { page: 1 })).body.error.message).toBe("That page is not part of this document.");
+    expect((await reviewer.agent.get(`/api/staff/kyc/${sub}`)).body.files[0]).toMatchObject({ pages: null, viewedByMe: false });
     expect(await warnings(reviewer, sub)).toContain("The account is frozen.");
 
     const pendingBefore = (await reviewer.agent.get("/api/staff/kyc/summary")).body.pending;

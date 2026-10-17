@@ -1,15 +1,15 @@
-import express, { Router, type Request } from "express";
+import express, { Router, type NextFunction, type Request, type Response } from "express";
 import { z } from "zod";
 import type { AppDeps } from "../../app";
 import {
-  auditedFiles, checklistFor, describeMissing, KYC_MAX_BYTES, KYC_REJECT_REASONS, KYC_TYPES, kycDocumentContext, latestSubmissions, lockClient, missingProfileFields, otherCategory, overallStatus,
+  auditedFiles, checklistFor, describeMissing, KYC_MAX_BYTES, KYC_REJECT_REASONS, KYC_TYPES, KYC_UNREADABLE_REASON, kycDocumentContext, latestSubmissions, lockClient, missingProfileFields, otherCategory, overallStatus,
   parseKycUpload, proofOf, readProfileSnapshot, sameProfileValue, saveProfileSnapshot, storeSubmission, subTypeOf, VERIFIED_FIELDS,
   type KycCategory, type KycOverall, type LatestSubmissions, type RequiredProfileField, type SnapshotField,
 } from "../../clients/kyc";
 import { clientName, clientPictureUrl, loadClient, type ClientRow } from "../../clients/model";
 import { auditContext, writeAudit } from "../../lib/audit";
 import { decryptBytes } from "../../lib/crypto";
-import { inspectPdf } from "../../lib/documents";
+import { heicAsJpeg, inspectPdf } from "../../lib/documents";
 import { exec, one, rows, transaction, type Conn } from "../../lib/db";
 import { queueEmail } from "../../lib/email";
 import { queueSupportEvent } from "../../lib/events";
@@ -97,7 +97,7 @@ interface DocRow {
   size_bytes: number;
   file_name: string;
   sha256: string;
-  /** Null only for a PDF stored before pages were counted, until a reviewer first opens it. */
+  /** Null for a PDF stored before pages were counted, until a reviewer opens it and the server can count it. */
   pages: number | null;
 }
 
@@ -106,23 +106,21 @@ const isPdf = (mime: string) => mime === "application/pdf";
 /**
  * What one reviewer has opened of a client's documents, from the audit log.
  * A photo counts once fetched. A PDF counts when the review screen drew every
- * page, or when the reviewer downloaded it to read elsewhere.
+ * page. A download never counts: documents are reviewed inside the CRM.
  */
 async function openedBy(conn: Conn, staffId: number, clientId: number) {
-  const events = await rows<{ action: string; doc: number; page: number | null; download: string | null }>(
+  const events = await rows<{ action: string; doc: number; page: number | null }>(
     conn,
-    `SELECT action, CAST(meta_json->>'$.documentId' AS UNSIGNED) AS doc, CAST(meta_json->>'$.page' AS UNSIGNED) AS page, meta_json->>'$.download' AS download
+    `SELECT action, CAST(meta_json->>'$.documentId' AS UNSIGNED) AS doc, CAST(meta_json->>'$.page' AS UNSIGNED) AS page
      FROM audit_log WHERE entity_type = 'client' AND entity_id = ? AND actor_type = 'staff' AND actor_id = ? AND action IN ('kyc.document_viewed', 'kyc.document_page_viewed')`,
     [String(clientId), staffId],
   );
-  const seen = new Map<number, { fetched: boolean; downloaded: boolean; pages: Set<number> }>();
+  const seen = new Map<number, { fetched: boolean; pages: Set<number> }>();
   for (const e of events) {
     const doc = Number(e.doc);
-    const s = seen.get(doc) ?? { fetched: false, downloaded: false, pages: new Set<number>() };
-    if (e.action === "kyc.document_viewed") {
-      s.fetched = true;
-      if (e.download === "true") s.downloaded = true;
-    } else if (e.page) s.pages.add(Number(e.page));
+    const s = seen.get(doc) ?? { fetched: false, pages: new Set<number>() };
+    if (e.action === "kyc.document_viewed") s.fetched = true;
+    else if (e.page) s.pages.add(Number(e.page));
     seen.set(doc, s);
   }
   return {
@@ -131,9 +129,9 @@ async function openedBy(conn: Conn, staffId: number, clientId: number) {
     fully: (d: DocRow) => {
       const s = seen.get(d.id);
       if (!s?.fetched) return false;
-      if (!isPdf(d.mime) || s.downloaded) return true;
-      const total = d.pages ?? 1;
-      for (let p = 1; p <= total; p++) if (!s.pages.has(p)) return false;
+      if (!isPdf(d.mime)) return true;
+      if (d.pages === null) return false;
+      for (let p = 1; p <= d.pages; p++) if (!s.pages.has(p)) return false;
       return true;
     },
   };
@@ -589,39 +587,78 @@ export function staffKycRouter(deps: AppDeps): Router {
         warnings,
         checklist: checklistFor(row.category, row.sub_type),
         reasons: KYC_REJECT_REASONS[row.category],
+        // Offered by the viewer when a document cannot be shown at all.
+        unreadableReason: KYC_UNREADABLE_REASON,
         queue: { pending: Number(queue?.pending ?? 0), position: Number(queue?.ahead ?? 0) + 1 },
       });
     }),
   );
 
+  // Documents are read only by the review screen's own requests, which send X-CRM-Viewer. A link, a
+  // download, an image, a frame or the address bar cannot send a header, so a file is never opened or
+  // saved outside the review screen (an admin page left open from before an update needs a reload).
+  const fromReviewScreen = (req: Request, _res: Response, next: NextFunction) =>
+    next(req.get("x-crm-viewer") === "1" ? undefined : forbidden("Open KYC documents from the review screen. If it is already open, reload it."));
+
+  async function readDocument(req: Request) {
+    const doc = await one<{ id: number; submission_id: number; slot: number; mime: string; file_name: string; pages: number | null; bytes_enc: Buffer }>(
+      db,
+      "SELECT id, submission_id, slot, mime, file_name, pages, bytes_enc FROM kyc_documents WHERE id = ?",
+      [parse(id, req.params.docId)],
+    );
+    if (!doc) throw notFound();
+    const sub = await loadVisible(req, doc.submission_id);
+    return { doc, sub, bytes: decryptBytes(config.dataKey, doc.bytes_enc, kycDocumentContext(doc.submission_id, doc.slot)) };
+  }
+
+  /** The file for the review screen to draw. It is never sent as a download. */
   router.get(
     "/documents/:docId",
     openDocuments,
+    fromReviewScreen,
     handler(async (req, res) => {
-      const doc = await one<{ id: number; submission_id: number; slot: number; mime: string; file_name: string; pages: number | null; bytes_enc: Buffer }>(
-        db,
-        "SELECT id, submission_id, slot, mime, file_name, pages, bytes_enc FROM kyc_documents WHERE id = ?",
-        [parse(id, req.params.docId)],
-      );
-      if (!doc) throw notFound();
-      const sub = await loadVisible(req, doc.submission_id);
-      const bytes = decryptBytes(config.dataKey, doc.bytes_enc, kycDocumentContext(doc.submission_id, doc.slot));
+      const { doc, sub, bytes } = await readDocument(req);
       // PDFs stored before pages were counted are counted now, before any page can be marked as seen.
+      // One the server cannot count stays uncounted: it cannot be approved, only rejected as unreadable.
       if (isPdf(doc.mime) && doc.pages === null) {
-        await exec(db, "UPDATE kyc_documents SET pages = ? WHERE id = ? AND pages IS NULL", [(await inspectPdf(bytes)).pages ?? 1, doc.id]);
+        const { pages } = await inspectPdf(bytes);
+        if (pages) await exec(db, "UPDATE kyc_documents SET pages = ? WHERE id = ? AND pages IS NULL", [pages, doc.id]);
       }
-      // A download (?download=1) means the reviewer reads the whole file elsewhere, so it counts for every page.
-      const download = req.query.download === "1";
+      // HEIC photos stored before uploads were converted are shown as JPEG, which every browser draws.
+      const heic = doc.mime === "image/heic";
+      const body = heic
+        ? await heicAsJpeg(bytes).catch(() => {
+            throw new HttpError(422, "UNREADABLE", "This photo could not be opened.");
+          })
+        : bytes;
       await transaction(db, (conn) =>
-        writeAudit(conn, ctx(req), { action: "kyc.document_viewed", entityType: "client", entityId: sub.client_id, meta: { submissionId: sub.id, documentId: doc.id, ...(download ? { download: true } : {}) } }),
+        writeAudit(conn, ctx(req), { action: "kyc.document_viewed", entityType: "client", entityId: sub.client_id, meta: { submissionId: sub.id, documentId: doc.id } }),
       );
-      const image = doc.mime.startsWith("image/") && doc.mime !== "image/heic";
+      res.setHeader("Cache-Control", "no-store");
+      res.setHeader("Content-Type", heic ? "image/jpeg" : doc.mime);
+      res.setHeader("Content-Security-Policy", "default-src 'none'; sandbox");
+      res.setHeader("Content-Disposition", "inline");
+      res.send(body);
+    }),
+  );
+
+  // Saving the original to a computer is its own permission, needs a recent 2FA code and has its own
+  // audit entry. It does not count as reviewing: approving needs the document opened in the review screen.
+  router.get(
+    "/documents/:docId/download",
+    requirePermission("kyc.view", "kyc.documents", "kyc.download"),
+    fromReviewScreen,
+    stepUp,
+    handler(async (req, res) => {
+      const { doc, sub, bytes } = await readDocument(req);
+      await transaction(db, (conn) =>
+        writeAudit(conn, ctx(req), { action: "kyc.document_downloaded", entityType: "client", entityId: sub.client_id, meta: { submissionId: sub.id, documentId: doc.id } }),
+      );
+      const ext = isPdf(doc.mime) ? "pdf" : doc.mime.split("/")[1];
       res.setHeader("Cache-Control", "no-store");
       res.setHeader("Content-Type", doc.mime);
       res.setHeader("Content-Security-Policy", "default-src 'none'; sandbox");
-      // Images show inline; PDFs (drawn by the review screen's pdf.js) and HEIC files stored before conversion existed are sent as attachments.
-      const ext = doc.mime === "application/pdf" ? "pdf" : doc.mime.split("/")[1];
-      res.setHeader("Content-Disposition", image ? "inline" : `attachment; filename="client-${sub.client_id}-${sub.category}-${doc.slot}.${ext}"`);
+      res.setHeader("Content-Disposition", `attachment; filename="client-${sub.client_id}-${sub.category}-${doc.slot}.${ext}"`);
       res.send(bytes);
     }),
   );
@@ -638,7 +675,7 @@ export function staffKycRouter(deps: AppDeps): Router {
       ]);
       if (!doc) throw notFound();
       const sub = await loadVisible(req, doc.submission_id);
-      if (!isPdf(doc.mime) || page > (doc.pages ?? 1)) throw badRequest("That page is not part of this document.");
+      if (!isPdf(doc.mime) || doc.pages === null || page > doc.pages) throw badRequest("That page is not part of this document.");
       await transaction(db, async (conn) => {
         const seen = await rows<{ action: string; page: number | null }>(
           conn,

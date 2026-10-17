@@ -168,6 +168,8 @@ export function FeedbackProvider({ children }: { children: ReactNode }) {
   const nextId = useRef(1);
 
   const toast = useCallback((text: string, tone: "good" | "bad" = "good") => {
+    // Toasts cannot show over a full-screen document, and a problem must be seen.
+    if (tone === "bad" && document.fullscreenElement) void document.exitFullscreen().catch(() => undefined);
     const id = nextId.current++;
     setToasts((list) => [...list, { id, tone, text }]);
     setTimeout(() => setToasts((list) => list.filter((t) => t.id !== id)), 4500);
