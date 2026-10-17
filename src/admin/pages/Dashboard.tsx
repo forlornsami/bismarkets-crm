@@ -53,13 +53,13 @@ export function Dashboard() {
         <div className="tiles">
           {can("kyc.view") && (
             <Link href="/kyc" className="tile tile-button">
-              <span className={kycWaiting ? "tile-icon warn" : "tile-icon good"}>
+              <span className={kycWaiting === undefined ? "tile-icon" : kycWaiting ? "tile-icon warn" : "tile-icon good"}>
                 <BadgeCheck size={20} />
               </span>
               <div>
                 <div className="tile-label">KYC waiting for review</div>
                 <div className="tile-value">{show(kycWaiting)}</div>
-                <div className="tile-foot">{kycWaiting ? "Open the queue to review" : "Nothing waiting"}</div>
+                <div className="tile-foot">{kyc.error ? "Could not load" : kycWaiting === undefined ? "Checking the queue" : kycWaiting ? "Open the queue to review" : "Nothing waiting"}</div>
               </div>
             </Link>
           )}

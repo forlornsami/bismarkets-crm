@@ -195,6 +195,7 @@ function GroupFilters({ value, onChange }: { value: GroupFilter; onChange: (v: G
         label="KYC (leave all unticked for everyone)"
         options={[
           { value: "none", label: "Not submitted" },
+          { value: "partial", label: "Partly verified" },
           { value: "pending", label: "Waiting for review" },
           { value: "approved", label: "Approved" },
           { value: "rejected", label: "Rejected" },

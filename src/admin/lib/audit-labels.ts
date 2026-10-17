@@ -36,6 +36,8 @@ const ACTION_LABEL: Record<string, string> = {
   "kyc.uploaded_by_staff": "KYC document uploaded by staff for the client",
   "kyc.approved_without_documents": "KYC approved without documents",
   "kyc.review_taken_over": "KYC review taken over by another reviewer",
+  "kyc.withdrawn_by_client": "Took back documents sent for verification",
+  "client.verified_details_changed": "Verified details changed by staff",
   "client.device_signed_out": "Signed a device out",
   "client.other_devices_signed_out": "Signed out all other devices",
   "client.marketing_unsubscribed": "Unsubscribed from news and offers",

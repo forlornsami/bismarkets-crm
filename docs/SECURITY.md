@@ -80,7 +80,11 @@ and money controls on top of the same foundations.
 ## Client portal API (Phase 2)
 
 The portal and app call the same `/api/*` paths as the old CRM, with Bearer
-tokens and Laravel-style errors (`{ message, errors }`), so they work unchanged.
+tokens and Laravel-style errors (`{ message, errors }`). The Android app works
+unchanged. The web portal needs the version built for this CRM
+(bismarkets-client-portal PR #2): older builds hide field errors and KYC
+rejection reasons behind generic text, so it must go live before or with the
+cutover.
 
 - Browsers may call it only from `CRM_CLIENT_ORIGINS` (CORS). There are no
   cookies, so there is nothing for another site to ride on.
@@ -115,7 +119,9 @@ tokens and Laravel-style errors (`{ message, errors }`), so they work unchanged.
 
 - Staff without `client.view_all` see only the clients assigned to them.
 - Phone, address, postcode and date of birth are masked everywhere. Showing them
-  needs `client.pii.reveal` and writes an audit entry each time.
+  needs `client.pii.reveal` and writes an audit entry each time. The one
+  exception is the KYC review screen, which needs `kyc.documents` and is
+  audited per view (see "KYC documents").
 - The audit log records old and new values for names, email, country and city;
   for personal data it records only which fields changed.
 - Freezing, closing or reactivating needs `client.status`, a reason and a fresh
@@ -145,8 +151,18 @@ push notifications and devices are signed out.
   id and body with `CRM_SUPPORT_EVENTS_SECRET`, which must match support's
   `CLIENT_NOTIFICATION_CRM_SECRET` and be at least 32 characters. Redirects are
   refused.
+- Exactly one event per KYC decision: `kyc.approved` when the client becomes
+  fully verified, `kyc.rejected` when their overall status becomes rejected,
+  otherwise the document's own `kyc.identity.*` or `kyc.address.*` event.
+- The sender claims due rows with a short lease in its own transaction, sends
+  outside any transaction and records each answer on its own, so no database
+  lock is held while support answers and a row is never sent twice at once.
 - Failures retry with backoff (30 seconds up to 6 hours, 12 tries). A 4xx other
-  than 408 or 429 is a permanent failure and is logged.
+  than 408 or 429 is a permanent failure and is logged; `401` and `422` are
+  logged as configuration errors (secret, environment name or server clock).
+- KYC events older than 24 hours are not sent (marked failed, `expired`), so a
+  backlog never turns into stale pushes. Account and sign-out events are always
+  sent.
 - With `CRM_SUPPORT_EVENTS_URL` unset, events are queued and sent once it is set.
 
 ## Email
@@ -186,15 +202,45 @@ waiting marketing emails and is audited. Account emails are unaffected.
 
 ## KYC documents
 
-- Clients upload identity (ID card front and back, passport, or driving licence) and proof of address through `POST /api/kyc`, the same call the portal and app already make. Staff "view as client" sessions cannot upload, and frozen or closed accounts cannot either.
-- Each file is checked by its bytes, not its name or declared type: only JPEG, PNG, WebP, HEIC and PDF, up to 10 MB each. Uploads are rate limited per client.
-- Files are encrypted at rest (AES-256-GCM with the data key, bound to the submission and slot), stored with their SHA-256 hash, and never served back to the client. The client API only returns statuses and rejection reasons.
-- Staff need `kyc.view` to see the queue, scoped to their assigned clients unless they also have `client.view_all`. Opening a submission and every document view are written to the audit log. Documents are served with `no-store` and a sandboxing CSP; PDFs and HEIC files download instead of rendering in the CRM.
-- Approving or rejecting needs `kyc.decide` and a fresh 2FA code. A rejection needs a reason, which the client sees and is emailed. The client can resubmit only after a rejection.
-- A decision can be changed later (`POST /api/staff/kyc/:id/change`): a rejected document approved, or an approved one rejected. It needs `kyc.decide`, a fresh 2FA code and a reason, works only on the client's latest submission, and is audited as `kyc.decision_changed` with the old and new status. A rejection reason is shown to the client; an approval reason stays in the audit log.
-- Staff with `kyc.upload` (Super Admin, Admin, Compliance) can upload documents for a client (`POST /api/staff/kyc/upload`), with 2FA and a note on where they came from. The files get the same checks and encryption as client uploads, the submission is marked as uploaded by that staff member, and it goes to the review queue. Four eyes: the uploader cannot approve their own upload unless they hold `kyc.override`.
-- Approving without documents (`POST /api/staff/kyc/approve-without-documents`) needs `kyc.override` (Super Admin and Admin), 2FA and a reason, and is audited as `kyc.approved_without_documents`. Approving any document-less item later also needs `kyc.override`.
-- "Ask for a new document" withdraws an approval (needs `kyc.decide` and 2FA, latest submission only). It is audited as `kyc.new_document_requested`, the client is emailed and notified, and their KYC goes back to rejected so they can upload again.
+**Uploads.** Clients upload identity (ID card front and back, passport, or driving licence) and proof of address through `POST /api/kyc`, the same call the portal and app already make.
+
+- Frozen accounts may upload (a freeze pauses money, not verification); closed accounts and staff "view as client" sessions cannot.
+- Each file is checked by its bytes, not its name or declared type: only JPEG, PNG, WebP, HEIC and PDF, up to 10 MB each.
+- Photos are decoded and re-encoded before they are stored. That drops EXIF and XMP (GPS location, device), applies the camera's rotation, refuses decompression bombs over 50 megapixels and photos under 400 pixels on the short side. HEIC is converted to JPEG so every reviewer's browser shows it; the conversion runs in a worker thread, two at a time, so a large photo never blocks other requests. The original photo is not kept.
+- PDFs are stored as sent, but one that needs a password to open is refused. Bank statements with only owner restrictions (no password to open) are accepted.
+- The SHA-256 used for duplicate checks is taken from the file as sent.
+- At most 10 stored uploads per client per hour, checked before the body is read; failed attempts do not use them up (a looser 30 attempts an hour stops hammering). Throttled requests get `429` with `Retry-After`. A retry that repeats a pending upload exactly (same type, same files) is answered `201` without storing it twice.
+- A client can take back their own pending upload (`POST /api/kyc/withdraw`) until a reviewer opens it. The submission is kept as `withdrawn` for the record and audited as `kyc.withdrawn_by_client`. Uploads staff made for them cannot be taken back.
+- Files are encrypted at rest (AES-256-GCM with the data key, bound to the submission and slot) and never served back to the client. The client API only returns statuses and rejection reasons.
+
+**Who sees what.**
+
+- `kyc.view` gives the queue, the counts and each client's KYC status, scoped to assigned clients unless the role also has `client.view_all`.
+- `kyc.documents` is needed to open a submission, its documents and the profile details they are checked against (full name, date of birth and address; the phone number is not shown). Built-in roles with it: Super Admin, Admin, Compliance and Auditor. Sales and support roles do not have it.
+- Every opened submission and every document view is audited. Documents are served with `no-store`, `nosniff` and a sandboxing CSP. PDFs are sent as attachments and never opened by the browser's own viewer; the review screen draws them with pdf.js served from the CRM itself (no eval, no CDN).
+- Warnings never name a client the reviewer could not open: a match outside their scope is shown as "another client".
+
+**Decisions.**
+
+- Approving or rejecting needs `kyc.decide`, `kyc.documents` and a fresh 2FA code. Changing a decision and asking for a new document need the same; claiming and "next" need the two permissions. A rejection needs a plain-text reason, which the client sees and is emailed. A decision can carry an internal note (plain text, at most 500 characters) that goes to the audit log and the decision history, never to the client.
+- Approving needs every checklist item ticked (the checklist depends on the document type: the back of an ID card is checked for expiry, not a recent date) and every page opened by the approving reviewer since the submission arrived. The ticked checklist is stored with the decision.
+- Four eyes: whoever uploaded documents for a client can never approve them, whatever their role, and "next" never hands them their own uploads.
+- `POST /api/staff/kyc/:id/change` only approves a rejected document (latest submission only, with a reason). Taking back an approval is "Ask for a new document" (`/request-new`), which tells the client what to send; it is audited as `kyc.new_document_requested`.
+- Approving without documents needs `kyc.override` (Super Admin and Admin), 2FA and a reason, and is audited as `kyc.approved_without_documents`. Approving any document-less item later also needs `kyc.override`. The client is told their proof was confirmed.
+- Closed accounts: their pending items leave the queue, the counts and "next" (the list shows them with `includeClosed=1`), and every decision, upload and approval on them is refused.
 - Review claims: opening a pending item holds it for 15 minutes (refreshed while open), so two reviewers never decide the same item. A decision is refused while someone else holds it; taking over a review is audited as `kyc.review_taken_over`.
-- Approving needs every checklist item ticked; the ticked checklist is stored with the decision and in the audit entry.
-- The review screen flags under-18 dates of birth, the same file uploaded by another client, identical front and back, profile edits made after the upload, unverified email and non-active accounts.
+- Every KYC change locks the client row first and recomputes the stored status with a locking read, so two decisions for one client run one after the other and the stored KYC status is never stale.
+
+**Verified details.** While a document is under review or approved, the details it is checked against are locked: first name, last name and date of birth for identity; country, city, address and postcode for proof of address.
+
+- `PATCH /api/user` refuses a real change to a locked field with a field error. Values that only differ in case or spacing count as unchanged, since the portal and app send the whole form.
+- Staff change them only with `kyc.override` and a fresh 2FA code; the change is audited as `client.verified_details_changed` with the fields. `GET /api/staff/clients/:id` lists the locked fields so the form can show them.
+- Each submission keeps an encrypted copy of these details from upload, refreshed on approval, so the review screen can name exactly which ones changed since.
+
+**Review warnings.** Under-18 dates of birth, the same person on another account (same date of birth and name), the same file sent by another client, a proof of address identical to the client's identity file, a file identical to one rejected before, identical front and back, details changed after sending, unverified email and non-active accounts.
+
+**Client notices and events.** An upload gives the client an in-app "We received your proof of ..." notice. A decision gives one notice and email saying what comes next, and exactly one support event (see "Support service events").
+
+**Keeping the evidence.** KYC submissions and documents cannot be deleted with their client or submission (foreign keys `ON DELETE RESTRICT`); nothing in the CRM deletes them. The retention period after an account closes is for compliance to set; a purge job will follow that decision.
+
+**Gated client features.** Money, trading-account and IB routes, as they are built, answer clients without approved KYC with `kycRequired()`: `403 { "message": "You must complete your KYC first." }`, the exact text the app looks for.

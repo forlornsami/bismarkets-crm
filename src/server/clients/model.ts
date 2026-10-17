@@ -13,7 +13,7 @@ export interface ClientRow {
   password_hash: string | null;
   status: "active" | "frozen" | "closed";
   status_reason: string | null;
-  kyc_status: "none" | "pending" | "approved" | "rejected";
+  kyc_status: "none" | "partial" | "pending" | "approved" | "rejected";
   kyc_approved_at: Date | null;
   important_notice: string | null;
   email_verified_at: Date | null;

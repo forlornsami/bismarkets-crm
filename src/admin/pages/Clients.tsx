@@ -4,6 +4,7 @@ import {
   Eye,
   ExternalLink,
   KeyRound,
+  Lock,
   LockOpen,
   LogOut,
   Pencil,
@@ -59,9 +60,11 @@ export interface Client {
   lastLoginIp: string | null;
   createdAt: string;
   pictureUrl: string | null;
-  kycStatus: "none" | "pending" | "approved" | "rejected";
+  kycStatus: "none" | "partial" | "pending" | "approved" | "rejected";
   kycApprovedAt: string | null;
   importantNotice: string | null;
+  /** Fields checked against the client's KYC documents (camelCase, as in the edit form). */
+  lockedFields?: string[];
   activeSessions?: number;
   notesCount?: number;
   referrals?: number;
@@ -178,7 +181,7 @@ export function ClientsList() {
         searchPlaceholder="Search name, email, client ID or referral code"
         filters={[
           { key: "status", label: "Status", options: [{ value: "active", label: "Active" }, { value: "frozen", label: "Frozen" }, { value: "closed", label: "Closed" }] },
-          { key: "kyc", label: "KYC", options: [{ value: "none", label: "Not submitted" }, { value: "pending", label: "Waiting for review" }, { value: "approved", label: "Approved" }, { value: "rejected", label: "Rejected" }] },
+          { key: "kyc", label: "KYC", options: [{ value: "none", label: "Not submitted" }, { value: "partial", label: "Partly verified" }, { value: "pending", label: "Waiting for review" }, { value: "approved", label: "Approved" }, { value: "rejected", label: "Rejected" }] },
           { key: "assigned", label: "Assigned", options: [{ value: "me", label: "To me" }, { value: "none", label: "Nobody" }] },
           { key: "country", label: "Country", options: (s?.countries ?? []).map((c) => ({ value: c, label: c })) },
           { key: "source", label: "Joined via", options: Object.entries(SOURCE_LABEL).map(([value, label]) => ({ value, label })) },
@@ -311,6 +314,7 @@ interface Activity {
   actor: string;
   action: string;
   ip: string;
+  meta?: unknown;
 }
 interface Revealed {
   phone: string | null;
@@ -321,12 +325,13 @@ interface Revealed {
 }
 
 
-function CountrySelect({ value, onChange }: { value: string; onChange: (country: string, dial: string) => void }) {
+function CountrySelect({ value, onChange, disabled }: { value: string; onChange: (country: string, dial: string) => void; disabled?: boolean }) {
   const known = COUNTRIES.some((c) => c.name === value);
   return (
     <select
       className="input"
       value={value}
+      disabled={disabled}
       onChange={(e) => {
         const c = COUNTRIES.find((x) => x.name === e.target.value);
         onChange(e.target.value, c?.dial.replace(/\D/g, "") ?? "");
@@ -699,7 +704,31 @@ const shortAgent = (ua: string) => {
   return os ? `${browser} on ${os}` : browser;
 };
 
+// What the client was told is KYC status (kyc.view); every other reason is compliance's own reasoning (kyc.documents).
+const TOLD_THE_CLIENT = new Set(["kyc.rejected", "kyc.new_document_requested"]);
+
+// For KYC entries: which document, and the reason given when this staff member may see it.
+function kycDetail(a: Activity, reasons: "all" | "client" | "none") {
+  if (!a.action.startsWith("kyc.")) return null;
+  let meta = a.meta;
+  if (typeof meta === "string") {
+    try {
+      meta = JSON.parse(meta);
+    } catch {
+      return null;
+    }
+  }
+  if (!meta || typeof meta !== "object") return null;
+  const m = meta as { category?: unknown; reason?: unknown };
+  const parts = [m.category === "identity" ? "Proof of identity" : m.category === "address" ? "Proof of address" : null];
+  const showReason = reasons === "all" || (reasons === "client" && TOLD_THE_CLIENT.has(a.action));
+  if (showReason && typeof m.reason === "string" && m.reason) parts.push(`Reason: ${m.reason}`);
+  return parts.filter(Boolean).join(" · ") || null;
+}
+
 function ActivityPanel({ id }: { id: string }) {
+  const can = useCan();
+  const reasons = can("kyc.documents") ? "all" : can("kyc.view") ? "client" : "none";
   const activity = useQuery({ queryKey: ["client-activity", id], queryFn: () => api.get<{ items: Activity[] }>(`/api/staff/clients/${id}/activity`) });
   return (
     <section className="panel">
@@ -714,6 +743,7 @@ function ActivityPanel({ id }: { id: string }) {
         {activity.data?.items.map((a) => (
           <li key={a.id} className={a.actorType === "staff" ? "by-staff" : ""}>
             <strong>{actionLabel(a.action)}</strong>
+            {kycDetail(a, reasons) && <small>{kycDetail(a, reasons)}</small>}
             <small className="muted">
               {formatDate(a.at)} · {a.actorType === "staff" ? `by ${a.actor}` : a.actorType === "client" ? "by the client" : "system"}
               {a.ip ? ` · ${a.ip}` : ""}
@@ -726,8 +756,9 @@ function ActivityPanel({ id }: { id: string }) {
 }
 
 function EditClientDialog({ c, onClose, onSaved }: { c: Client; onClose: () => void; onSaved: () => void }) {
+  const can = useCan();
   const { toast } = useFeedback();
-  const [form, setForm] = useState({
+  const initial = {
     firstName: c.firstName,
     lastName: c.lastName,
     email: c.email,
@@ -736,20 +767,28 @@ function EditClientDialog({ c, onClose, onSaved }: { c: Client; onClose: () => v
     gender: c.gender ?? "",
     business_name: c.businessName ?? "",
     importantNotice: c.importantNotice ?? "",
-  });
+  };
+  const [form, setForm] = useState(initial);
   const set = (patch: Partial<typeof form>) => setForm({ ...form, ...patch });
+  // Details checked against the client's documents: only a compliance admin changes them, with a 2FA code.
+  const locked = new Set(c.lockedFields ?? []);
+  const mayChangeVerified = can("kyc.override");
+  const lockedFor = (field: string) => locked.has(field) && !mayChangeVerified;
+  const lockHint = (field: string) =>
+    locked.has(field) ? (
+      <span className="lock-hint">
+        <Lock size={12} /> {mayChangeVerified ? "Checked against the client's documents. Changing it needs your 2FA code." : "Checked against the client's documents. Ask a compliance admin to change it."}
+      </span>
+    ) : undefined;
   const save = useMutation({
-    mutationFn: () =>
-      api.patch<Client>(`/api/staff/clients/${c.id}`, {
-        firstName: form.firstName,
-        lastName: form.lastName,
-        email: form.email,
-        country: form.country,
-        city: form.city,
-        gender: form.gender,
-        business_name: form.business_name,
-        importantNotice: form.importantNotice.trim() || null,
-      }),
+    mutationFn: () => {
+      // Only what was changed goes up, so untouched details are never part of the edit.
+      const body: Record<string, unknown> = {};
+      for (const key of Object.keys(form) as (keyof typeof form)[]) {
+        if (form[key] !== initial[key]) body[key] = key === "importantNotice" ? form.importantNotice.trim() || null : form[key];
+      }
+      return Object.keys(body).length ? api.patch<Client>(`/api/staff/clients/${c.id}`, body) : Promise.resolve(c);
+    },
     onSuccess: () => {
       toast("Client updated.");
       onSaved();
@@ -765,11 +804,11 @@ function EditClientDialog({ c, onClose, onSaved }: { c: Client; onClose: () => v
         }}
       >
         <div className="form-grid">
-          <Field label="First name">
-            <input className="input" value={form.firstName} onChange={(e) => set({ firstName: e.target.value })} required />
+          <Field label="First name" hint={lockHint("firstName")}>
+            <input className="input" value={form.firstName} onChange={(e) => set({ firstName: e.target.value })} disabled={lockedFor("firstName")} required />
           </Field>
-          <Field label="Last name">
-            <input className="input" value={form.lastName} onChange={(e) => set({ lastName: e.target.value })} required />
+          <Field label="Last name" hint={lockHint("lastName")}>
+            <input className="input" value={form.lastName} onChange={(e) => set({ lastName: e.target.value })} disabled={lockedFor("lastName")} required />
           </Field>
           <Field label="Sign-in email" hint={form.email !== c.email ? "Changing it needs your 2FA code, and the old address is told." : undefined}>
             <input className="input" type="email" value={form.email} onChange={(e) => set({ email: e.target.value })} required />
@@ -781,11 +820,11 @@ function EditClientDialog({ c, onClose, onSaved }: { c: Client; onClose: () => v
               <option value="Female">Female</option>
             </select>
           </Field>
-          <Field label="Country">
-            <CountrySelect value={form.country} onChange={(country) => set({ country })} />
+          <Field label="Country" hint={lockHint("country")}>
+            <CountrySelect value={form.country} onChange={(country) => set({ country })} disabled={lockedFor("country")} />
           </Field>
-          <Field label="City">
-            <input className="input" value={form.city} onChange={(e) => set({ city: e.target.value })} />
+          <Field label="City" hint={lockHint("city")}>
+            <input className="input" value={form.city} onChange={(e) => set({ city: e.target.value })} disabled={lockedFor("city")} />
           </Field>
           <Field label="Business name">
             <input className="input" value={form.business_name} onChange={(e) => set({ business_name: e.target.value })} />
@@ -794,7 +833,10 @@ function EditClientDialog({ c, onClose, onSaved }: { c: Client; onClose: () => v
         <Field label="Notice shown to the client" hint="Appears at the top of their portal and app profile. Leave empty for none.">
           <textarea className="input" rows={2} maxLength={500} value={form.importantNotice} onChange={(e) => set({ importantNotice: e.target.value })} />
         </Field>
-        <p className="muted tight">Phone, address and date of birth are changed by the client in the portal, or after verifying their identity.</p>
+        <p className="muted tight">
+          The client changes their phone in the portal. Their address and date of birth lock once documents for them are sent. To let the client change them, reject the
+          waiting document, or use Ask for a new document on an approved one.
+        </p>
         <ErrorText error={save.error} />
         <div className="actions">
           <button type="button" className="button" onClick={onClose}>

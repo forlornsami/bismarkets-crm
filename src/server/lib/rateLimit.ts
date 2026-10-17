@@ -23,6 +23,12 @@ export class RateLimiter {
     return entry.count <= this.limit;
   }
 
+  /** True while the key has used up its limit, without recording a hit. */
+  isLimited(key: string, now = Date.now()): boolean {
+    const entry = this.hits.get(key);
+    return Boolean(entry && entry.resetAt > now && entry.count >= this.limit);
+  }
+
   /** Whole seconds until the key's window resets (for a Retry-After header). */
   retryAfter(key: string, now = Date.now()): number {
     const entry = this.hits.get(key);

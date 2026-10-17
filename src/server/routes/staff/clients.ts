@@ -14,6 +14,7 @@ import {
   updateClientColumns,
   type ClientRow,
 } from "../../clients/model";
+import { latestSubmissions, lockedProfileFields, sameProfileValue, type SnapshotField } from "../../clients/kyc";
 import { createResetLink } from "../../clients/reset";
 import { createClientSession, revokeClientSessions } from "../../clients/session";
 import { notifyClient } from "../../clients/notifications";
@@ -27,6 +28,10 @@ import { deletePicture } from "../../lib/pictures";
 import { requirePermission, requireStepUp, staffActor, staffOf, type StaffContext } from "../../staff/session";
 
 const id = z.coerce.number().int().positive();
+/** Profile columns as the admin edit form names them. */
+const FORM_FIELD: Record<SnapshotField, string> = {
+  first_name: "firstName", last_name: "lastName", dob: "dob", country: "country", city: "city", address: "address", zipcode: "zipcode",
+};
 const SORT_COLUMNS = { created_at: "c.created_at", name: "c.last_name", email: "c.email", last_login_at: "c.last_login_at", id: "c.id" } as const;
 
 // Personal data is masked in every list and profile; showing it in full is a
@@ -112,7 +117,7 @@ export function staffClientsRouter(deps: AppDeps): Router {
           assigned: z.string().regex(/^(me|none|\d+)$/).optional().or(z.literal("").transform(() => undefined)),
           source: z.enum(["portal", "app", "staff", "import"]).optional().or(z.literal("").transform(() => undefined)),
           verified: z.enum(["yes", "no"]).optional().or(z.literal("").transform(() => undefined)),
-          kyc: z.enum(["none", "pending", "approved", "rejected"]).optional().or(z.literal("").transform(() => undefined)),
+          kyc: z.enum(["none", "partial", "pending", "approved", "rejected"]).optional().or(z.literal("").transform(() => undefined)),
           country: z.string().trim().max(80).optional(),
         }),
         req.query,
@@ -250,7 +255,9 @@ export function staffClientsRouter(deps: AppDeps): Router {
                 (SELECT COUNT(*) FROM clients WHERE referred_by = ?) AS referrals`,
         [row.id, row.id, row.id],
       );
-      res.json({ ...present(row), activeSessions: Number(counts?.sessions ?? 0), notesCount: Number(counts?.notes ?? 0), referrals: Number(counts?.referrals ?? 0) });
+      // Fields checked against documents under review or approved; the edit form shows them locked.
+      const lockedFields = lockedProfileFields(await latestSubmissions(db, row.id)).map((f) => FORM_FIELD[f]);
+      res.json({ ...present(row), activeSessions: Number(counts?.sessions ?? 0), notesCount: Number(counts?.notes ?? 0), referrals: Number(counts?.referrals ?? 0), lockedFields });
     }),
   );
 
@@ -290,26 +297,38 @@ export function staffClientsRouter(deps: AppDeps): Router {
       const clientId = parse(id, req.params.id);
       const body = parse(editSchema, req.body);
       const updated = await transaction(db, async (conn) => {
+        const staff = staffOf(req);
+        const freshStepUp = () => {
+          const at = staff.stepUpAt;
+          if (!at || at.getTime() + config.stepUpMs <= Date.now()) throw new HttpError(403, "STEP_UP_REQUIRED", "Enter your 2FA code to confirm this action.");
+        };
         const before = await loadVisible(conn, req, clientId, true);
         const columns = profileColumns({ ...body, first_name: body.firstName, last_name: body.lastName });
         if (body.importantNotice !== undefined) columns.push(["important_notice", body.importantNotice || null]);
         if (body.email && body.email !== before.email) {
           // Changing where a client signs in is sensitive: fresh 2FA, and the old address is told.
-          const at = staffOf(req).stepUpAt;
-          if (!at || at.getTime() + config.stepUpMs <= Date.now()) throw new HttpError(403, "STEP_UP_REQUIRED", "Enter your 2FA code to confirm this action.");
+          freshStepUp();
           if (await one(conn, "SELECT id FROM clients WHERE email = ? AND id <> ?", [body.email, clientId])) throw conflict("A client with this email already exists.");
           columns.push(["email", body.email]);
         }
         const old = before as unknown as Record<string, unknown>;
         const changed = columns.filter(([k, v]) => String(old[k] ?? "") !== String(v ?? ""));
         if (changed.length === 0) return before;
+        // Details checked against documents under review or approved: only
+        // kyc.override holders change them, with a fresh 2FA code.
+        const locked = new Set<string>(lockedProfileFields(await latestSubmissions(conn, clientId, true)));
+        const verified = changed.filter(([k, v]) => locked.has(k) && !sameProfileValue(old[k], v)).map(([k]) => k);
+        if (verified.length) {
+          if (!staff.permissions.has("kyc.override")) throw forbidden("These details were checked against the client's documents. Ask a compliance admin to change them.");
+          freshStepUp();
+        }
         await updateClientColumns(conn, clientId, changed);
         const plain = changed.filter(([k]) => PLAIN_FIELDS.has(k));
         await writeAudit(conn, ctx(req), {
-          action: "client.updated", entityType: "client", entityId: clientId,
+          action: verified.length ? "client.verified_details_changed" : "client.updated", entityType: "client", entityId: clientId,
           before: Object.fromEntries(plain.map(([k]) => [k, old[k] ?? null])),
           after: Object.fromEntries(plain),
-          meta: { fields: changed.map(([k]) => k) },
+          meta: { fields: changed.map(([k]) => k), ...(verified.length ? { verifiedFields: verified } : {}) },
         });
         if (body.email && body.email !== before.email) {
           await queueEmail(conn, config, {
@@ -514,8 +533,17 @@ export function staffClientsRouter(deps: AppDeps): Router {
          WHERE entity_type = 'client' AND entity_id = ? ORDER BY id DESC LIMIT 100`,
         [String(row.id)],
       );
+      // KYC entries can hold internal notes and audit-only reasons. Without kyc.documents only the
+      // reason the client was shown is kept.
+      const fullKyc = staffOf(req).permissions.has("kyc.documents");
+      const meta = (a: (typeof list)[number]) => {
+        if (!a.action.startsWith("kyc.") || fullKyc || !a.meta_json || typeof a.meta_json !== "object") return a.meta_json ?? null;
+        const m = a.meta_json as Record<string, unknown>;
+        const shown = a.action === "kyc.rejected" || a.action === "kyc.new_document_requested";
+        return { submissionId: m.submissionId, category: m.category, ...(shown ? { reason: m.reason } : {}) };
+      };
       res.json({
-        items: list.map((a) => ({ id: a.id, at: a.occurred_at.toISOString(), actorType: a.actor_type, actor: a.actor_label, action: a.action, ip: a.ip, meta: a.meta_json ?? null })),
+        items: list.map((a) => ({ id: a.id, at: a.occurred_at.toISOString(), actorType: a.actor_type, actor: a.actor_label, action: a.action, ip: a.ip, meta: meta(a) })),
       });
     }),
   );

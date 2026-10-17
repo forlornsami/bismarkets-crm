@@ -22,9 +22,9 @@ import { AuthScreen, Login } from "./pages/Login";
 import { Roles } from "./pages/Roles";
 import { StaffDetail, StaffList } from "./pages/Staff";
 
-function Guarded({ permission, children }: { permission: string; children: React.ReactNode }) {
+function Guarded({ permission, children }: { permission: string | string[]; children: React.ReactNode }) {
   const can = useCan();
-  return can(permission) ? (
+  return can(...[permission].flat()) ? (
     <>{children}</>
   ) : (
     <div className="panel">
@@ -130,8 +130,9 @@ export function App() {
           </Route>
           <Route path="/kyc/:id">
             {(params) => (
-              <Guarded permission="kyc.view">
-                <KycWorkbench id={params.id} />
+              <Guarded permission={["kyc.view", "kyc.documents"]}>
+                {/* A fresh screen for every item, so nothing from the last one carries over. */}
+                <KycWorkbench key={params.id} id={params.id} />
               </Guarded>
             )}
           </Route>

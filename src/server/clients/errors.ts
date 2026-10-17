@@ -6,7 +6,11 @@ import { HttpError } from "../lib/http";
 // answers errors in Laravel's shape: { message, errors: { field: [text] } }.
 
 export class ValidationError extends HttpError {
-  constructor(public fields: Record<string, string[]>) {
+  constructor(
+    public fields: Record<string, string[]>,
+    /** Extra top-level keys for the error body, next to message and errors. */
+    public extra: Record<string, unknown> = {},
+  ) {
     super(422, "VALIDATION", Object.values(fields)[0]?.[0] ?? "The given data was invalid.");
   }
 }
@@ -38,7 +42,7 @@ function issuesToFields(error: ZodError): Record<string, string[]> {
 export function clientErrorMiddleware(log: { error: (obj: unknown, msg: string) => void }) {
   return (error: unknown, req: Request, res: Response, _next: NextFunction) => {
     if (error instanceof ValidationError) {
-      res.status(422).json({ message: error.message, errors: error.fields });
+      res.status(422).json({ ...error.extra, message: error.message, errors: error.fields });
       return;
     }
     if (error instanceof TooManyRequests) {

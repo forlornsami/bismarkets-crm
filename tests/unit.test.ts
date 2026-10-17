@@ -131,7 +131,10 @@ describe("permission catalog", () => {
   it("keeps the auditor read-only", () => {
     const auditor = DEFAULT_ROLES.find((r) => r.slug === "auditor")!;
     expect(auditor.permissions).not.toBe("all");
-    for (const p of auditor.permissions as string[]) expect(p.endsWith(".view") || p === "audit.verify" || p === "client.view_all").toBe(true);
+    for (const p of auditor.permissions as string[]) expect(p.endsWith(".view") || p === "audit.verify" || p === "client.view_all" || p === "kyc.documents").toBe(true);
+    // Opening KYC documents is its own permission: compliance and the auditor have it, sales and support do not.
+    expect(auditor.permissions).toContain("kyc.documents");
+    for (const slug of ["sales_agent", "sales_manager", "support_agent", "finance_agent"]) expect(DEFAULT_ROLES.find((r) => r.slug === slug)!.permissions).not.toContain("kyc.documents");
   });
 });
 

@@ -47,6 +47,22 @@ node dist/cli.mjs seed-roles
 node dist/cli.mjs create-super-admin --email you@bismarkets.com --name "Your Name"
 ```
 
+KYC photos are processed with `sharp`, which ships a native library for the
+server's platform. Run `npm ci` on the server itself (or on the same OS and
+CPU type), never copy `node_modules` from a laptop.
+
+Upgrading: stop the service, install the new release as above, run
+`node dist/cli.mjs migrate`, then start it again. Migrations also grant new
+permissions to the built-in roles (0011 gives `kyc.documents` to Super Admin,
+Admin, Compliance and Auditor); custom roles that should open KYC documents
+need it added under Roles.
+
+**Cutover order.** The client portal must run the version built for this CRM
+(bismarkets-client-portal PR #2) before or at the same moment
+`crmbismarkets.com` is pointed at this server. The older portal hides the
+CRM's field errors and KYC rejection reasons behind generic text. The Android
+app already shows the CRM's messages as written.
+
 ## 4. Run it
 
 `/etc/systemd/system/bismarkets-crm.service`:
@@ -78,21 +94,82 @@ curl -s localhost:3000/api/readyz
 
 ## 5. HTTPS with nginx
 
-Point `staff.crmbismarkets.com` at the server, get a certificate
-(`apt install certbot python3-certbot-nginx && certbot --nginx`), and proxy:
+Point `staff.crmbismarkets.com` (staff panel) and `crmbismarkets.com` (the API
+the client portal and app call) at the server, get certificates
+(`apt install certbot python3-certbot-nginx && certbot --nginx`), and proxy.
+Bodies stay small everywhere except the uploads that need more: KYC uploads
+carry up to two 10 MB files, and a client's profile picture is a 1 MB image
+sent as a form.
 
 ```nginx
+# At http level (outside the server blocks): the origins that may call the
+# client API, the same list as CRM_CLIENT_ORIGINS.
+map $http_origin $client_cors {
+  default "";
+  "https://bismarkets.global" $http_origin;
+}
+
+# Staff panel and staff API.
 server {
   server_name staff.crmbismarkets.com;
   client_max_body_size 1m;
+  proxy_set_header Host $host;
+  proxy_set_header X-Forwarded-For $remote_addr;
+  proxy_set_header X-Forwarded-Proto https;
+
   location / {
     proxy_pass http://127.0.0.1:3000;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-For $remote_addr;
-    proxy_set_header X-Forwarded-Proto https;
+  }
+  # KYC documents uploaded on a client's behalf.
+  location = /api/staff/kyc/upload {
+    client_max_body_size 21m;
+    proxy_read_timeout 150s;
+    proxy_pass http://127.0.0.1:3000;
+  }
+}
+
+# Client API for the portal and the app.
+server {
+  server_name crmbismarkets.com;
+  client_max_body_size 1m;
+  proxy_set_header Host $host;
+  proxy_set_header X-Forwarded-For $remote_addr;
+  proxy_set_header X-Forwarded-Proto https;
+
+  # A body over the limit is refused here, before the CRM sees it. Answer with
+  # JSON and the CORS header, or the portal's browser hides the 413.
+  error_page 413 = @too_large;
+  location @too_large {
+    default_type application/json;
+    add_header Access-Control-Allow-Origin $client_cors always;
+    add_header Vary Origin always;
+    return 413 '{"message":"The upload is too large."}';
+  }
+
+  location / {
+    proxy_pass http://127.0.0.1:3000;
+  }
+  location = /api/kyc {
+    client_max_body_size 21m;
+    proxy_read_timeout 150s;
+    proxy_pass http://127.0.0.1:3000;
+  }
+  location = /api/user/profile-picture {
+    client_max_body_size 3m;
+    proxy_pass http://127.0.0.1:3000;
   }
 }
 ```
+
+nginx answers a larger body with `413` before the CRM sees it. On the client
+API host that answer is the JSON above, with the CORS header, so the portal
+can read it and shows its "file too large" message; the app reads the status.
+The staff panel is on its own origin and reads nginx's plain `413` directly.
+
+KYC uploads get a longer `proxy_read_timeout`: photos are converted before they
+are stored, and a two-sided HEIC upload can take up to two minutes when the
+server is busy. With nginx's default of 60 s the client would see a `504` while
+the CRM still stores the document.
 
 With nginx on the same host, `CRM_TRUSTED_PROXIES=127.0.0.1`. If Cloudflare is
 in front, use nginx's `real_ip` module with Cloudflare's published ranges so

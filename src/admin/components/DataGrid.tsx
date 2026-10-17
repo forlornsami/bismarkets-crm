@@ -48,6 +48,10 @@ interface Props<T> {
   toolbar?: ReactNode;
   expanded?: (row: T) => ReactNode | null;
   emptyText?: string;
+  /** Heading for an empty list when nothing is filtered (default "Nothing here yet"). */
+  emptyTitle?: string;
+  /** The page's starting filters (such as "waiting for review"): they do not count as filtering, and Clear goes back to them. */
+  defaultFilters?: Record<string, string>;
 }
 
 const sortWords = (key: string) =>
@@ -60,10 +64,12 @@ export function DataGrid<T>(props: Props<T>) {
   const sortBy = (key: string) => set({ sort: key, dir: state.sort === key && state.dir === "desc" ? "asc" : "desc" });
   const first = total === 0 ? 0 : (state.page - 1) * state.pageSize + 1;
   const last = Math.min(total, state.page * state.pageSize);
-  const filtered = Boolean(state.q) || Object.values(state.filters).some(Boolean);
+  const defaults = props.defaultFilters ?? {};
+  const changed = [...new Set([...Object.keys(state.filters), ...Object.keys(defaults)])].filter((k) => (state.filters[k] ?? "") !== (defaults[k] ?? ""));
+  const filtered = Boolean(state.q) || changed.length > 0;
   // On phones a long row of dropdowns would fill the screen, so they fold behind one button.
   const [showFilters, setShowFilters] = useState(false);
-  const activeFilters = Object.values(state.filters).filter(Boolean).length;
+  const activeFilters = changed.length;
 
   return (
     <div className="grid">
@@ -110,7 +116,7 @@ export function DataGrid<T>(props: Props<T>) {
           </select>
         ))}
         {filtered && (
-          <button type="button" className="button button-ghost button-small" onClick={() => set({ q: undefined, filters: {} })}>
+          <button type="button" className="button button-ghost button-small" onClick={() => set({ q: undefined, filters: { ...defaults } })}>
             <X size={14} /> Clear
           </button>
         )}
@@ -190,7 +196,7 @@ export function DataGrid<T>(props: Props<T>) {
             {rows && rows.length === 0 && (
               <tr>
                 <td colSpan={columns.length} className="empty">
-                  <EmptyState icon={<Inbox size={36} />} title={filtered ? "No matches" : "Nothing here yet"}>
+                  <EmptyState icon={<Inbox size={36} />} title={filtered ? "No matches" : (props.emptyTitle ?? "Nothing here yet")}>
                     {filtered ? "Try a different search or clear the filters." : props.emptyText}
                   </EmptyState>
                 </td>

@@ -3,9 +3,9 @@ import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { describeAgent } from "../src/server/routes/client/account";
 import { decryptField } from "../src/server/lib/crypto";
-import { exec, one } from "../src/server/lib/db";
+import { exec, one, transaction } from "../src/server/lib/db";
 import { outboxContext } from "../src/server/lib/email";
-import { deliverSupportEvents, signSupportEvent, SUPPORT_EVENTS_PATH } from "../src/server/lib/events";
+import { deliverSupportEvents, queueSupportEvent, signSupportEvent, SUPPORT_EVENTS_PATH } from "../src/server/lib/events";
 import { createStaff, hasDb, post, setup, signIn, stepUp, type SignedIn, type TestEnv } from "./helpers";
 
 const GOOD = "Sunny-Day-42!";
@@ -163,5 +163,33 @@ describe.skipIf(!hasDb)("client notifications, devices and support events", () =
     answer = 401;
     await deliverSupportEvents(env.db, env.config, fakeFetch);
     expect(await one(env.db, "SELECT id FROM webhook_outbox WHERE status = 'failed' AND last_status = 401")).toBeTruthy();
+  });
+
+  it("holds a lease while sending and drops KYC pushes older than a day", async () => {
+    const { user } = await register("stale@client.test");
+    await exec(env.db, "UPDATE webhook_outbox SET status = 'delivered' WHERE status = 'queued'");
+    await transaction(env.db, async (conn) => {
+      await queueSupportEvent(conn, env.config, { event: "kyc.approved", clientId: user.id });
+      await queueSupportEvent(conn, env.config, { event: "account.disabled", clientId: user.id });
+      await queueSupportEvent(conn, env.config, { event: "kyc.identity.rejected", clientId: user.id });
+    });
+    await exec(env.db, "UPDATE webhook_outbox SET created_at = CURRENT_TIMESTAMP(3) - INTERVAL 25 HOUR WHERE client_id = ? AND event IN ('kyc.approved', 'account.disabled')", [user.id]);
+
+    const sent: string[] = [];
+    let during = -1;
+    const fakeFetch = (async (_url: string, init: RequestInit) => {
+      sent.push(JSON.parse(String(init.body)).event);
+      // A second sender running meanwhile finds nothing: the rows are leased, not locked.
+      if (during < 0) during = await deliverSupportEvents(env.db, env.config, fakeFetch, undefined, 500);
+      return new Response("{}", { status: 202 });
+    }) as unknown as typeof fetch;
+    expect(await deliverSupportEvents(env.db, env.config, fakeFetch, undefined, 500)).toBe(2);
+    expect(during).toBe(0);
+    expect(sent.sort()).toEqual(["account.disabled", "kyc.identity.rejected"]);
+    const rows = (await env.db.query("SELECT event, status, last_error FROM webhook_outbox WHERE client_id = ? AND event LIKE 'kyc.%' ORDER BY id", [user.id]))[0] as { event: string; status: string; last_error: string | null }[];
+    expect(rows).toEqual([
+      { event: "kyc.approved", status: "failed", last_error: "expired" },
+      { event: "kyc.identity.rejected", status: "delivered", last_error: null },
+    ]);
   });
 });

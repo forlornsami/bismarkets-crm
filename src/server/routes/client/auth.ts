@@ -19,6 +19,7 @@ import {
   type ClientRow,
   type CodePurpose,
 } from "../../clients/model";
+import { latestSubmissions, lockClient, lockedProfileFields, sameProfileValue } from "../../clients/kyc";
 import { createResetLink } from "../../clients/reset";
 import { fieldError, TooManyRequests, validate, ValidationError } from "../../clients/errors";
 import { bearerToken, clientActor, clientAuth, clientOf, createClientSession, noImpersonation, revokeClientSession, revokeClientSessions } from "../../clients/session";
@@ -356,10 +357,22 @@ export function clientAuthRouter(deps: AppDeps): Router {
         raw,
       );
       const updated = await transaction(db, async (conn) => {
-        const before = (await loadClient(conn, client.id, true))!;
-        const columns = profileColumns(body);
+        await lockClient(conn, client.id);
+        const before = (await loadClient(conn, client.id))!;
+        const old = before as unknown as Record<string, unknown>;
+        // Details checked against documents under review or approved stay as
+        // they are. The portal and app send the whole form, so only a real
+        // change is refused; an unchanged value is simply not written.
+        const locked = new Set<string>(lockedProfileFields(await latestSubmissions(conn, client.id, true)));
+        const refused: Record<string, string[]> = {};
+        const columns = profileColumns(body).filter(([k, v]) => {
+          if (!locked.has(k)) return true;
+          if (!sameProfileValue(old[k], v)) refused[k] = ["This was checked with your documents. Contact support to change it."];
+          return false;
+        });
+        if (Object.keys(refused).length) throw new ValidationError(refused);
         await updateClientColumns(conn, client.id, columns);
-        const changed = columns.filter(([k, v]) => String((before as unknown as Record<string, unknown>)[k] ?? "") !== String(v ?? "")).map(([k]) => k);
+        const changed = columns.filter(([k, v]) => String(old[k] ?? "") !== String(v ?? "")).map(([k]) => k);
         if (changed.length) await writeAudit(conn, ctx(req, client), { action: "client.profile_updated", entityType: "client", entityId: client.id, meta: { fields: changed } });
         return (await loadClient(conn, client.id))!;
       });
@@ -371,7 +384,8 @@ export function clientAuthRouter(deps: AppDeps): Router {
     "/user/profile-picture",
     auth,
     noImpersonation,
-    express.raw({ type: "multipart/form-data", limit: PICTURE_MAX_BYTES + 64 * 1024 }),
+    // The portal and app send the picture twice (image and image_name), so allow for both copies.
+    express.raw({ type: "multipart/form-data", limit: 2 * PICTURE_MAX_BYTES + 64 * 1024 }),
     handler(async (req, res) => {
       const client = clientOf(req);
       if (!Buffer.isBuffer(req.body)) throw fieldError("image", "Choose a picture to upload.");

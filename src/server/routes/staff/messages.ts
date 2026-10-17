@@ -69,7 +69,7 @@ const idList = (max: number) => z.array(z.coerce.number().int().positive()).max(
 const clientFilter = z.object({
   clientIds: idList(500),
   status: z.array(z.enum(["active", "frozen", "closed"])).max(3).optional(),
-  kyc: z.array(z.enum(["none", "pending", "approved", "rejected"])).max(4).optional(),
+  kyc: z.array(z.enum(["none", "partial", "pending", "approved", "rejected"])).max(5).optional(),
   countries: z.array(z.string().trim().min(1).max(80)).max(50).optional(),
   assigned: z.union([z.literal("me"), z.literal("none"), z.coerce.number().int().positive()]).optional(),
   registeredFrom: z.string().date().optional(),

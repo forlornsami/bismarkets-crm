@@ -54,8 +54,42 @@ async function send<T>(method: string, url: string, body?: unknown, retried = fa
   return data as T;
 }
 
+/**
+ * Reads a file the staff API serves as raw bytes (KYC documents), with the same
+ * session cookie and error handling as `api`, so the page can draw it itself.
+ */
+async function bytes(url: string): Promise<ArrayBuffer> {
+  const res = await fetch(url, { credentials: "same-origin", cache: "no-store" });
+  if (!res.ok) {
+    const err = (await res.json().catch(() => ({})))?.error ?? {};
+    if (res.status === 401) sessionLostHandler?.();
+    throw new ApiError(res.status, err.code ?? "ERROR", err.message ?? "Could not open the file.", err.details);
+  }
+  return res.arrayBuffer();
+}
+
+/**
+ * A POST that still goes out while the tab is closing (keepalive), for letting
+ * go of things the page holds. sendBeacon cannot carry the CSRF header.
+ */
+function sendOnExit(url: string, body: unknown = {}) {
+  try {
+    void fetch(url, {
+      method: "POST",
+      keepalive: true,
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", Accept: "application/json", "X-CSRF-Token": csrfToken },
+      body: JSON.stringify(body),
+    }).catch(() => undefined);
+  } catch {
+    /* the page is going away anyway */
+  }
+}
+
 export const api = {
   get: <T>(url: string) => send<T>("GET", url),
+  bytes,
+  sendOnExit,
   post: <T>(url: string, body: unknown = {}) => send<T>("POST", url, body),
   patch: <T>(url: string, body: unknown) => send<T>("PATCH", url, body),
   put: <T>(url: string, body: unknown) => send<T>("PUT", url, body),

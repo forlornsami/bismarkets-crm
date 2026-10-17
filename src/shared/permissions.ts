@@ -45,10 +45,11 @@ export const PERMISSION_GROUPS = {
   kyc: {
     label: "KYC",
     permissions: {
-      "kyc.view": "View KYC submissions and documents",
+      "kyc.view": "View the KYC queue and each client's KYC status",
+      "kyc.documents": "Open KYC submissions, documents and the client details they are checked against",
       "kyc.decide": "Approve or reject KYC, and change a decision later",
       "kyc.upload": "Upload KYC documents on behalf of a client",
-      "kyc.override": "Approve KYC without documents, or approve documents you uploaded yourself",
+      "kyc.override": "Approve KYC without documents, and change client details already checked against documents",
       "kyc.settings": "Manage KYC document types and tiers",
     },
   },
@@ -176,8 +177,9 @@ export interface DefaultRole {
   permissions: readonly Permission[] | "all";
 }
 
+// Opening KYC documents is read-only too, so the auditor can check reviews.
 const viewOnly = ALL_PERMISSIONS.filter(
-  (p) => p.endsWith(".view") || p === "audit.verify" || p === "client.view_all",
+  (p) => p.endsWith(".view") || p === "audit.verify" || p === "client.view_all" || p === "kyc.documents",
 );
 
 // System roles are seeded by `cli seed-roles`. Super Admin always holds every
@@ -201,7 +203,7 @@ export const DEFAULT_ROLES: readonly DefaultRole[] = [
     description: "KYC and AML decisions, risk scores and account freezes.",
     permissions: [
       "client.view", "client.view_all", "client.status", "client.notes", "client.pii.reveal",
-      "kyc.view", "kyc.decide", "kyc.upload", "kyc.settings", "aml.view", "aml.decide", "aml.freeze",
+      "kyc.view", "kyc.documents", "kyc.decide", "kyc.upload", "kyc.settings", "aml.view", "aml.decide", "aml.freeze",
       "deposit.view", "withdrawal.view", "wallet.view", "mt5.view", "ib.view", "audit.view", "report.view",
     ],
   },

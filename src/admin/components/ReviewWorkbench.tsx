@@ -1,5 +1,7 @@
-import { AlertTriangle, ArrowLeft, Check, Download, FileText, Info, Keyboard, Maximize2, RotateCcw, RotateCw, SkipForward, X, ZoomIn, ZoomOut } from "lucide-react";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { AlertTriangle, ArrowLeft, Check, ChevronLeft, ChevronRight, Download, FileText, Info, Keyboard, Maximize2, RotateCcw, RotateCw, SkipForward, X, ZoomIn, ZoomOut } from "lucide-react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import type { PDFDocumentProxy, RenderTask } from "pdfjs-dist";
+import { ApiError, api } from "../lib/api";
 import { Dialog, ErrorText, Spinner } from "./ui";
 
 // The shared review screen for every approval queue: KYC now, deposits and
@@ -18,46 +20,323 @@ export interface ReviewFile {
 export interface ReviewWarning {
   tone: "bad" | "warn" | "info";
   text: string;
+  /** Opens in a new tab, so the item stays held while the reviewer looks. */
+  href?: string;
+  linkLabel?: string;
 }
 
 const kb = (n: number) => (n > 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : `${Math.ceil(n / 1024)} KB`);
-const isImage = (t: string) => t.startsWith("image/") && t !== "image/heic";
+const isPdf = (t: string) => t === "application/pdf";
+// HEIC is converted to JPEG when it is uploaded; only older uploads are still HEIC, which browsers cannot draw.
+const isImage = (t: string) => t.startsWith("image/") && t !== "image/heic" && t !== "image/heif";
+// Only fields that take text count as typing; a focused checkbox must not swallow the shortcuts.
+const TEXT_ENTRY = 'textarea, select, [contenteditable=""], [contenteditable="true"], input:not([type=checkbox]):not([type=radio]):not([type=button]):not([type=submit]):not([type=reset])';
 const typing = (e: KeyboardEvent) => {
   const el = e.target as HTMLElement | null;
-  return !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable);
+  return !!el && typeof el.matches === "function" && (el.matches(TEXT_ENTRY) || el.isContentEditable);
+};
+// The server refuses links and markup in anything a reviewer writes (the same rule), so say so before the 2FA prompt.
+const NOT_PLAIN = /[<>{}`\\]|https?:|\bwww\./i;
+export const plainProblem = (text: string, what: "reason" | "note") => (NOT_PLAIN.test(text) ? `Write the ${what} as plain text, without links or symbols like < > { }` : null);
+
+/** A refused decision, in the server's own words for each field rather than just "Check the highlighted fields." */
+export function DecisionError({ error }: { error: unknown }) {
+  const details = error instanceof ApiError ? error.details : undefined;
+  if (!details?.length) return <ErrorText error={error} />;
+  return (
+    <p className="error-text" role="alert">
+      {details.map((d) => d.message).join(" ")}
+    </p>
+  );
+}
+
+const lowerList = (items: string[]) => {
+  const words = items.map((w) => w.toLowerCase());
+  return words.length < 2 ? (words[0] ?? "") : `${words.slice(0, -1).join(", ")} and ${words[words.length - 1]}`;
 };
 
-/** Keyboard shortcuts that stay quiet while the reviewer is typing. */
-export function useShortcuts(map: Record<string, () => void>, enabled = true) {
+// ---------- Shortcut setting ----------
+// Single-key shortcuts can be switched off (WCAG 2.1.4). The choice is kept in
+// this browser only; it is a convenience, so a blocked storage just means "on".
+
+const SHORTCUTS_KEY = "review-shortcuts";
+let shortcutsOn = (() => {
+  try {
+    return localStorage.getItem(SHORTCUTS_KEY) !== "off";
+  } catch {
+    return true;
+  }
+})();
+const shortcutListeners = new Set<() => void>();
+
+export function useShortcutsSetting(): [boolean, (on: boolean) => void] {
+  const on = useSyncExternalStore(
+    (fn) => {
+      shortcutListeners.add(fn);
+      return () => shortcutListeners.delete(fn);
+    },
+    () => shortcutsOn,
+  );
+  const set = useCallback((value: boolean) => {
+    shortcutsOn = value;
+    try {
+      localStorage.setItem(SHORTCUTS_KEY, value ? "on" : "off");
+    } catch {
+      /* private mode: the choice lasts until the page reloads */
+    }
+    shortcutListeners.forEach((fn) => fn());
+  }, []);
+  return [on, set];
+}
+
+/**
+ * Keyboard shortcuts that stay quiet while the reviewer is typing, while any
+ * dialog (such as the 2FA prompt) is open, and, for letters, digits and
+ * symbols, when the reviewer has switched single-key shortcuts off.
+ */
+export function useShortcuts(map: Record<string, (e: KeyboardEvent) => void>, enabled = true) {
   const ref = useRef(map);
   ref.current = map;
+  const [on] = useShortcutsSetting();
+  const onRef = useRef(on);
+  onRef.current = on;
   useEffect(() => {
     if (!enabled) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      if (e.ctrlKey || e.metaKey || e.altKey || e.isComposing || e.defaultPrevented) return;
+      if (document.querySelector("dialog[open]")) return;
+      if (e.key.length === 1 && !onRef.current) return;
       if (typing(e) && e.key !== "Escape") return;
       const fn = ref.current[e.key] ?? ref.current[e.key.toLowerCase()];
-      if (fn) {
-        e.preventDefault();
-        fn();
-      }
+      if (!fn) return;
+      e.preventDefault();
+      fn(e);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [enabled]);
 }
 
-/** Large document viewer with zoom, rotate and front/back switching. */
-export function DocumentViewer({ files }: { files: ReviewFile[] }) {
+// ---------- Document viewer ----------
+
+// pdf.js loads only when a PDF is opened, so the rest of the CRM stays small.
+// Its worker is bundled with the CRM and served from it, never from a CDN. The
+// "legacy" build carries polyfills: the plain build needs very new browser
+// features (such as Map.prototype.getOrInsertComputed) and fails without them.
+let pdfjs: Promise<typeof import("pdfjs-dist/legacy/build/pdf.mjs")> | null = null;
+const loadPdfjs = () =>
+  (pdfjs ??= Promise.all([import("pdfjs-dist/legacy/build/pdf.mjs"), import("pdfjs-dist/legacy/build/pdf.worker.min.mjs?url")])
+    .then(([lib, worker]) => {
+      lib.GlobalWorkerOptions.workerSrc = worker.default;
+      return lib;
+    })
+    .catch((e) => {
+      pdfjs = null;
+      throw e;
+    }));
+
+type Opened = { kind: "image"; bitmap: ImageBitmap } | { kind: "pdf"; doc: PDFDocumentProxy } | { kind: "failed"; message: string };
+
+const dispose = (o: Opened) => {
+  if (o.kind === "image") o.bitmap.close();
+  if (o.kind === "pdf") void o.doc.loadingTask.destroy();
+};
+
+/**
+ * Fetches a document and prepares it for drawing. Fetching is what the server
+ * records as "viewed", so this runs only for the page on screen, never ahead.
+ */
+async function openFile(file: ReviewFile): Promise<Opened> {
+  try {
+    const data = await api.bytes(file.url);
+    if (isPdf(file.type)) {
+      const lib = await loadPdfjs();
+      // Drawn to a canvas only: no text, annotation, form or script layer, and
+      // nothing in the file is ever run as code. pdf.js 6 dropped eval entirely;
+      // isEvalSupported stays false for any older build.
+      const options = {
+        data: new Uint8Array(data),
+        isEvalSupported: false,
+        enableXfa: false,
+        useWasm: false,
+        wasmUrl: "/pdfjs/decoders/",
+        cMapUrl: "/pdfjs/cmaps/",
+        standardFontDataUrl: "/pdfjs/standard_fonts/",
+        verbosity: 0,
+      } as Parameters<typeof lib.getDocument>[0];
+      return { kind: "pdf", doc: await lib.getDocument(options).promise };
+    }
+    return { kind: "image", bitmap: await createImageBitmap(new Blob([data], { type: file.type }), { imageOrientation: "from-image" }) };
+  } catch (e) {
+    const name = (e as { name?: string })?.name;
+    const message =
+      name === "PasswordException"
+        ? "This PDF is protected with a password."
+        : name === "InvalidPDFException"
+          ? "This file is damaged or is not a real PDF."
+          : e instanceof ApiError
+            ? e.message
+            : e instanceof Error && /fetch|network/i.test(e.message)
+              ? "The document could not be loaded. Check your connection and try again."
+              : "The browser could not read this file.";
+    return { kind: "failed", message };
+  }
+}
+
+// Canvas limits that hold on every browser, Safari included.
+const MAX_AREA = 16_000_000;
+const MAX_SIDE = 8192;
+
+/** One page drawn to fit the stage, then zoomed and turned; turning never clips. */
+function PageCanvas({ opened, page, turn, zoom, box, label }: { opened: Exclude<Opened, { kind: "failed" }>; page: number; turn: number; zoom: number; box: { w: number; h: number }; label: string }) {
+  const ref = useRef<HTMLCanvasElement>(null);
+  const [error, setError] = useState<string | null>(null);
+  const rotation = ((turn % 360) + 360) % 360;
+  useEffect(() => {
+    const canvas = ref.current;
+    if (!canvas || box.w < 20 || box.h < 20) return;
+    setError(null);
+    let cancelled = false;
+    let task: RenderTask | null = null;
+    const measure = (w: number, h: number) => {
+      const fit = Math.min(box.w / w, box.h / h);
+      const cssW = w * fit * zoom;
+      const cssH = h * fit * zoom;
+      const ratio = Math.min(window.devicePixelRatio || 1, Math.sqrt(MAX_AREA / (cssW * cssH)), MAX_SIDE / Math.max(cssW, cssH));
+      return { fit, cssW, cssH, ratio };
+    };
+    const place = (width: number, height: number, cssW: number, cssH: number) => {
+      canvas.width = width;
+      canvas.height = height;
+      canvas.style.width = `${cssW}px`;
+      canvas.style.height = `${cssH}px`;
+      return canvas.getContext("2d");
+    };
+    if (opened.kind === "image") {
+      const { bitmap } = opened;
+      const sideways = rotation % 180 !== 0;
+      const { cssW, cssH, ratio } = measure(sideways ? bitmap.height : bitmap.width, sideways ? bitmap.width : bitmap.height);
+      const cw = Math.max(1, Math.round(cssW * ratio));
+      const ch = Math.max(1, Math.round(cssH * ratio));
+      const ctx = place(cw, ch, cssW, cssH);
+      if (!ctx) return;
+      ctx.imageSmoothingQuality = "high";
+      ctx.translate(cw / 2, ch / 2);
+      ctx.rotate((rotation * Math.PI) / 180);
+      const [dw, dh] = sideways ? [ch, cw] : [cw, ch];
+      ctx.drawImage(bitmap, -dw / 2, -dh / 2, dw, dh);
+      return;
+    }
+    void (async () => {
+      try {
+        const p = await opened.doc.getPage(page);
+        if (cancelled) return;
+        const pageRotation = (p.rotate + rotation) % 360;
+        const base = p.getViewport({ scale: 1, rotation: pageRotation });
+        const { fit, cssW, cssH, ratio } = measure(base.width, base.height);
+        const viewport = p.getViewport({ scale: fit * zoom * ratio, rotation: pageRotation });
+        // Draw off screen first, so zooming does not flash a blank page.
+        const off = document.createElement("canvas");
+        off.width = Math.max(1, Math.floor(viewport.width));
+        off.height = Math.max(1, Math.floor(viewport.height));
+        task = p.render({ canvas: off, viewport });
+        await task.promise;
+        if (cancelled) return;
+        place(off.width, off.height, cssW, cssH)?.drawImage(off, 0, 0);
+        off.width = off.height = 0;
+      } catch (e) {
+        if (!cancelled && (e as { name?: string })?.name !== "RenderingCancelledException") setError("This page could not be drawn.");
+      }
+    })();
+    return () => {
+      cancelled = true;
+      task?.cancel();
+    };
+  }, [opened, page, rotation, zoom, box.w, box.h]);
+  if (error) return <p className="viewer-note error-text">{error}</p>;
+  return <canvas ref={ref} className="viewer-page" role="img" aria-label={label} />;
+}
+
+/**
+ * Large document viewer: photos and PDFs drawn to fit, with zoom, rotate,
+ * front/back and page switching. Tabs show which documents are not opened yet.
+ */
+export function DocumentViewer({ files, viewed, onViewed, banner }: { files: ReviewFile[]; viewed?: ReadonlySet<number>; onViewed?: (fileId: number) => void; banner?: ReactNode }) {
   const [index, setIndex] = useState(0);
+  const [page, setPage] = useState(1);
   const [zoom, setZoom] = useState(1);
   const [turn, setTurn] = useState(0);
-  const file = files[Math.min(index, files.length - 1)];
+  const [opened, setOpened] = useState<Record<number, Opened>>({});
+  const [box, setBox] = useState({ w: 0, h: 0 });
+  const [shortcutsOn] = useShortcutsSetting();
+  const stage = useRef<HTMLDivElement>(null);
+  const loading = useRef(new Set<number>());
+  const all = useRef(opened);
+  all.current = opened;
+  const alive = useRef(true);
+  const viewedRef = useRef(onViewed);
+  viewedRef.current = onViewed;
+  // A different set of files (such as the client's other document) starts at its first page.
+  // Reset while rendering, so a page from the old position is never fetched by mistake.
+  const filesKey = files.map((f) => f.id).join(",");
+  const [shownKey, setShownKey] = useState(filesKey);
+  if (shownKey !== filesKey) {
+    setShownKey(filesKey);
+    setIndex(0);
+    setPage(1);
+  }
+  const file = files[shownKey === filesKey ? Math.min(index, files.length - 1) : 0];
+  const current = file ? opened[file.id] : undefined;
+  const pages = current?.kind === "pdf" ? current.doc.numPages : 1;
+
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+      Object.values(all.current).forEach(dispose);
+    };
+  }, []);
   useEffect(() => {
     setZoom(1);
     setTurn(0);
-  }, [index]);
+  }, [file?.id]);
+  useEffect(() => {
+    const el = stage.current;
+    if (!el) return;
+    const observer = new ResizeObserver(([entry]) => entry && setBox({ w: Math.floor(entry.contentRect.width), h: Math.floor(entry.contentRect.height) }));
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [Boolean(file)]);
+  // Open the document on screen (only that one: opening is what gets recorded as viewed).
+  useEffect(() => {
+    if (!file || !(isPdf(file.type) || isImage(file.type)) || opened[file.id] || loading.current.has(file.id)) return;
+    loading.current.add(file.id);
+    void openFile(file).then((o) => {
+      loading.current.delete(file.id);
+      if (!alive.current) return dispose(o);
+      setOpened((prev) => ({ ...prev, [file.id]: o }));
+    });
+  }, [file, opened]);
+  // A document counts as opened once it is on screen.
+  useEffect(() => {
+    if (file && current && current.kind !== "failed") viewedRef.current?.(file.id);
+  }, [file?.id, current]);
+
   const step = (dir: number) => setZoom((z) => Math.min(4, Math.max(0.5, Math.round((z + dir * 0.25) * 100) / 100)));
+  const go = (dir: 1 | -1) => {
+    if (dir === 1 && page < pages) return setPage(page + 1);
+    if (dir === -1 && page > 1) return setPage(page - 1);
+    if (files.length < 2) return;
+    const next = (index + dir + files.length) % files.length;
+    const o = opened[files[next]!.id];
+    setIndex(next);
+    setPage(dir === -1 && o?.kind === "pdf" ? o.doc.numPages : 1);
+  };
+  const retry = (id: number) =>
+    setOpened((prev) => {
+      const { [id]: _, ...rest } = prev;
+      return rest;
+    });
   useShortcuts({
     "+": () => step(1),
     "=": () => step(1),
@@ -65,65 +344,151 @@ export function DocumentViewer({ files }: { files: ReviewFile[] }) {
     "0": () => (setZoom(1), setTurn(0)),
     "[": () => setTurn((t) => t - 90),
     "]": () => setTurn((t) => t + 90),
-    ArrowRight: () => setIndex((i) => (i + 1) % files.length),
-    ArrowLeft: () => setIndex((i) => (i - 1 + files.length) % files.length),
+    ArrowRight: () => go(1),
+    ArrowLeft: () => go(-1),
   });
+
+  // Drag to move around a zoomed page with the mouse; touch screens scroll natively.
+  const drag = useRef<{ x: number; y: number; left: number; top: number } | null>(null);
+  const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    const el = stage.current;
+    if (!el || e.pointerType !== "mouse" || e.button !== 0 || (el.scrollWidth <= el.clientWidth && el.scrollHeight <= el.clientHeight)) return;
+    drag.current = { x: e.clientX, y: e.clientY, left: el.scrollLeft, top: el.scrollTop };
+    el.setPointerCapture(e.pointerId);
+  };
+  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const el = stage.current;
+    if (!el || !drag.current) return;
+    el.scrollLeft = drag.current.left - (e.clientX - drag.current.x);
+    el.scrollTop = drag.current.top - (e.clientY - drag.current.y);
+  };
+  const endDrag = () => {
+    drag.current = null;
+  };
+
   if (!file) return <div className="viewer viewer-empty muted">No documents were attached.</div>;
+  const drawable = current && current.kind !== "failed";
+  const download = (text: ReactNode, hint: ReactNode, icon: ReactNode = <FileText size={44} />) => (
+    <a className="viewer-file" href={file.url} onClick={() => onViewed?.(file.id)}>
+      {icon}
+      <strong>{text}</strong>
+      <span className="muted">{hint}</span>
+      <span className="button">
+        <Download size={15} /> Download ({kb(file.bytes)})
+      </span>
+    </a>
+  );
   return (
     <div className="viewer">
       <div className="viewer-bar">
         {files.length > 1 && (
-          <div className="viewer-pages" role="tablist" aria-label="Pages">
-            {files.map((f, i) => (
-              <button key={f.id} type="button" role="tab" aria-selected={i === index} className={i === index ? "active" : ""} onClick={() => setIndex(i)}>
-                {f.label}
-              </button>
-            ))}
+          <div className="viewer-pages" role="tablist" aria-label="Documents">
+            {files.map((f, i) => {
+              const unseen = viewed && !viewed.has(f.id);
+              return (
+                <button
+                  key={f.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={i === index}
+                  className={i === index ? "active" : ""}
+                  onClick={() => (setIndex(i), setPage(1))}
+                  title={unseen ? "Not opened yet" : undefined}
+                >
+                  {f.label}
+                  {unseen && (
+                    <>
+                      <span className="viewer-dot" aria-hidden />
+                      <span className="sr-only">(not opened yet)</span>
+                    </>
+                  )}
+                </button>
+              );
+            })}
           </div>
         )}
-        <span className="muted viewer-meta">{kb(file.bytes)}</span>
-        {isImage(file.type) && (
+        {pages > 1 && (
+          <span className="viewer-paging">
+            <button type="button" className="icon-button" aria-label="Previous page" disabled={page <= 1} onClick={() => setPage(page - 1)}>
+              <ChevronLeft size={17} />
+            </button>
+            <span>
+              Page {page} of {pages}
+            </span>
+            <button type="button" className="icon-button" aria-label="Next page" disabled={page >= pages} onClick={() => setPage(page + 1)}>
+              <ChevronRight size={17} />
+            </button>
+          </span>
+        )}
+        <span className="muted viewer-meta">
+          {isPdf(file.type) ? "PDF · " : ""}
+          {kb(file.bytes)}
+        </span>
+        {drawable && (
           <span className="viewer-tools">
-            <button type="button" className="icon-button" title="Zoom out (−)" onClick={() => step(-1)}>
+            <button type="button" className="icon-button" title="Zoom out (−)" aria-label="Zoom out" onClick={() => step(-1)}>
               <ZoomOut size={17} />
             </button>
-            <span className="viewer-zoom">{Math.round(zoom * 100)}%</span>
-            <button type="button" className="icon-button" title="Zoom in (+)" onClick={() => step(1)}>
+            <button type="button" className="viewer-zoom" title="Fit to the screen (0)" onClick={() => (setZoom(1), setTurn(0))}>
+              {zoom === 1 ? "Fit" : `${Math.round(zoom * 100)}%`}
+            </button>
+            <button type="button" className="icon-button" title="Zoom in (+)" aria-label="Zoom in" onClick={() => step(1)}>
               <ZoomIn size={17} />
             </button>
-            <button type="button" className="icon-button" title="Rotate left ([)" onClick={() => setTurn((t) => t - 90)}>
+            <button type="button" className="icon-button" title="Turn left ([)" aria-label="Turn left" onClick={() => setTurn((t) => t - 90)}>
               <RotateCcw size={17} />
             </button>
-            <button type="button" className="icon-button" title="Rotate right (])" onClick={() => setTurn((t) => t + 90)}>
+            <button type="button" className="icon-button" title="Turn right (])" aria-label="Turn right" onClick={() => setTurn((t) => t + 90)}>
               <RotateCw size={17} />
             </button>
-            <a className="icon-button" title="Open full size in a new tab" href={file.url} target="_blank" rel="noreferrer">
-              <Maximize2 size={17} />
-            </a>
+            {isPdf(file.type) ? (
+              <a className="icon-button" title="Download the original PDF" aria-label="Download the original PDF" href={file.url}>
+                <Download size={17} />
+              </a>
+            ) : (
+              <a className="icon-button" title="Open full size in a new tab" aria-label="Open full size in a new tab" href={file.url} target="_blank" rel="noreferrer">
+                <Maximize2 size={17} />
+              </a>
+            )}
           </span>
         )}
       </div>
-      <div className="viewer-stage" onWheel={(e) => e.ctrlKey && (e.preventDefault(), step(e.deltaY < 0 ? 1 : -1))}>
-        {isImage(file.type) ? (
-          <img
-            key={file.id}
-            src={file.url}
-            alt={file.label}
-            style={{ transform: `rotate(${turn}deg)`, width: `${zoom * 100}%`, maxWidth: zoom === 1 ? "100%" : "none" }}
-            onDoubleClick={() => setZoom((z) => (z === 1 ? 2 : 1))}
-          />
-        ) : (
-          <a className="viewer-file" href={file.url}>
-            <FileText size={44} />
-            <strong>{file.type === "application/pdf" ? "PDF document" : "HEIC photo"}</strong>
-            <span className="muted">Browsers cannot show this safely inside the CRM. Download it to view.</span>
-            <span className="button">
-              <Download size={15} /> Download ({kb(file.bytes)})
+      {banner && <div className="viewer-banner">{banner}</div>}
+      <div
+        ref={stage}
+        className={zoom > 1 ? "viewer-stage zoomed" : "viewer-stage"}
+        onWheel={(e) => e.ctrlKey && (e.preventDefault(), step(e.deltaY < 0 ? 1 : -1))}
+        onDoubleClick={() => drawable && setZoom((z) => (z === 1 ? 2 : 1))}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={endDrag}
+        onPointerCancel={endDrag}
+      >
+        {!isPdf(file.type) && !isImage(file.type) ? (
+          download(file.type === "image/heic" ? "HEIC photo" : "Document", "This older upload is in a format browsers cannot show. Download it to view.")
+        ) : !current ? (
+          <div className="viewer-note muted">
+            <Spinner /> Opening the document…
+          </div>
+        ) : current.kind === "failed" ? (
+          <div className="viewer-file">
+            <AlertTriangle size={40} />
+            <strong>This document could not be shown here</strong>
+            <span className="muted">{current.message}</span>
+            <span className="actions actions-left">
+              <button type="button" className="button" onClick={() => retry(file.id)}>
+                Try again
+              </button>
+              <a className="button button-ghost" href={file.url} onClick={() => onViewed?.(file.id)}>
+                <Download size={15} /> Download
+              </a>
             </span>
-          </a>
+          </div>
+        ) : (
+          <PageCanvas key={file.id} opened={current} page={Math.min(page, pages)} turn={turn} zoom={zoom} box={box} label={pages > 1 ? `${file.label}, page ${page} of ${pages}` : file.label} />
         )}
       </div>
-      {files.length > 1 && <p className="muted tight viewer-hint">← → switch pages · + − zoom · [ ] rotate · double-click to zoom</p>}
+      {shortcutsOn && <p className="muted tight viewer-hint shortcut-hint">← → pages · + − zoom · 0 fit · [ ] turn · double-click to zoom, drag to move</p>}
     </div>
   );
 }
@@ -135,7 +500,17 @@ export function Warnings({ items }: { items: ReviewWarning[] }) {
       {items.map((w, i) => (
         <li key={i} className={`review-warning ${w.tone}`}>
           {w.tone === "info" ? <Info size={15} /> : <AlertTriangle size={15} />}
-          <span>{w.text}</span>
+          <span>
+            {w.text}
+            {w.href && (
+              <>
+                {" "}
+                <a href={w.href} target="_blank" rel="noreferrer">
+                  {w.linkLabel ?? "Open"}
+                </a>
+              </>
+            )}
+          </span>
         </li>
       ))}
     </ul>
@@ -147,46 +522,67 @@ export interface ReviewDecisionProps {
   reasons: string[];
   busy: boolean;
   error: unknown;
+  /** Whether this reviewer may approve or reject right now. */
   canDecide: boolean;
   blockedText?: string | null;
+  /** Why approving is not possible (rejecting still is). */
+  approveBlocked?: string | null;
+  /** Documents the reviewer has not opened yet; approving waits for them. */
+  unopened?: string[];
   approveLabel?: string;
-  onApprove: (ticked: string[]) => void;
-  onReject: (reason: string, ticked: string[]) => void;
+  onApprove: (ticked: string[], internalNote?: string) => void;
+  onReject: (reason: string, ticked: string[], internalNote?: string) => void;
   onSkip?: () => void;
   onBack?: () => void;
   resetKey: string | number;
 }
 
-/** Checklist, approve and reject with ready-made reasons. */
+/** Checklist, approve and reject with ready-made reasons, and an optional note for staff. */
 export function ReviewDecision(props: ReviewDecisionProps) {
   const { checklist, reasons, busy, canDecide } = props;
+  const unopened = props.unopened ?? [];
   const [ticked, setTicked] = useState<string[]>([]);
   const [rejecting, setRejecting] = useState(false);
   const [reason, setReason] = useState("");
+  const [noteOpen, setNoteOpen] = useState(false);
+  const [note, setNote] = useState("");
   const [help, setHelp] = useState(false);
+  const [keysOn, setKeysOn] = useShortcutsSetting();
   const reasonRef = useRef<HTMLTextAreaElement>(null);
   useEffect(() => {
     setTicked([]);
     setRejecting(false);
     setReason("");
+    setNote("");
+    setNoteOpen(false);
   }, [props.resetKey]);
   useEffect(() => {
     if (rejecting) reasonRef.current?.focus();
   }, [rejecting]);
   const allTicked = checklist.every((c) => ticked.includes(c.key));
+  const mayApprove = canDecide && !props.approveBlocked && unopened.length === 0;
+  const internalNote = note.trim() || undefined;
+  const noteProblem = plainProblem(note, "note");
+  const reasonProblem = plainProblem(reason, "reason");
   const toggle = (key: string) => setTicked((t) => (t.includes(key) ? t.filter((k) => k !== key) : [...t, key]));
-  const approve = () => allTicked && !busy && canDecide && props.onApprove(ticked);
-  const reject = () => reason.trim().length >= 5 && !busy && canDecide && props.onReject(reason.trim(), ticked);
-  const keys: Record<string, () => void> = {
+  const approve = () => allTicked && !busy && mayApprove && !noteProblem && props.onApprove(ticked, internalNote);
+  const reject = () => reason.trim().length >= 5 && !reasonProblem && !noteProblem && !busy && canDecide && props.onReject(reason.trim(), ticked, internalNote);
+  const keys: Record<string, (e: KeyboardEvent) => void> = {
     a: approve,
-    r: () => canDecide && setRejecting(true),
-    s: () => props.onSkip?.(),
+    r: () => canDecide && !busy && setRejecting(true),
+    s: () => !busy && props.onSkip?.(),
     "?": () => setHelp(true),
-    Escape: () => (rejecting ? setRejecting(false) : props.onBack?.()),
-    c: () => setTicked(allTicked ? [] : checklist.map((c) => c.key)),
+    Escape: (e) => {
+      if (rejecting) setRejecting(false);
+      else if (typing(e)) (e.target as HTMLElement).blur();
+      else props.onBack?.();
+    },
+    // Ticking everything at once only makes sense after every document was looked at.
+    c: () => canDecide && unopened.length === 0 && setTicked(allTicked ? [] : checklist.map((c) => c.key)),
   };
-  checklist.forEach((c, i) => (keys[String(i + 1)] = () => toggle(c.key)));
+  checklist.forEach((c, i) => (keys[String(i + 1)] = () => canDecide && toggle(c.key)));
   useShortcuts(keys, !help);
+  const k = (key: string) => keysOn && <kbd>{key}</kbd>;
 
   return (
     <div className="review-decision">
@@ -202,13 +598,25 @@ export function ReviewDecision(props: ReviewDecisionProps) {
             <label>
               <input type="checkbox" checked={ticked.includes(c.key)} onChange={() => toggle(c.key)} disabled={!canDecide} />
               <span>{c.label}</span>
-              <kbd>{i + 1}</kbd>
+              {k(String(i + 1))}
             </label>
           </li>
         ))}
       </ul>
       {props.blockedText && <p className="notice notice-warn tight">{props.blockedText}</p>}
-      <ErrorText error={props.error} />
+      {canDecide &&
+        (noteOpen ? (
+          <label className="review-note">
+            <span className="field-label">Internal note for staff (never shown to the client)</span>
+            <textarea className="input" rows={2} maxLength={500} value={note} onChange={(e) => setNote(e.target.value)} placeholder="For example: asked a colleague to check the address" autoFocus />
+            {noteProblem && <small className="error-text">{noteProblem}</small>}
+          </label>
+        ) : (
+          <button type="button" className="button-link review-note-toggle" onClick={() => setNoteOpen(true)}>
+            Add an internal note
+          </button>
+        ))}
+      <DecisionError error={props.error} />
       {rejecting ? (
         <form
           className="review-reject"
@@ -235,45 +643,62 @@ export function ReviewDecision(props: ReviewDecisionProps) {
             placeholder="Pick a reason above or write your own"
             maxLength={500}
           />
+          {reasonProblem && <small className="error-text">{reasonProblem}</small>}
           <div className="actions">
             <button type="button" className="button" onClick={() => setRejecting(false)}>
               Back <kbd>Esc</kbd>
             </button>
-            <button type="submit" className="button button-danger-solid" disabled={busy || reason.trim().length < 5}>
+            <button type="submit" className="button button-danger-solid" disabled={busy || reason.trim().length < 5 || !!reasonProblem || !!noteProblem}>
               {busy && <Spinner />} Reject and next <kbd>Ctrl ↵</kbd>
             </button>
           </div>
         </form>
       ) : (
         <div className="review-buttons">
-          <button type="button" className="button button-primary button-big" disabled={!canDecide || !allTicked || busy} onClick={approve} title={allTicked ? undefined : "Tick every check first"}>
-            {busy ? <Spinner /> : <Check size={17} />} {props.approveLabel ?? "Approve and next"} <kbd>A</kbd>
+          <button type="button" className="button button-primary button-big" disabled={!mayApprove || !allTicked || busy || !!noteProblem} onClick={approve} title={allTicked ? undefined : "Tick every check first"}>
+            {busy ? <Spinner /> : <Check size={17} />} {props.approveLabel ?? "Approve and next"} {k("A")}
           </button>
           <div className="review-buttons-row">
             <button type="button" className="button button-danger" disabled={!canDecide || busy} onClick={() => setRejecting(true)}>
-              <X size={15} /> Reject <kbd>R</kbd>
+              <X size={15} /> Reject {k("R")}
             </button>
             {props.onSkip && (
               <button type="button" className="button" disabled={busy} onClick={props.onSkip}>
-                <SkipForward size={15} /> Skip <kbd>S</kbd>
+                <SkipForward size={15} /> Skip {k("S")}
               </button>
             )}
           </div>
-          {!allTicked && canDecide && <p className="muted tight">
-              Tick every check to approve<span className="shortcut-hint">, or press C to tick them all after checking</span>.
-            </p>}
+          {canDecide && props.approveBlocked ? (
+            <p className="notice notice-warn tight">{props.approveBlocked}</p>
+          ) : canDecide && unopened.length > 0 ? (
+            <p className="muted tight">Open the {lowerList(unopened)} before approving.</p>
+          ) : (
+            !allTicked &&
+            canDecide && (
+              <p className="muted tight">
+                Tick every check to approve{keysOn && <span className="shortcut-hint">, or press C to tick them all after checking</span>}.
+              </p>
+            )
+          )}
         </div>
       )}
       <Dialog open={help} title="Keyboard shortcuts" onClose={() => setHelp(false)}>
+        <label className="check shortcut-toggle">
+          <input type="checkbox" checked={keysOn} onChange={(e) => setKeysOn(e.target.checked)} />
+          <span>
+            Use single-key shortcuts
+            <small className="muted block">The letters, numbers and symbols below. Esc and the arrow keys always work.</small>
+          </span>
+        </label>
         <dl className="details shortcuts">
           <dt><kbd>A</kbd></dt><dd>Approve and open the next item</dd>
           <dt><kbd>R</kbd></dt><dd>Reject (pick or write a reason, then Ctrl + Enter)</dd>
           <dt><kbd>S</kbd></dt><dd>Skip to the next item</dd>
           <dt><kbd>1</kbd>–<kbd>{checklist.length}</kbd></dt><dd>Tick a check</dd>
-          <dt><kbd>C</kbd></dt><dd>Tick or untick every check</dd>
-          <dt><kbd>←</kbd> <kbd>→</kbd></dt><dd>Front and back of the document</dd>
-          <dt><kbd>+</kbd> <kbd>−</kbd> <kbd>0</kbd></dt><dd>Zoom in, out, reset</dd>
-          <dt><kbd>[</kbd> <kbd>]</kbd></dt><dd>Rotate</dd>
+          <dt><kbd>C</kbd></dt><dd>Tick or untick every check, once every document is open</dd>
+          <dt><kbd>←</kbd> <kbd>→</kbd></dt><dd>Pages, front and back of the document</dd>
+          <dt><kbd>+</kbd> <kbd>−</kbd> <kbd>0</kbd></dt><dd>Zoom in, out, fit to the screen</dd>
+          <dt><kbd>[</kbd> <kbd>]</kbd></dt><dd>Turn left or right</dd>
           <dt><kbd>Esc</kbd></dt><dd>Back to the queue</dd>
         </dl>
       </Dialog>
@@ -282,7 +707,7 @@ export function ReviewDecision(props: ReviewDecisionProps) {
 }
 
 /** Page frame: back link, title, queue position, evidence left, decision right. */
-export function ReviewLayout({ title, subtitle, position, onBack, evidence, side }: { title: ReactNode; subtitle?: ReactNode; position?: string; onBack: () => void; evidence: ReactNode; side: ReactNode }) {
+export function ReviewLayout({ title, subtitle, position, headExtra, onBack, evidence, side }: { title: ReactNode; subtitle?: ReactNode; position?: string; headExtra?: ReactNode; onBack: () => void; evidence: ReactNode; side: ReactNode }) {
   return (
     <div className="review">
       <div className="review-head">
@@ -293,6 +718,7 @@ export function ReviewLayout({ title, subtitle, position, onBack, evidence, side
           <h1 className="flush">{title}</h1>
           {subtitle && <div className="muted">{subtitle}</div>}
         </div>
+        {headExtra}
         {position && <span className="review-position">{position}</span>}
       </div>
       <div className="review-body">
