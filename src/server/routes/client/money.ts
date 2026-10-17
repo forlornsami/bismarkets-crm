@@ -104,7 +104,7 @@ export function clientMoneyRouter(deps: AppDeps): Router {
   const withdrawals = new RateLimiter(5, HOUR);
   const withdrawalAttempts = new RateLimiter(10, HOUR);
   const payoutChanges = new RateLimiter(20, HOUR);
-  const payoutAttempts = new RateLimiter(60, HOUR);
+  const payoutAttempts = new RateLimiter(30, HOUR);
 
   /** Refuses a throttled client before the body (up to 10 MB) is read. */
   const gate = (stored: RateLimiter, attempts: RateLimiter, message: string) => (req: Request, _res: Response, next: NextFunction) => {

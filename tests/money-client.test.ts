@@ -343,6 +343,10 @@ describe.skipIf(!hasDb)("client money API", () => {
     const json = await api().post("/api/deposits").set(bearer(cal.token)).send({ method: String(m.trc), amount: "125.50", network: "trc20" });
     expect(json.body).toEqual({ message: "Instant deposits are not available yet. Please choose another method.", errors: { method: ["Instant deposits are not available yet. Please choose another method."] } });
     expect(errorOf(await deposit(cal, { ...ok, method: "999999" }, proof), "method")).toBe("Choose a deposit method.");
+    // Far more parts or far longer values than a deposit has are refused before the form is parsed further.
+    const padded = Object.fromEntries(Array.from({ length: 30 }, (_, i) => [`x${i}`, "1"]));
+    expect(errorOf(await deposit(cal, { ...ok, ...padded }, proof), "file_name")).toBe("Attach a screenshot of your payment.");
+    expect(errorOf(await deposit(cal, { ...ok, note: "a".repeat(5000) }, proof), "note")).toBe("This is too long.");
     expect(errorOf(await deposit(cal, { ...ok, method: String(m.off) }, proof), "method")).toBe("Choose a deposit method.");
     expect(errorOf(await deposit(cal, { ...ok, method: String(m.empty) }, proof), "method")).toBe("Choose a deposit method.");
     expect(errorOf(await deposit(cal, { ...ok, method: String(m.wBank) }, proof), "method")).toBe("Choose a deposit method.");

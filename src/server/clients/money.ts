@@ -135,11 +135,30 @@ export interface MoneyForm {
   files: Map<string, File>;
 }
 
+/** More parts than any money form has. Parsing runs on the main thread, and its cost grows with the parts. */
+const MAX_FORM_PARTS = 24;
+/** The longest text value any money form field needs (a reason or a name is far shorter). */
+const MAX_FORM_TEXT = 4096;
+
+/** How many parts a multipart body has, counted by its boundary without parsing it; null without a boundary. */
+function partCount(body: Buffer, contentType: string): number | null {
+  const match = /boundary=(?:"([^"]{1,70})"|([^;\s]{1,70}))/i.exec(contentType);
+  const boundary = match?.[1] ?? match?.[2];
+  if (!boundary) return null;
+  const marker = Buffer.from(`--${boundary}`);
+  let seen = 0;
+  for (let at = body.indexOf(marker); at !== -1 && seen <= MAX_FORM_PARTS + 1; at = body.indexOf(marker, at + marker.length)) seen++;
+  // The last boundary closes the form.
+  return Math.max(0, seen - 1);
+}
+
 /** Reads a multipart body (a Buffer from express.raw) or a parsed JSON body. Files come with multipart only. */
 export async function readMoneyForm(req: Request, brokenField: string, brokenMessage: string): Promise<MoneyForm> {
   const body = req.body as unknown;
   const files = new Map<string, File>();
   if (Buffer.isBuffer(body)) {
+    const parts = partCount(body, req.get("content-type") ?? "");
+    if (parts === null || parts > MAX_FORM_PARTS) throw fieldError(brokenField, brokenMessage);
     let form: FormData;
     try {
       form = await new Response(new Uint8Array(body), { headers: { "content-type": req.get("content-type") ?? "" } }).formData();
@@ -149,6 +168,7 @@ export async function readMoneyForm(req: Request, brokenField: string, brokenMes
     const values: Record<string, unknown> = {};
     for (const [key, value] of form.entries()) {
       if (typeof value === "string") {
+        if (value.length > MAX_FORM_TEXT) throw fieldError(key.slice(0, 40), "This is too long.");
         if (!(key in values)) values[key] = value;
       } else if (!files.has(key)) {
         files.set(key, value);
