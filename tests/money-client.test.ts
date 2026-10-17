@@ -232,14 +232,13 @@ describe.skipIf(!hasDb)("client money API", () => {
         amount_note: `Send from an account in your own name.\nWrite BIS-${ann.id} as the payment reference.`,
       },
     });
-    // The global minimum of USD 50 at 280 rupees per dollar; no processing label means no key at all.
-    expect(pkr).toMatchObject({ currency: "PKR", min_amount: 14000, fee: "No fee", requires_slip: true, type: "manual" });
-    expect(pkr).not.toHaveProperty("processing");
+    // The global minimum of USD 50 at 280 rupees per dollar; without a processing label the client reads what happens next.
+    expect(pkr).toMatchObject({ currency: "PKR", min_amount: 14000, fee: "No fee", requires_slip: true, type: "manual", processing: "Added after our team checks it" });
     expect(pkr.details.bank_details).toBe("HBL\nAccount Title: BIS Markets Ltd\nAccount No: 1234567");
     expect(trc).toMatchObject({ currency: "USD", min_amount: 25, type: "manual", requires_slip: true });
+    // A wallet transfer has no reference field, so it gets no reference line.
     expect(trc.details).toEqual({
       wallet_address: "TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE", network: "TRC20", qr_code_url: `${env.config.publicUrl}/api/payment-qr/${qrToken}`,
-      amount_note: `Write BIS-${ann.id} as the payment reference.`,
     });
     for (const row of res.body.payment_methods) {
       expect(typeof row.min_amount).toBe("number");
@@ -464,7 +463,7 @@ describe.skipIf(!hasDb)("client money API", () => {
 
   it("pages the deposit history newest first, echoing the page, with the client's status words and the reason only when rejected", async () => {
     const [first, second, third] = (await rows<{ reference: string }>(env.db, "SELECT reference FROM deposits WHERE client_id = ? ORDER BY id", [dee.id])).map((r) => r.reference);
-    const reason = "We could not find this payment in our account. If you have already paid, please contact support with your bank receipt.";
+    const reason = "We could not find this payment. If you have already paid, please contact support with your payment receipt.";
     await exec(env.db, "UPDATE deposits SET status = 'rejected', reject_reason = ? WHERE reference = ?", [reason, first]);
     await exec(env.db, "UPDATE deposits SET status = 'second_approval' WHERE reference = ?", [second]);
     await approveDeposit(third!);

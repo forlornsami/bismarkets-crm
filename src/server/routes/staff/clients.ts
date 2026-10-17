@@ -527,10 +527,12 @@ export function staffClientsRouter(deps: AppDeps): Router {
     requirePermission("client.view"),
     handler(async (req, res) => {
       const row = await loadVisible(db, req, parse(id, req.params.id));
+      // Staff opening a page or a proof is in the audit log; here it would push the client's own story out of view.
       const list = await rows<{ id: number; occurred_at: Date; actor_type: string; actor_label: string; action: string; ip: string; meta_json: unknown }>(
         db,
         `SELECT id, occurred_at, actor_type, actor_label, action, ip, meta_json FROM audit_log
-         WHERE entity_type = 'client' AND entity_id = ? AND action <> 'kyc.document_page_viewed' ORDER BY id DESC LIMIT 100`,
+         WHERE entity_type = 'client' AND entity_id = ? AND action NOT IN ('kyc.document_page_viewed', 'deposit.viewed', 'deposit.proof_viewed', 'withdrawal.viewed')
+         ORDER BY id DESC LIMIT 100`,
         [String(row.id)],
       );
       // KYC entries can hold internal notes and audit-only reasons. Without kyc.documents only the

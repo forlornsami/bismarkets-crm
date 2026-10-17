@@ -65,6 +65,9 @@ export interface WithdrawalItem {
   paidAt: string | null;
   claimedBy: Claimer | null;
   destinationEnding: string | null;
+  /** Who finished it (paid or rejected) and when. */
+  decidedBy?: Person | null;
+  decidedAt?: string | null;
 }
 
 interface WithdrawalDetail extends WithdrawalItem {
@@ -99,8 +102,6 @@ interface WithdrawalDetail extends WithdrawalItem {
   secondApprovalReasons?: string[];
   /** Read when the server sends them (not part of the current contract). */
   rejectReason?: string | null;
-  decidedBy?: Person | null;
-  decidedAt?: string | null;
   firstReviewedAt?: string | null;
 }
 
@@ -182,6 +183,8 @@ const columns: Column<WithdrawalItem>[] = [
     render: (w) =>
       w.paidBy ? (
         `Paid by ${personName(w.paidBy)}, ${formatDate(w.paidAt)}`
+      ) : w.status === "rejected" && w.decidedBy ? (
+        `Rejected by ${personName(w.decidedBy)}, ${formatDate(w.decidedAt ?? null)}`
       ) : w.approvedBy ? (
         `Approved by ${personName(w.approvedBy)}, ${formatDate(w.approvedAt)}`
       ) : w.firstReviewedBy ? (

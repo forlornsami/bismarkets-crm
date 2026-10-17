@@ -207,6 +207,10 @@ describe.skipIf(!hasDb)("staff deposits", () => {
     expect((await audits("deposit.viewed", d.id)).map((a) => [a.actor_id, a.meta_json])).toEqual([[agent2.staffId, { depositId: d.id, reference: d.reference }]]);
     await detail(agent2, d.id);
     expect(await audits("deposit.viewed", d.id)).toHaveLength(2);
+    // Openings stay in the audit log, not in the client's activity, where they would crowd out what happened.
+    const feed = await agent2.agent.get(`/api/staff/clients/${clientId}/activity`);
+    expect(feed.status).toBe(200);
+    expect(feed.body.items.map((a: { action: string }) => a.action)).not.toEqual(expect.arrayContaining([expect.stringMatching(/^deposit\.(viewed|proof_viewed)$/)]));
     expect((await approve(agent2, d.id, { checklist: FIRST.slice(1) })).status).toBe(400);
     expect((await approve(agent2, d.id)).body.status).toBe("approved");
   });

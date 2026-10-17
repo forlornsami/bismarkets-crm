@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type Re
 import { Link, useLocation } from "wouter";
 import { ApiError, api, formatDate } from "../lib/api";
 import { useCan } from "../lib/session";
+import { reopenItem } from "../lib/visits";
 import { DEPOSIT_STATUS_LABELS, NOT_PLAIN, WITHDRAWAL_STATUS_LABELS, type DepositStatus, type WithdrawalStatus } from "../../shared/money";
 import { DecisionError, plainProblem } from "./ReviewWorkbench";
 import { Badge, ErrorText, Spinner, useFeedback, type Tone } from "./ui";
@@ -328,7 +329,7 @@ export function queueTab<S extends string>(name: string, stages: readonly S[]): 
 
 /** "Start reviewing" and approve-and-next: claims the oldest item this reviewer can act on, or goes back to the queue. */
 export function useNextItem<S extends string>({ base, route, keys, tab, nothing }: { base: string; route: string; keys: string[]; tab: QueueTab<S>; nothing: (stage: S | null, skips: number) => string }) {
-  const [, navigate] = useLocation();
+  const [location, navigate] = useLocation();
   const { toast } = useFeedback();
   const client = useQueryClient();
   return useMutation({
@@ -338,7 +339,10 @@ export function useNextItem<S extends string>({ base, route, keys, tab, nothing 
     },
     onSuccess: (res) => {
       for (const key of keys) void client.invalidateQueries({ queryKey: [key] });
-      if (res.id) return navigate(`${route}/${res.id}`);
+      if (res.id) {
+        if (location === `${route}/${res.id}`) reopenItem();
+        return navigate(`${route}/${res.id}`);
+      }
       toast(nothing(tab.stage(), tab.skipped().length));
       navigate(route);
     },

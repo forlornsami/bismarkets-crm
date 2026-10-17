@@ -7,6 +7,7 @@ import { EmptyState, PageHeader, Spinner } from "./components/ui";
 import { ApiError, api, onSessionLost, setCsrf, type SessionInfo } from "./lib/api";
 import { useFavicon, useLogo } from "./lib/branding";
 import { SessionProvider, useCan } from "./lib/session";
+import { useVisit } from "./lib/visits";
 import { ClientDetail, ClientsList } from "./pages/Clients";
 import { Emails } from "./pages/Emails";
 import { EmailSettings } from "./pages/EmailSettings";
@@ -70,6 +71,7 @@ function Splash({ children }: { children: React.ReactNode }) {
 export function App() {
   const client = useQueryClient();
   useFavicon();
+  const visit = useVisit();
   const session = useQuery({
     queryKey: ["session"],
     queryFn: async () => {
@@ -152,7 +154,7 @@ export function App() {
             {(params) => (
               <Guarded permission={["kyc.view", "kyc.documents"]}>
                 {/* A fresh screen for every item, so nothing from the last one carries over. */}
-                <KycWorkbench key={params.id} id={params.id} />
+                <KycWorkbench key={`${params.id}:${visit}`} id={params.id} />
               </Guarded>
             )}
           </Route>
@@ -168,7 +170,7 @@ export function App() {
               <Guarded permission={["deposit.view", "deposit.proof"]}>
                 {/* A fresh screen for every item, so nothing from the last one carries over. */}
                 <Loading>
-                  <DepositWorkbench key={params.id} id={params.id} />
+                  <DepositWorkbench key={`${params.id}:${visit}`} id={params.id} />
                 </Loading>
               </Guarded>
             )}
@@ -184,7 +186,7 @@ export function App() {
             {(params) => (
               <Guarded permission="withdrawal.view">
                 <Loading>
-                  <WithdrawalWorkbench key={params.id} id={params.id} />
+                  <WithdrawalWorkbench key={`${params.id}:${visit}`} id={params.id} />
                 </Loading>
               </Guarded>
             )}

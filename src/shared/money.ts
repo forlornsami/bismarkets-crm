@@ -61,7 +61,7 @@ export const WITHDRAWAL_CHECKLIST: Record<"first" | "second" | "pay", ChecklistI
 
 /** Ready-made reasons. The reviewer can edit them before sending. */
 export const DEPOSIT_REJECT_REASONS = [
-  "We could not find this payment in our account. If you have already paid, please contact support with your bank receipt.",
+  "We could not find this payment. If you have already paid, please contact support with your payment receipt.",
   "We only accept payments from an account in your own name. Please contact support so we can return this payment.",
   "The screenshot does not show a completed payment. Please send a new request with a screenshot of the finished transfer.",
   "The screenshot could not be read. Please send a new request with a clear screenshot of the payment.",

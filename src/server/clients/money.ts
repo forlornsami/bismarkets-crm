@@ -217,15 +217,18 @@ export const payoutQrUrl = (config: Config, token: string) => `${config.publicUr
  * minimum. Each is manual with a proof screenshot: nothing here is automated.
  */
 export function presentDepositMethod(config: Config, m: DepositMethodRow, settings: MoneySettings, clientId: number) {
-  const reference = `Write ${paymentReference(clientId)} as the payment reference.`;
-  const details: Record<string, string> = { amount_note: m.amount_note ? `${m.amount_note}\n${reference}` : reference };
+  const details: Record<string, string> = {};
   if (m.kind === "bank") {
+    // Only a bank transfer has a reference field; a wallet transfer is matched by its transaction id.
+    const reference = `Write ${paymentReference(clientId)} as the payment reference.`;
+    details.amount_note = m.amount_note ? `${m.amount_note}\n${reference}` : reference;
     // The portal reads line 1 as the bank name and the labelled lines after it; other lines are not shown.
     details.bank_details = [m.bank_name || m.name, m.account_title && `Account Title: ${m.account_title}`, m.account_number && `Account No: ${m.account_number}`, m.iban && `IBAN: ${m.iban}`]
       .filter(Boolean)
       .join("\n");
     Object.assign(details, { bank_name: m.bank_name, account_title: m.account_title, account_number: m.account_number, iban: m.iban });
   } else {
+    if (m.amount_note) details.amount_note = m.amount_note;
     details.wallet_address = m.wallet_address;
     details.network = networkLabel(m.network);
     if (m.qr_token) details.qr_code_url = depositQrUrl(config, m.qr_token);
@@ -240,7 +243,8 @@ export function presentDepositMethod(config: Config, m: DepositMethodRow, settin
     requires_slip: true,
     type: "manual",
     fee: m.fee_label || "0",
-    processing: m.processing_label || undefined,
+    // Without one the portal shows "Unavailable", so say what does happen.
+    processing: m.processing_label || "Added after our team checks it",
     details,
   };
 }
