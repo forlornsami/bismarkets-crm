@@ -619,6 +619,13 @@ describe.skipIf(!hasDb)("client money API", () => {
     expect(list.data.map((r: { id: number; is_default: boolean }) => [r.id, r.is_default])).toEqual([[annBep, false], [annTrc, true], [annBank, false]]);
     // Nobody else sees them.
     expect((await api().get("/api/user-payment-methods").set(bearer(ben.token))).body.data).toEqual([]);
+    // Staff looking through the client's eyes see the endings only, and no QR link.
+    const boss = (await one<{ id: number }>(env.db, "SELECT id FROM staff_users WHERE email = 'boss@bis.test'"))!.id;
+    const view = await createClientSession(env.db, env.config, ann.id, "127.0.0.1", "test", { staffId: boss, reason: "Checking the payout page" });
+    const seen = (await api().get("/api/user-payment-methods").set(bearer(view.token))).body.data as Record<string, unknown>[];
+    expect(seen.find((r) => r.id === annTrc)).toMatchObject({ account_number: "••••bLSE", qr_code_url: null, network: "TRC20" });
+    expect(seen.find((r) => r.id === annBank)).toMatchObject({ account_number: "••••8901", iban: expect.stringMatching(/^••••/) });
+    expect(JSON.stringify(seen)).not.toContain("TQn9Y2kh");
   });
 
   it("updates an account the way the app does (empty IBAN and SWIFT), and tells the client when the details change", async () => {

@@ -21,7 +21,7 @@ import { AMOUNT_MESSAGES, money, parseAmount, toMajor, toUsdCents } from "../../
 import { holdAccount, lockWallet, postLedger, walletAccount, walletOf, type WalletRow } from "../../money/ledger";
 import { depositProofContext, prepareProof, PROOF_MAX_BYTES, PROOF_RULES, ProofProblem, proofType, type PreparedProof } from "../../money/proofs";
 import { destinationFingerprint, withReference } from "../../money/references";
-import { endingOf } from "../../money/review";
+import { endingOf, masked } from "../../money/review";
 import { loadMoneySettings } from "../../money/settings";
 
 const HOUR = 60 * 60_000;
@@ -248,7 +248,12 @@ export function clientMoneyRouter(deps: AppDeps): Router {
     auth,
     handler(async (req, res) => {
       const list = await rows<PayoutMethodRow>(db, `${PAYOUT_METHOD} WHERE m.client_id = ? AND m.deleted_at IS NULL ORDER BY m.id DESC`, [clientOf(req).id]);
-      const data = list.map((m) => presentPayoutMethod(config, m));
+      // Staff looking through the client's eyes see the endings only: full details are on the
+      // withdrawal review screen, for the staff who check and pay withdrawals, and recorded there.
+      const viewOnly = clientOf(req).kind === "impersonation";
+      const data = list
+        .map((m) => presentPayoutMethod(config, m))
+        .map((m) => (viewOnly ? { ...m, account_number: masked(m.account_number) ?? "", iban: masked(m.iban) ?? "", qr_code_url: null } : m));
       res.json({ success: true, data, user_payment_methods: data });
     }),
   );
