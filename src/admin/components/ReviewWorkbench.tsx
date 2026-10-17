@@ -154,6 +154,7 @@ const dispose = (o: Opened) => {
 async function openFile(file: ReviewFile): Promise<Opened> {
   // Only a failure while reading the file itself says the file is bad; fetching it or loading pdf.js is the connection.
   let reading = false;
+  let slow = false;
   try {
     const data = await api.bytes(file.url);
     if (isPdf(file.type)) {
@@ -170,15 +171,26 @@ async function openFile(file: ReviewFile): Promise<Opened> {
         wasmUrl: "/pdfjs/decoders/",
         cMapUrl: "/pdfjs/cmaps/",
         standardFontDataUrl: "/pdfjs/standard_fonts/",
+        maxImageSize: PDF_MAX_IMAGE_PIXELS,
         verbosity: 0,
       } as Parameters<typeof lib.getDocument>[0];
-      return { kind: "pdf", doc: await lib.getDocument(options).promise };
+      const task = lib.getDocument(options);
+      const timer = setTimeout(() => {
+        slow = true;
+        void task.destroy();
+      }, PDF_OPEN_MS);
+      try {
+        return { kind: "pdf", doc: await task.promise };
+      } finally {
+        clearTimeout(timer);
+      }
     }
     reading = true;
     return { kind: "image", bitmap: await createImageBitmap(new Blob([data], { type: file.type === "image/heic" ? "image/jpeg" : file.type }), { imageOrientation: "from-image" }) };
   } catch (e) {
     const name = (e as { name?: string })?.name;
     const failed = (message: string, fileProblem: boolean): Opened => ({ kind: "failed", message, fileProblem });
+    if (slow) return failed("This PDF took too long to open.", true);
     if (name === "PasswordException") return failed("This PDF is protected with a password.", true);
     if (name === "InvalidPDFException") return failed("This file is damaged or is not a real PDF.", true);
     if (e instanceof ApiError) return failed(e.message, e.code === "UNREADABLE");
@@ -187,6 +199,11 @@ async function openFile(file: ReviewFile): Promise<Opened> {
     return failed("The browser could not read this file.", true);
   }
 }
+
+// The browser's pdf.js has no time or memory limit of its own (the server only sends PDFs its own,
+// limited pdf.js could open): opening gives up after this long, and larger images are not drawn.
+const PDF_OPEN_MS = 20_000;
+const PDF_MAX_IMAGE_PIXELS = 50_000_000;
 
 // Canvas limits that hold on every browser, Safari included.
 const MAX_AREA = 16_000_000;

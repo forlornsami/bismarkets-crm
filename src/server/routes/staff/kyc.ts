@@ -619,10 +619,12 @@ export function staffKycRouter(deps: AppDeps): Router {
     handler(async (req, res) => {
       const { doc, sub, bytes } = await readDocument(req);
       // PDFs stored before pages were counted are counted now, before any page can be marked as seen.
-      // One the server cannot count stays uncounted: it cannot be approved, only rejected as unreadable.
+      // The reviewer's browser reads PDFs with no time or memory limit, so one the server's limited pdf.js
+      // cannot open is never sent: it stays uncounted and can only be rejected as unreadable.
       if (isPdf(doc.mime) && doc.pages === null) {
         const { pages } = await inspectPdf(bytes);
-        if (pages) await exec(db, "UPDATE kyc_documents SET pages = ? WHERE id = ? AND pages IS NULL", [pages, doc.id]);
+        if (!pages) throw new HttpError(422, "UNREADABLE", "This PDF could not be opened.");
+        await exec(db, "UPDATE kyc_documents SET pages = ? WHERE id = ? AND pages IS NULL", [pages, doc.id]);
       }
       // HEIC photos stored before uploads were converted are shown as JPEG, which every browser draws.
       const heic = doc.mime === "image/heic";

@@ -730,12 +730,16 @@ describe.skipIf(!hasDb)("KYC", () => {
     const legacyPdf = async (bytes: Buffer) => {
       await exec(env.db, "UPDATE kyc_documents SET mime = 'application/pdf', pages = NULL, bytes_enc = ? WHERE submission_id = ? AND slot = 1", [encryptBytes(env.config.dataKey, bytes, kycDocumentContext(sub, 1)), sub]);
       const f = (await reviewer.agent.get(`/api/staff/kyc/${sub}`)).body.files[0];
-      expect((await view(reviewer, f.url)).status).toBe(200);
-      return { id: f.id as number, pages: (await one<{ pages: number | null }>(env.db, "SELECT pages FROM kyc_documents WHERE id = ?", [f.id]))!.pages };
+      const shown = await view(reviewer, f.url);
+      return { id: f.id as number, shown, pages: (await one<{ pages: number | null }>(env.db, "SELECT pages FROM kyc_documents WHERE id = ?", [f.id]))!.pages };
     };
-    expect((await legacyPdf(missingPagePdf)).pages).toBe(2);
+    const missing = await legacyPdf(missingPagePdf);
+    expect(missing).toMatchObject({ pages: 2, shown: expect.objectContaining({ status: 200 }) });
+    // The browser's PDF reader has no limits of its own, so a PDF the server cannot open is not sent to it.
     const unread = await legacyPdf(brokenPdf);
     expect(unread.pages).toBeNull();
+    expect(unread.shown.status).toBe(422);
+    expect(unread.shown.body.error).toMatchObject({ code: "UNREADABLE", message: "This PDF could not be opened." });
     expect((await post(reviewer, `/api/staff/kyc/documents/${unread.id}/pages`, { page: 1 })).body.error.message).toBe("That page is not part of this document.");
     expect((await reviewer.agent.get(`/api/staff/kyc/${sub}`)).body.files[0]).toMatchObject({ pages: null, viewedByMe: false });
     expect(await warnings(reviewer, sub)).toContain("The account is frozen.");
