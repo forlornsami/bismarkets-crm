@@ -47,6 +47,7 @@ interface Row {
   network: string;
   received_minor: number | null;
   credited_cents: number | null;
+  needs_second_approval: number;
   sender_name: string | null;
   bank_reference: string | null;
   received_on: string | null;
@@ -80,7 +81,7 @@ interface Row {
 }
 
 const SELECT = `SELECT d.id, d.reference, d.client_id, d.payment_method_id, d.method_name, d.status, d.currency, d.amount_minor, d.usd_rate, d.amount_cents, d.network,
-  d.received_minor, d.credited_cents, d.sender_name, d.bank_reference, DATE_FORMAT(d.received_on, '%Y-%m-%d') AS received_on, d.reject_reason, d.checklist, d.notes,
+  d.received_minor, d.credited_cents, d.needs_second_approval, d.sender_name, d.bank_reference, DATE_FORMAT(d.received_on, '%Y-%m-%d') AS received_on, d.reject_reason, d.checklist, d.notes,
   d.first_reviewed_by, fr.name AS first_reviewer_name, d.decided_by, d.decided_at, dc.name AS decider_name, d.claimed_by, d.claimed_until, cl.name AS claimer_name, d.created_at,
   c.first_name, c.last_name, c.email, c.status AS client_status, c.kyc_status, c.assigned_staff_id, c.created_at AS client_created_at, pm.kind AS method_kind,
   p.sha256 AS proof_sha, p.editor AS proof_editor,
@@ -96,8 +97,10 @@ const person = (staffId: number | null, name: string | null) => (staffId ? { id:
 const verifiedName = (r: Pick<Row, "first_name" | "last_name">) => `${r.first_name} ${r.last_name}`.trim();
 /** US cents the deposit would credit: what the reviewer found, or what the client says they sent until then. */
 const expectedCents = (r: Row) => (r.credited_cents !== null ? Number(r.credited_cents) : r.received_minor !== null ? toUsdCents(Number(r.received_minor), r.currency, r.usd_rate) : Number(r.amount_cents));
+/** Above the limit, or sent back from the second approval once (then it stays a two-person decision). */
+const aboveLimit = (r: Row, threshold: number) => expectedCents(r) > threshold || r.needs_second_approval === 1;
 const needsSecondApproval = (r: Row, threshold: number) =>
-  r.status === "second_approval" || (r.status === "approved" ? r.first_reviewed_by !== null && r.first_reviewed_by !== r.decided_by : expectedCents(r) > threshold);
+  r.status === "second_approval" || (r.status === "approved" ? r.first_reviewed_by !== null && r.first_reviewed_by !== r.decided_by : aboveLimit(r, threshold));
 
 type Warning = { tone: "bad" | "warn" | "info"; text: string; href?: string };
 
@@ -118,7 +121,7 @@ function flagsOf(r: Row, threshold: number) {
     firstDeposit: Number(r.first_deposit) === 1,
     newClient: r.client_created_at.getTime() > Date.now() - 24 * 3_600_000,
     unassigned: r.assigned_staff_id === null,
-    aboveLimit: r.status === "second_approval" || (r.status === "pending" && expectedCents(r) > threshold),
+    aboveLimit: r.status === "second_approval" || (r.status === "pending" && aboveLimit(r, threshold)),
   };
 }
 
@@ -143,6 +146,8 @@ const present = (r: Row, threshold: number) => ({
   creditedCents: r.credited_cents === null ? null : Number(r.credited_cents),
   status: r.status,
   needsSecondApproval: needsSecondApproval(r, threshold),
+  /** Sent back from the second approval: the next first approval goes to a second person whatever the amount. */
+  sentBack: r.needs_second_approval === 1,
   firstReviewedBy: person(r.first_reviewed_by, r.first_reviewer_name),
   decidedBy: person(r.decided_by, r.decider_name),
   createdAt: r.created_at.toISOString(),
@@ -343,7 +348,10 @@ export function staffDepositsRouter(deps: AppDeps): Router {
     if (f.firstDeposit) out.push({ tone: "warn", text: "This is the client's first deposit." });
     if (f.newClient) out.push({ tone: "warn", text: "The client registered less than 24 hours ago." });
     if (f.unassigned) out.push({ tone: "warn", text: "The client is not assigned to anyone on the team." });
-    if (f.aboveLimit) out.push({ tone: "info", text: "Needs a second approval from another person." });
+    if (f.aboveLimit) {
+      const why = r.status === "pending" && r.needs_second_approval === 1 ? " It was sent back from the second approval, so this applies whatever the amount." : "";
+      out.push({ tone: "info", text: `Needs a second approval from another person.${why}` });
+    }
     const order = { bad: 0, warn: 1, info: 2 };
     return out.sort((a, b) => order[a.tone] - order[b.tone]);
   }
@@ -686,7 +694,7 @@ export function staffDepositsRouter(deps: AppDeps): Router {
         }
         const entered = await loadVisible(req, r.id, conn);
         const warnings = (await warningsFor(conn, staff, entered, threshold)).filter((w) => w.tone !== "info").map((w) => w.text);
-        if (credited > threshold) {
+        if (credited > threshold || r.needs_second_approval === 1) {
           await exec(conn, "UPDATE deposits SET status = 'second_approval' WHERE id = ?", [r.id]);
           await appendNote(conn, "deposits", r.id, staff, "first_approval", body.note);
           await writeAudit(conn, ctx(req), {
@@ -750,7 +758,7 @@ export function staffDepositsRouter(deps: AppDeps): Router {
         await exec(
           conn,
           `UPDATE deposits SET status = 'pending', received_minor = NULL, sender_name = NULL, bank_reference = NULL, bank_reference_key = NULL, received_on = NULL, checklist = NULL,
-             first_reviewed_by = NULL, first_reviewed_at = NULL, claimed_by = NULL, claimed_until = NULL WHERE id = ? AND status = 'second_approval'`,
+             first_reviewed_by = NULL, first_reviewed_at = NULL, needs_second_approval = 1, claimed_by = NULL, claimed_until = NULL WHERE id = ? AND status = 'second_approval'`,
           [r.id],
         );
         await appendNote(conn, "deposits", r.id, staff, "returned", body.note);

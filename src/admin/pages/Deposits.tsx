@@ -65,6 +65,7 @@ export interface DepositItem {
   creditedCents: number | null;
   status: DepositStatus;
   needsSecondApproval: boolean;
+  sentBack: boolean;
   firstReviewedBy: Person | null;
   decidedBy: Person | null;
   createdAt: string;
@@ -467,7 +468,7 @@ export function DepositWorkbench({ id }: { id: string }) {
   const differs = parsed.minor !== undefined && parsed.minor !== d.amountMinor;
   const credited = parsed.minor !== undefined ? toUsdCents(parsed.minor, d.currency, d.usdRate) : null;
   const limit = typeof d.secondApprovalAboveCents === "number" ? d.secondApprovalAboveCents : null;
-  const needsSecond = stage === "first" && (limit !== null ? (credited ?? d.amountCents) > limit : d.needsSecondApproval);
+  const needsSecond = stage === "first" && (d.sentBack || (limit !== null ? (credited ?? d.amountCents) > limit : d.needsSecondApproval));
   const approveHint =
     stage === "first" && !complete
       ? anyProblem

@@ -143,7 +143,7 @@ describe.skipIf(!hasDb)("staff deposits", () => {
     expect(Object.keys(item).sort()).toEqual(
       [
         "id", "reference", "clientId", "clientName", "clientEmail", "clientStatus", "kycStatus", "methodId", "methodName", "methodKind", "currency", "amountMinor", "amountCents",
-        "creditedCents", "status", "needsSecondApproval", "firstReviewedBy", "decidedBy", "createdAt", "decidedAt", "claimedBy", "warningCount",
+        "creditedCents", "status", "needsSecondApproval", "sentBack", "firstReviewedBy", "decidedBy", "createdAt", "decidedAt", "claimedBy", "warningCount",
       ].sort(),
     );
     expect(item).toMatchObject({ reference: d.reference, clientId, clientName: "Ali Khan", methodId: usdBank, methodKind: "bank", currency: "USD", amountMinor: 10_000, amountCents: 10_000, creditedCents: null, status: "pending", needsSecondApproval: false, firstReviewedBy: null, claimedBy: null });
@@ -360,7 +360,11 @@ describe.skipIf(!hasDb)("staff deposits", () => {
     expect((await post(agent, url(d.id, "/return"), { note: "Wrong reference entered" })).status).toBe(403);
     const back = await post(manager, url(d.id, "/return"), { note: "The reference is from another payment" });
     expect(back.status).toBe(200);
-    expect(back.body).toMatchObject({ status: "pending", stage: "first", receivedMinor: null, senderName: null, bankReference: null, receivedOn: null, firstReviewedBy: null, checked: { first: null, second: null } });
+    expect(back.body).toMatchObject({
+      status: "pending", stage: "first", receivedMinor: null, senderName: null, bankReference: null, receivedOn: null, firstReviewedBy: null, checked: { first: null, second: null },
+      sentBack: true, needsSecondApproval: true,
+    });
+    expect(back.body.warnings).toContainEqual({ tone: "info", text: "Needs a second approval from another person. It was sent back from the second approval, so this applies whatever the amount." });
     expect(back.body.notes.at(-1)).toMatchObject({ byName: "manager", stage: "returned", text: "The reference is from another payment" });
     expect((await audits("deposit.returned", d.id))[0]!.before_json).toMatchObject({ status: "second_approval", receivedMinor: 800_000, bankReference: ref });
     expect((await post(manager, url(d.id, "/return"), { note: "Again please" })).status).toBe(400);
@@ -371,6 +375,17 @@ describe.skipIf(!hasDb)("staff deposits", () => {
     await openProof(manager2, d.id);
     expect((await secondApprove(manager2, d.id)).body.status).toBe("approved");
     expect(await credits(d.id)).toBe(1);
+
+    // Once sent back, it stays a two-person decision even if the amount found is under the limit.
+    const again = await makeDeposit(await makeClient(), usdBank, { amountMinor: 600_000 });
+    await openProof(agent, again.id);
+    expect((await approve(agent, again.id, { receivedAmount: "6000" })).body.status).toBe("second_approval");
+    expect((await post(manager, url(again.id, "/return"), { note: "Check the amount on the statement" })).status).toBe(200);
+    await openProof(manager, again.id);
+    expect((await approve(manager, again.id, { receivedAmount: "5000", note: "Statement shows 5,000" })).body.status).toBe("second_approval");
+    expect(await credits(again.id)).toBe(0);
+    expect((await secondApprove(manager, again.id)).status).toBe(403);
+    expect((await reject(manager2, again.id)).status).toBe(200);
 
     // Rejecting a waiting deposit tells the client why.
     const waiting = await makeDeposit(clientId, pkrBank, { currency: "PKR", amountMinor: 2_800_000 });
