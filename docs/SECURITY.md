@@ -1,7 +1,7 @@
-# Security model (Phase 1)
+# Security model
 
-What protects the staff side of the CRM today. Later phases add client-side
-and money controls on top of the same foundations.
+What protects the CRM: the staff side (Phase 1), the client API and KYC
+(Phase 2), and client money (Phase 3, deposits and withdrawals).
 
 ## Who can reach it
 
@@ -248,3 +248,83 @@ waiting marketing emails and is audited. Account emails are unaffected.
 **Keeping the evidence.** KYC submissions and documents cannot be deleted with their client or submission (foreign keys `ON DELETE RESTRICT`); nothing in the CRM deletes them. The retention period after an account closes is for compliance to set; a purge job will follow that decision.
 
 **Gated client features.** Money, trading-account and IB routes, as they are built, answer clients without approved KYC with `kycRequired()`: `403 { "message": "You must complete your KYC first." }`, the exact text the app looks for.
+
+## Money: deposits and withdrawals (Phase 3)
+
+**The ledger.** Every dollar a client holds is in a double-entry ledger in US
+cents. Entries are only ever added (MySQL triggers refuse UPDATE and DELETE),
+each transaction balances to zero, and a deposit, hold, payout or release can
+be posted once per request (unique on its source). The wallet's cached
+balances are changed in the same transaction as the entries. `cli
+verify-ledger`, run from cron, checks that every transaction balances, every
+wallet equals its entries, and every ledger transaction matches its deposit or
+withdrawal exactly (accounts, amounts, client, and one hold per withdrawal
+with one payout or one return once it is decided). Every money change locks
+the client row, then the wallet, then the request, in that order.
+
+**Client requests.** Deposits, withdrawals and saved payout accounts need
+approved KYC, an account that is not frozen or closed, and the client's own
+session (a staff "view as client" session cannot). A withdrawal also needs a
+6-digit code emailed to the client's own address; a code is bound to the client
+who asked for it, used once, and five wrong guesses end it. Amounts are parsed
+as text (at most two decimals, no exponent or separators). Forms are refused
+before parsing when they have more parts or longer values than any money form
+needs, or a Content-Type that is not a plain multipart boundary. Payment
+screenshots and wallet QR pictures are checked by their bytes, re-encoded
+(dropping EXIF and anything hidden in the file) and stored encrypted. Adding or
+changing a payout account tells the client in the app and by email.
+
+**Encryption.** Payout account numbers, IBANs, the destination copied onto each
+withdrawal, payment screenshots and wallet QR pictures are encrypted with the
+data key (AES-256-GCM). Each is bound to its own row (id, client and
+reference), so a sealed value copied to another row does not open: the review
+screen says the destination could not be read, and it cannot be approved or
+paid.
+
+**Reviewing.** Deposits and withdrawals share the review screen: a 15-minute
+claim so two people never decide the same request, warnings, a checklist that
+must be fully ticked, preset reasons, and a fresh 2FA code for every decision.
+A deposit can be approved only by someone who opened its payment screenshot in
+the review screen; the bank reference entered must not be on another deposit
+of the same method. Reasons the client sees are plain text, at most 240
+characters. Every view, proof opening, claim, take-over and decision is in the
+audit log. The client's activity feed shows review details only to staff who
+review that kind of request.
+
+**Two people.**
+
+- A deposit above the second-approval limit (USD 5,000 by default) needs a
+  second approval from someone else, and so does one sent back from the second
+  approval, whatever the amount the next reviewer enters.
+- A deposit approved first by whoever set its method's account details, or the
+  rupee rate it uses, goes to a second person whatever the amount. The second
+  reviewer is asked to check that the account is the company's own and the
+  rate is right.
+- A withdrawal above its limit (USD 1,000 by default) or a client's first
+  withdrawal needs two approvals. Whoever approved a withdrawal alone cannot
+  also mark it paid.
+- The limits themselves need `settings.manage` (Super Admin only by default).
+  Deposit methods, payout types, minimums and the rupee rate need
+  `payment.manage` and 2FA. One change moves the rupee rate by at most 20%.
+- Whoever manages staff accounts does not approve or pay money: the Admin role
+  does not hold the deposit, withdrawal, wallet adjustment and IB payout
+  approval permissions (a Super Admin can add them back). Combined with the
+  rule that nobody grants or resets a role whose permissions they do not hold,
+  an Admin cannot create or take over a finance account to give both approvals.
+
+**Where clients pay.** A deposit method's account details cannot change while
+deposits paid to it wait for review (add a new method instead). A crypto
+method's QR code must decode to a payment of its own wallet address and no
+other (a payment link that names another address is refused), and a new
+address removes the old QR code. QR pictures are read in a worker thread with a
+5-second limit. A payout type's network cannot change once clients have saved
+accounts under it, and its name must carry its own network's word only, as the
+portal and app choose the form by name.
+
+**Withdrawal warnings.** The same destination saved by another client, a name
+that does not match the verified name, a first withdrawal, an account added or
+changed in the last 72 hours, recent password resets, email or verified-detail
+changes and payout account changes (a rename or new default does not count),
+money that arrived just before it is asked out, and a withdrawal to a different
+kind of account than the client deposited with.
+

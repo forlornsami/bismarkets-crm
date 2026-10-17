@@ -9,9 +9,9 @@ phases; each one is reviewed on a staging server before the next starts.
 
 | Phase | Contents | State |
 | --- | --- | --- |
-| 1. Foundation | Staff sign-in with 2FA, roles and permissions, staff management, audit log, admin panel | This branch |
-| 2. Clients and KYC | Client API sign-in and profile, client management, KYC queue, compliance screening | Next |
-| 3. MT5 and money | MT5 gateway, accounts, packages, wallet ledger, deposits (ZyntrixPay and manual), withdrawals | |
+| 1. Foundation | Staff sign-in with 2FA, roles and permissions, staff management, audit log, admin panel | Done |
+| 2. Clients and KYC | Client API sign-in and profile, client management, KYC queue, compliance screening | Done |
+| 3. MT5 and money | Wallet ledger, manual deposits and withdrawals with staff approval (this branch); MT5 gateway, accounts, packages and ZyntrixPay next | In progress |
 | 4. IB system | IB hierarchy, commission plans and runs, payouts | |
 | 5. Advanced | Risk view, bonuses, reports, communication, go-live checks | |
 
@@ -53,7 +53,7 @@ only the unit tests run. MySQL must allow trigger creation by the test user
 schema/migrations/   SQL migrations, applied in order by `cli migrate`, never on start
 src/shared/          Permission catalog and default roles (used by server and panel)
 src/server/          Express app: config, staff session and guards, routes, audit log
-src/cli/             generate-key, migrate, seed-roles, create-super-admin, verify-audit
+src/cli/             generate-key, migrate, seed-roles, create-super-admin, verify-audit, verify-ledger
 src/admin/           React admin panel
 tests/               Vitest unit and MySQL integration tests
 docs/                Security model and VPS deployment guide

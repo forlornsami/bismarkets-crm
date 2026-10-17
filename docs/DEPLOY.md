@@ -226,4 +226,6 @@ in front, use nginx's `real_ip` module with Cloudflare's published ranges so
 
 - Daily `mysqldump --single-transaction bismarkets_crm` copied off the server.
 - Daily `node dist/cli.mjs verify-audit` from cron; alert if it exits non-zero.
+- Hourly `node dist/cli.mjs verify-ledger` from cron; alert if it exits
+  non-zero (a wallet, deposit or withdrawal that does not match the ledger).
 - `unattended-upgrades` for security patches.
