@@ -162,10 +162,11 @@ describe.skipIf(!hasDb)("ledger", () => {
     await expect(exec(env.db, "UPDATE ledger_entries SET amount_cents = 1 WHERE id = 1")).rejects.toThrow(/append-only/);
     await expect(exec(env.db, "DELETE FROM ledger_entries WHERE id = 1")).rejects.toThrow(/append-only/);
     await expect(exec(env.db, "DELETE FROM ledger_transactions WHERE id = 1")).rejects.toThrow(/append-only/);
-    // No deposit or withdrawal rows exist for these test sources, so only the wallet checks apply.
-    expect(await verifyLedger(env.db)).toEqual([]);
+    // No deposit or withdrawal rows exist for these test sources, which the check points out.
+    const orphans = [expect.stringMatching(/\(deposit\) belongs to deposit 1, which does not exist\.$/), expect.stringMatching(/\(withdrawal_hold\) belongs to withdrawal 2, which does not exist\.$/)];
+    expect(await verifyLedger(env.db)).toEqual(orphans);
     await exec(env.db, "UPDATE wallets SET available_cents = available_cents + 1 WHERE client_id = ?", [clientId]);
-    expect(await verifyLedger(env.db)).toEqual([expect.stringMatching(/wallet shows 6001 cents but the ledger adds up to 6000/)]);
+    expect(await verifyLedger(env.db)).toEqual([expect.stringMatching(/wallet shows 6001 cents but the ledger adds up to 6000/), ...orphans]);
     await exec(env.db, "UPDATE wallets SET available_cents = available_cents - 1 WHERE client_id = ?", [clientId]);
   });
 

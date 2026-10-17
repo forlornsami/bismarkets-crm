@@ -846,6 +846,12 @@ describe.skipIf(!hasDb)("staff withdrawals", () => {
     expect((await auditOf("withdrawal.rejected", copy.insertId))[0]!.meta_json).toMatchObject({ holdReleased: false });
     expect(await ledgerOf(copy.insertId)).toEqual([]);
     expect(await wallet(clientId)).toEqual(before);
+    // verify-ledger points the row out; it is removed so the rest of this file starts from a sound ledger.
+    expect(await verifyLedger(env.db)).toEqual([
+      "Withdrawal W-NOHOLD01 has 0 hold transaction(s), not 1.",
+      "Withdrawal W-NOHOLD01 is rejected, but the ledger has 0 payout(s) and 0 return(s) to the wallet.",
+    ]);
+    await exec(env.db, "DELETE FROM withdrawals WHERE id = ?", [copy.insertId]);
     expect((await reject(managerA, w.id)).status).toBe(200);
     expect((await post(agentA, `${W(999_999)}/claim`)).status).toBe(404);
     expect((await agentA.agent.get(W(999_999))).status).toBe(404);
@@ -888,4 +894,40 @@ describe.skipIf(!hasDb)("staff withdrawals", () => {
     }
     expect(await verifyLedger(env.db)).toEqual([]);
   }, 120_000);
+
+  // Last: the ledger is append-only, so what this test posts stays wrong for the rest of the file.
+  it("reports withdrawals whose ledger outcome contradicts their status, and credits with no deposit", async () => {
+    const { clientId, payout } = await regular();
+    const post = (kind: "withdrawal_paid" | "withdrawal_release" | "deposit", sourceId: number, entries: { account: string; amount: number }[]) =>
+      transaction(env.db, async (conn) => {
+        await lockWallet(conn, clientId);
+        const sourceType = kind === "deposit" ? "deposit" : "withdrawal";
+        return postLedger(conn, { kind, sourceType, sourceId, clientId, staffId: null, memo: "tampered" }, entries);
+      });
+    // Marked paid, but the held money went back to the wallet: the client would get it twice.
+    const doubled = await withdraw(payout, 6_000);
+    await exec(env.db, "UPDATE withdrawals SET status = 'paid' WHERE id = ?", [doubled.id]);
+    await post("withdrawal_release", doubled.id, [{ account: holdAccount(clientId), amount: -6_000 }, { account: walletAccount(clientId), amount: 6_000 }]);
+    // Marked rejected ("the money is back in your wallet"), but it was paid out.
+    const vanished = await withdraw(payout, 7_000);
+    await exec(env.db, "UPDATE withdrawals SET status = 'rejected' WHERE id = ?", [vanished.id]);
+    await post("withdrawal_paid", vanished.id, [{ account: holdAccount(clientId), amount: -7_000 }, { account: payoutAccount(bankType), amount: 7_000 }]);
+    // Paid out through another payout type than the one the client asked for.
+    const elsewhere = await withdraw(payout, 5_000);
+    await exec(env.db, "UPDATE withdrawals SET status = 'paid' WHERE id = ?", [elsewhere.id]);
+    const wrongTx = await post("withdrawal_paid", elsewhere.id, [{ account: holdAccount(clientId), amount: -5_000 }, { account: payoutAccount(cryptoType), amount: 5_000 }]);
+    // A credit for a deposit that does not exist.
+    const ghostTx = await post("deposit", 99_999_999, [{ account: walletAccount(clientId), amount: 50_000 }, { account: depositMethodAccount(bankDeposit), amount: -50_000 }]);
+
+    const problems = await verifyLedger(env.db);
+    expect(problems).toEqual(
+      expect.arrayContaining([
+        `Withdrawal ${doubled.reference} is paid, but the ledger has 0 payout(s) and 1 return(s) to the wallet.`,
+        `Withdrawal ${vanished.reference} is rejected, but the ledger has 1 payout(s) and 0 return(s) to the wallet.`,
+        `Ledger transaction ${wrongTx} (withdrawal_paid) for ${elsewhere.reference} moves client:${clientId}:hold -5000, payout:${cryptoType} 5000, not client:${clientId}:hold -5000, payout:${bankType} 5000.`,
+        `Ledger transaction ${ghostTx} (deposit) belongs to deposit 99999999, which does not exist.`,
+      ]),
+    );
+    expect(problems).toHaveLength(4);
+  });
 });

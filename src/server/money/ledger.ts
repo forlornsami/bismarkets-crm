@@ -146,18 +146,95 @@ export async function verifyLedger(conn: Conn): Promise<string[]> {
     if (d.status !== "approved" && credits !== 0) problems.push(`Deposit ${d.reference} is ${d.status} but was credited to the wallet.`);
   }
 
-  // A withdrawal's money is held from request until it is paid or rejected.
-  const withdrawals = await rows<{ id: number; reference: string; status: string; amount_cents: number; held: string | null }>(
+  // A withdrawal's money is held from request until it is paid out (paid) or given back (rejected).
+  const withdrawals = await rows<{ id: number; reference: string; status: string; amount_cents: number; held: string | null; holds: number; paid: number; released: number }>(
     conn,
     `SELECT w.id, w.reference, w.status, w.amount_cents,
        (SELECT SUM(e.amount_cents) FROM ledger_transactions t JOIN ledger_entries e ON e.transaction_id = t.id
-          WHERE t.source_type = 'withdrawal' AND t.source_id = w.id AND e.account = CONCAT('client:', w.client_id, ':hold')) AS held
+          WHERE t.source_type = 'withdrawal' AND t.source_id = w.id AND e.account = CONCAT('client:', w.client_id, ':hold')) AS held,
+       (SELECT COUNT(*) FROM ledger_transactions t WHERE t.source_type = 'withdrawal' AND t.source_id = w.id AND t.kind = 'withdrawal_hold') AS holds,
+       (SELECT COUNT(*) FROM ledger_transactions t WHERE t.source_type = 'withdrawal' AND t.source_id = w.id AND t.kind = 'withdrawal_paid') AS paid,
+       (SELECT COUNT(*) FROM ledger_transactions t WHERE t.source_type = 'withdrawal' AND t.source_id = w.id AND t.kind = 'withdrawal_release') AS released
      FROM withdrawals w`,
   );
   for (const w of withdrawals) {
     const open = ["pending", "second_approval", "approved"].includes(w.status);
     const expected = open ? Number(w.amount_cents) : 0;
     if (Number(w.held ?? 0) !== expected) problems.push(`Withdrawal ${w.reference} is ${w.status}, so ${expected} cents should be held, but ${w.held ?? 0} are.`);
+    const outcome = { paid: Number(w.paid), released: Number(w.released) };
+    const wanted = w.status === "paid" ? { paid: 1, released: 0 } : w.status === "rejected" ? { paid: 0, released: 1 } : { paid: 0, released: 0 };
+    if (Number(w.holds) !== 1) problems.push(`Withdrawal ${w.reference} has ${w.holds} hold transaction(s), not 1.`);
+    if (outcome.paid !== wanted.paid || outcome.released !== wanted.released) {
+      problems.push(`Withdrawal ${w.reference} is ${w.status}, but the ledger has ${outcome.paid} payout(s) and ${outcome.released} return(s) to the wallet.`);
+    }
   }
+
+  problems.push(...(await verifyTransactions(conn)));
   return problems;
+}
+
+/**
+ * Every transaction moves exactly what its deposit or withdrawal says, between the accounts its
+ * kind names, for that deposit's or withdrawal's own client. Read in pages, oldest first.
+ */
+async function verifyTransactions(conn: Conn): Promise<string[]> {
+  const problems: string[] = [];
+  const inList = (ids: number[]) => ids.map(() => "?").join(", ");
+  let after = 0;
+  for (;;) {
+    const batch = await rows<{ id: number; kind: string; source_type: string; source_id: number; client_id: number | null }>(
+      conn,
+      "SELECT id, kind, source_type, source_id, client_id FROM ledger_transactions WHERE id > ? ORDER BY id LIMIT 2000",
+      [after],
+    );
+    if (!batch.length) return problems;
+    after = Number(batch.at(-1)!.id);
+    const ids = batch.map((t) => Number(t.id));
+    const entries = await rows<{ transaction_id: number; account: string; amount_cents: number }>(
+      conn,
+      `SELECT transaction_id, account, amount_cents FROM ledger_entries WHERE transaction_id IN (${inList(ids)})`,
+      ids,
+    );
+    const sourcesOf = async <T extends { id: number }>(type: LedgerSource, sql: string) => {
+      const wanted = [...new Set(batch.filter((t) => t.source_type === type).map((t) => Number(t.source_id)))];
+      const found = wanted.length ? await rows<T>(conn, `${sql} WHERE id IN (${inList(wanted)})`, wanted) : [];
+      return new Map(found.map((r) => [Number(r.id), r]));
+    };
+    const deposits = await sourcesOf<{ id: number; reference: string; client_id: number; payment_method_id: number; credited_cents: number | null }>(
+      "deposit",
+      "SELECT id, reference, client_id, payment_method_id, credited_cents FROM deposits",
+    );
+    const withdrawals = await sourcesOf<{ id: number; reference: string; client_id: number; payment_method_id: number; amount_cents: number }>(
+      "withdrawal",
+      "SELECT id, reference, client_id, payment_method_id, amount_cents FROM withdrawals",
+    );
+
+    for (const t of batch) {
+      const label = `Ledger transaction ${t.id} (${t.kind})`;
+      const source = t.source_type === "deposit" ? deposits.get(Number(t.source_id)) : t.source_type === "withdrawal" ? withdrawals.get(Number(t.source_id)) : undefined;
+      if (!source) {
+        problems.push(`${label} belongs to ${t.source_type} ${t.source_id}, which does not exist.`);
+        continue;
+      }
+      const clientId = Number(source.client_id);
+      if (Number(t.client_id) !== clientId) problems.push(`${label} is for client ${t.client_id}, but ${source.reference} belongs to client ${clientId}.`);
+      let want: [string, number][] | null = null;
+      if (t.source_type === "deposit" && t.kind === "deposit" && "credited_cents" in source) {
+        const x = Number(source.credited_cents ?? 0);
+        want = [[walletAccount(clientId), x], [depositMethodAccount(Number(source.payment_method_id)), -x]];
+      } else if (t.source_type === "withdrawal" && "amount_cents" in source) {
+        const a = Number(source.amount_cents);
+        if (t.kind === "withdrawal_hold") want = [[walletAccount(clientId), -a], [holdAccount(clientId), a]];
+        if (t.kind === "withdrawal_paid") want = [[holdAccount(clientId), -a], [payoutAccount(Number(source.payment_method_id)), a]];
+        if (t.kind === "withdrawal_release") want = [[holdAccount(clientId), -a], [walletAccount(clientId), a]];
+      }
+      if (!want) {
+        problems.push(`${label} is not a kind of transaction a ${t.source_type} makes.`);
+        continue;
+      }
+      const show = (list: [string, number][]) => list.map(([account, amount]) => `${account} ${amount}`).sort().join(", ");
+      const got = entries.filter((e) => Number(e.transaction_id) === Number(t.id)).map((e): [string, number] => [e.account, Number(e.amount_cents)]);
+      if (show(got) !== show(want)) problems.push(`${label} for ${source.reference} moves ${show(got) || "nothing"}, not ${show(want)}.`);
+    }
+  }
 }
