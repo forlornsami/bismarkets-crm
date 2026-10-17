@@ -19,7 +19,14 @@ const fixture = (name: string) => readFileSync(new URL(`./fixtures/${name}`, imp
 const heic = fixture("photo.heic");
 const lockedPdf = fixture("locked.pdf");
 const ownerPdf = fixture("owner-password.pdf");
-const pdf = Buffer.from("%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n");
+/** A PDF with blank pages; pdf.js rebuilds the missing cross-reference table. */
+const pdfOf = (pages: number) => {
+  const kids = Array.from({ length: pages }, (_, i) => `${i + 3} 0 R`).join(" ");
+  const pageObjects = Array.from({ length: pages }, (_, i) => `${i + 3} 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>endobj\n`).join("");
+  return Buffer.from(`%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[${kids}]/Count ${pages}>>endobj\n${pageObjects}trailer<</Root 1 0 R>>\n%%EOF\n`);
+};
+const pdf = pdfOf(2);
+const brokenPdf = Buffer.from("%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n");
 /** A plain photo big enough to read; each colour gives a different file. */
 const photo = (background: string, width = 640, height = 440) => sharp({ create: { width, height, channels: 3, background } }).png().toBuffer();
 const [front, back, passport, other] = await Promise.all([photo("#336699"), photo("#993366"), photo("#669933"), photo("#cc9900")]);
@@ -49,6 +56,7 @@ describe("document handling", () => {
       .toBuffer();
     expect((await sharp(jpeg).metadata()).exif).toBeDefined();
     const out = await prepareDocument(jpeg, "image/jpeg");
+    expect(out.pages).toBe(1);
     expect(out.mime).toBe("image/jpeg");
     const meta = await sharp(out.bytes).metadata();
     expect(meta).toMatchObject({ format: "jpeg", width: 500, height: 800 });
@@ -78,8 +86,10 @@ describe("document handling", () => {
 
   it("refuses PDFs that need a password, but keeps ones with only owner restrictions", async () => {
     expect(await problem(prepareDocument(lockedPdf, "application/pdf"))).toBe("Remove the password from the PDF and upload it again.");
-    expect((await prepareDocument(ownerPdf, "application/pdf")).bytes).toBe(ownerPdf);
-    expect((await prepareDocument(pdf, "application/pdf")).bytes).toBe(pdf);
+    expect(await prepareDocument(ownerPdf, "application/pdf")).toMatchObject({ bytes: ownerPdf, pages: 1 });
+    // Pages are counted so approving can require every one; a PDF pdf.js cannot read is kept for download.
+    expect(await prepareDocument(pdf, "application/pdf")).toMatchObject({ bytes: pdf, pages: 2 });
+    expect(await prepareDocument(brokenPdf, "application/pdf")).toMatchObject({ bytes: brokenPdf, pages: null });
   });
 });
 
@@ -133,7 +143,10 @@ describe.skipIf(!hasDb)("KYC", () => {
   /** Opens the submission and every page of it, as a reviewer must before approving. */
   async function openAll(s: SignedIn, submissionId: number) {
     const detail = (await s.agent.get(`/api/staff/kyc/${submissionId}`)).body;
-    for (const f of detail.files) expect((await s.agent.get(f.url)).status).toBe(200);
+    for (const f of detail.files) {
+      expect((await s.agent.get(f.url)).status).toBe(200);
+      if (f.type === "application/pdf") for (let page = 1; page <= f.pages; page++) expect((await post(s, `/api/staff/kyc/documents/${f.id}/pages`, { page })).status).toBe(204);
+    }
     return detail as { checklist: { key: string }[] };
   }
   async function approve(s: SignedIn, submissionId: number) {
@@ -285,6 +298,9 @@ describe.skipIf(!hasDb)("KYC", () => {
     expect(bill.headers["content-type"]).toBe("application/pdf");
     expect(bill.headers["content-disposition"]).toBe(`attachment; filename="client-${clientId}-address-1.pdf"`);
     expect(bill.headers["x-content-type-options"]).toBe("nosniff");
+    expect(detail.other.files[0]).toMatchObject({ pages: 2, viewedByMe: false, viewedPages: [] });
+    expect(detail.files[0]).toMatchObject({ pages: 1 });
+    expect(detail.files[0]).not.toHaveProperty("viewedPages");
 
     expect((await post(reviewer, `/api/staff/kyc/${identity.id}/decision`, { decision: "approve" })).body.error.code).toBe("STEP_UP_REQUIRED");
     await stepUp(env, reviewer);
@@ -335,6 +351,29 @@ describe.skipIf(!hasDb)("KYC", () => {
     expect(earlier.trail[1]).toMatchObject({
       label: "Rejected", staff: "comp", reason: "The photo is blurred, please upload a sharper one", internalNote: "Corners cut off on the back as well",
     });
+
+    // A PDF counts as opened once the review screen drew every page of it, or the reviewer downloaded it.
+    const billFile = (s: SignedIn) => s.agent.get(`/api/staff/kyc/${address.id}`).then((r) => r.body.files[0] as { id: number; url: string; viewedByMe: boolean; viewedPages: number[] });
+    const billId = (await billFile(reviewer)).id;
+    const page = (s: SignedIn, n: unknown, docId = billId) => post(s, `/api/staff/kyc/documents/${docId}/pages`, { page: n });
+    expect((await page(second, 1)).body.error.message).toBe("Open the document first.");
+    expect((await page(support, 1)).status).toBe(403);
+    expect((await page(reviewer, 3)).body.error.message).toBe("That page is not part of this document.");
+    expect((await page(reviewer, 0)).status).toBe(400);
+    expect((await page(reviewer, 1, detail.files[0].id)).body.error.message).toBe("That page is not part of this document.");
+    expect((await page(reviewer, 1)).status).toBe(204);
+    expect((await page(reviewer, 1)).status).toBe(204);
+    expect(await billFile(reviewer)).toMatchObject({ viewedByMe: false, viewedPages: [1] });
+    const halfRead = await post(reviewer, `/api/staff/kyc/${address.id}/decision`, { decision: "approve", checklist: ALL.address });
+    expect(halfRead.body.error.message).toBe("Open every page of the document before approving.");
+    expect((await page(reviewer, 2)).status).toBe(204);
+    expect(await billFile(reviewer)).toMatchObject({ viewedByMe: true, viewedPages: [1, 2] });
+    // Each page is recorded once, and kept out of the client's activity list.
+    const pageViews = await one<{ n: number }>(env.db, "SELECT COUNT(*) AS n FROM audit_log WHERE action = 'kyc.document_page_viewed' AND entity_id = ?", [String(clientId)]);
+    expect(Number(pageViews!.n)).toBe(2);
+    expect((await reviewer.agent.get(`/api/staff/clients/${clientId}/activity`)).body.items.some((a: { action: string }) => a.action === "kyc.document_page_viewed")).toBe(false);
+    expect((await boss.agent.get(`${(await billFile(boss)).url}?download=1`)).status).toBe(200);
+    expect(await billFile(boss)).toMatchObject({ viewedByMe: true, viewedPages: [] });
 
     for (const item of (await reviewer.agent.get("/api/staff/kyc")).body.items) expect((await approve(reviewer, item.id)).status).toBe(200);
     expect((await reviewer.agent.get("/api/staff/kyc/summary")).body).toMatchObject({ pending: 0, decidedTodayByMe: 3 });
@@ -560,6 +599,29 @@ describe.skipIf(!hasDb)("KYC", () => {
     // The reviewer is told which detail changed after the documents were sent.
     const sub = (await one<{ id: number }>(env.db, "SELECT id FROM kyc_submissions WHERE client_id = ? AND status = 'pending'", [lia]))!.id;
     expect(await warnings(reviewer, sub)).toContain("The client's last name changed after these documents were sent. Compare against the details shown here.");
+  });
+
+  it("leaves blank details open to fill in while a staff upload waits, and locks them once filled", async () => {
+    const bo = await register("blank@client.test", "Bo", "Blank");
+    const b = bearer(bo.token);
+    await stepUp(env, reviewer);
+    const staffUpload = await reviewer.agent.post("/api/staff/kyc/upload").set("Origin", ORIGIN).set("X-CSRF-Token", reviewer.csrf)
+      .field("client_id", String(bo.id)).field("type", "4").field("sub_type", "1").field("note", "Sent by email on 16 October")
+      .attach("document1", await photo("#123456"), { filename: "bill.png", contentType: "image/png" });
+    expect(staffUpload.status).toBe(201);
+    // Nothing was checked yet, so the empty address fields are not locked; the name is.
+    expect((await api().get("/api/kyc").set(b)).body.locked_profile_fields).toEqual([]);
+    expect((await boss.agent.get(`/api/staff/clients/${bo.id}`)).body.lockedFields).toEqual([]);
+    const { zipcode: _zip, ...noZip } = PROFILE;
+    expect((await api().patch("/api/user").set(b).send({ ...noZip, dob: "1985-05-05" })).status).toBe(200);
+    expect((await api().get("/api/kyc").set(b)).body.locked_profile_fields).toEqual(["country", "city", "address"]);
+    const moved = await api().patch("/api/user").set(b).send({ city: "Leeds" });
+    expect(moved.body.errors).toEqual({ city: [LOCKED] });
+    // Staff without the override may fill in the blank postcode too, but not change what is filled.
+    expect((await patch(salesManager, `/api/staff/clients/${bo.id}`, { city: "York" })).body.error.message).toBe("These details were checked against the client's documents. Ask a compliance admin to change them.");
+    expect((await patch(salesManager, `/api/staff/clients/${bo.id}`, { zipcode: "LS1 1AA" })).status).toBe(200);
+    expect((await api().get("/api/kyc").set(b)).body.locked_profile_fields).toEqual(["country", "city", "address", "zipcode"]);
+    expect((await api().patch("/api/user").set(b).send({ zipcode: "LS2 2BB" })).body.errors).toEqual({ zipcode: [LOCKED] });
   });
 
   it("warns about the same person, reused files and shared files without naming clients out of scope", async () => {

@@ -6,7 +6,8 @@ import sharp, { type Metadata } from "sharp";
 // EXIF (GPS location, device), applies the camera's rotation, refuses
 // decompression bombs and photos too small to read, and turns HEIC into JPEG
 // so every reviewer's browser can show it. PDFs are stored as sent, except
-// that ones needing a password to open are refused.
+// that ones needing a password to open are refused; their pages are counted so
+// approving can require every page to be opened.
 
 export const DOCUMENT_RULES = "Use a JPG, PNG, WebP or HEIC photo, or a PDF, up to 10 MB.";
 const UNREADABLE = `This photo could not be opened. ${DOCUMENT_RULES}`;
@@ -21,11 +22,12 @@ export class DocumentProblem extends Error {}
 // Decoded document pixels must not linger in libvips' operation cache.
 sharp.cache(false);
 
-/** What to store for an uploaded document: the re-encoded image, or the PDF as sent. */
-export async function prepareDocument(bytes: Buffer, mime: DocumentMime): Promise<{ bytes: Buffer; mime: string }> {
+/** What to store for an uploaded document: the re-encoded image, or the PDF as sent, with its page count. */
+export async function prepareDocument(bytes: Buffer, mime: DocumentMime): Promise<{ bytes: Buffer; mime: string; pages: number | null }> {
   if (mime === "application/pdf") {
-    if (await pdfNeedsPassword(bytes)) throw new DocumentProblem("Remove the password from the PDF and upload it again.");
-    return { bytes, mime };
+    const pdf = await inspectPdf(bytes);
+    if (pdf.needsPassword) throw new DocumentProblem("Remove the password from the PDF and upload it again.");
+    return { bytes, mime, pages: pdf.pages };
   }
   let meta: Metadata;
   try {
@@ -54,26 +56,26 @@ export async function prepareDocument(bytes: Buffer, mime: DocumentMime): Promis
     const image = sharp(input, { limitInputPixels: MAX_DOCUMENT_PIXELS, autoOrient: true });
     const encoded = out === "image/png" ? image.png() : out === "image/webp" ? image.webp({ quality: 90 }) : image.flatten({ background: "#ffffff" }).jpeg({ quality: 90 });
     // Metadata is not copied unless asked for, so EXIF and XMP are dropped here.
-    return { bytes: await encoded.toBuffer(), mime: out };
+    return { bytes: await encoded.toBuffer(), mime: out, pages: 1 };
   } catch {
     throw new DocumentProblem(UNREADABLE);
   }
 }
 
 /**
- * True when the PDF cannot be opened without a password. Many bank statements
+ * Opens a PDF the way the review screen will. `pages` is null when pdf.js
+ * cannot read the file (the reviewer then downloads it). Many bank statements
  * are encrypted with an empty user password (owner restrictions only); those
  * open without a prompt and are accepted.
  */
-export async function pdfNeedsPassword(bytes: Buffer): Promise<boolean> {
-  if (!bytes.includes("/Encrypt")) return false;
+export async function inspectPdf(bytes: Buffer): Promise<{ needsPassword: boolean; pages: number | null }> {
   const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  // A copy: pdf.js may take over the buffer it is given, and the original is stored.
   const task = pdfjs.getDocument({ data: new Uint8Array(bytes), disableFontFace: true, useSystemFonts: false, verbosity: 0 });
   try {
-    await task.promise;
-    return false;
+    return { needsPassword: false, pages: (await task.promise).numPages };
   } catch (error) {
-    return (error as { name?: string }).name === "PasswordException";
+    return { needsPassword: (error as { name?: string }).name === "PasswordException", pages: null };
   } finally {
     await task.destroy();
   }

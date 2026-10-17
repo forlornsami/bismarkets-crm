@@ -256,7 +256,7 @@ export function staffClientsRouter(deps: AppDeps): Router {
         [row.id, row.id, row.id],
       );
       // Fields checked against documents under review or approved; the edit form shows them locked.
-      const lockedFields = lockedProfileFields(await latestSubmissions(db, row.id)).map((f) => FORM_FIELD[f]);
+      const lockedFields = lockedProfileFields(await latestSubmissions(db, row.id), row).map((f) => FORM_FIELD[f]);
       res.json({ ...present(row), activeSessions: Number(counts?.sessions ?? 0), notesCount: Number(counts?.notes ?? 0), referrals: Number(counts?.referrals ?? 0), lockedFields });
     }),
   );
@@ -316,7 +316,7 @@ export function staffClientsRouter(deps: AppDeps): Router {
         if (changed.length === 0) return before;
         // Details checked against documents under review or approved: only
         // kyc.override holders change them, with a fresh 2FA code.
-        const locked = new Set<string>(lockedProfileFields(await latestSubmissions(conn, clientId, true)));
+        const locked = new Set<string>(lockedProfileFields(await latestSubmissions(conn, clientId, true), before));
         const verified = changed.filter(([k, v]) => locked.has(k) && !sameProfileValue(old[k], v)).map(([k]) => k);
         if (verified.length) {
           if (!staff.permissions.has("kyc.override")) throw forbidden("These details were checked against the client's documents. Ask a compliance admin to change them.");
@@ -530,7 +530,7 @@ export function staffClientsRouter(deps: AppDeps): Router {
       const list = await rows<{ id: number; occurred_at: Date; actor_type: string; actor_label: string; action: string; ip: string; meta_json: unknown }>(
         db,
         `SELECT id, occurred_at, actor_type, actor_label, action, ip, meta_json FROM audit_log
-         WHERE entity_type = 'client' AND entity_id = ? ORDER BY id DESC LIMIT 100`,
+         WHERE entity_type = 'client' AND entity_id = ? AND action <> 'kyc.document_page_viewed' ORDER BY id DESC LIMIT 100`,
         [String(row.id)],
       );
       // KYC entries can hold internal notes and audit-only reasons. Without kyc.documents only the

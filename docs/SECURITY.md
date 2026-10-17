@@ -223,7 +223,7 @@ waiting marketing emails and is audited. Account emails are unaffected.
 **Decisions.**
 
 - Approving or rejecting needs `kyc.decide`, `kyc.documents` and a fresh 2FA code. Changing a decision and asking for a new document need the same; claiming and "next" need the two permissions. A rejection needs a plain-text reason, which the client sees and is emailed. A decision can carry an internal note (plain text, at most 500 characters) that goes to the audit log and the decision history, never to the client.
-- Approving needs every checklist item ticked (the checklist depends on the document type: the back of an ID card is checked for expiry, not a recent date) and every page opened by the approving reviewer since the submission arrived. The ticked checklist is stored with the decision.
+- Approving needs every checklist item ticked (the checklist depends on the document type: the back of an ID card is checked for expiry, not a recent date) and every document opened by the approving reviewer. A photo counts once fetched; a PDF counts when the review screen drew every page (each page is reported once and audited as `kyc.document_page_viewed`; the server counts the pages with pdf.js at upload) or when the reviewer downloaded it. The ticked checklist is stored with the decision.
 - Four eyes: whoever uploaded documents for a client can never approve them, whatever their role, and "next" never hands them their own uploads.
 - `POST /api/staff/kyc/:id/change` only approves a rejected document (latest submission only, with a reason). Taking back an approval is "Ask for a new document" (`/request-new`), which tells the client what to send; it is audited as `kyc.new_document_requested`.
 - Approving without documents needs `kyc.override` (Super Admin and Admin), 2FA and a reason, and is audited as `kyc.approved_without_documents`. Approving any document-less item later also needs `kyc.override`. The client is told their proof was confirmed.
@@ -231,7 +231,7 @@ waiting marketing emails and is audited. Account emails are unaffected.
 - Review claims: opening a pending item holds it for 15 minutes (refreshed while open), so two reviewers never decide the same item. A decision is refused while someone else holds it; taking over a review is audited as `kyc.review_taken_over`.
 - Every KYC change locks the client row first and recomputes the stored status with a locking read, so two decisions for one client run one after the other and the stored KYC status is never stale.
 
-**Verified details.** While a document is under review or approved, the details it is checked against are locked: first name, last name and date of birth for identity; country, city, address and postcode for proof of address.
+**Verified details.** While a document is under review or approved, the details it is checked against are locked: first name, last name and date of birth for identity; country, city, address and postcode for proof of address. A blank detail was never checked, so it stays open to fill in (staff can upload for a client whose profile is still empty); once it has a value it is locked like the rest.
 
 - `PATCH /api/user` refuses a real change to a locked field with a field error. Values that only differ in case or spacing count as unchanged, since the portal and app send the whole form.
 - Staff change them only with `kyc.override` and a fresh 2FA code; the change is audited as `client.verified_details_changed` with the fields. `GET /api/staff/clients/:id` lists the locked fields so the form can show them.

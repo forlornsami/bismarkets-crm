@@ -363,7 +363,7 @@ export function clientAuthRouter(deps: AppDeps): Router {
         // Details checked against documents under review or approved stay as
         // they are. The portal and app send the whole form, so only a real
         // change is refused; an unchanged value is simply not written.
-        const locked = new Set<string>(lockedProfileFields(await latestSubmissions(conn, client.id, true)));
+        const locked = new Set<string>(lockedProfileFields(await latestSubmissions(conn, client.id, true), before));
         const refused: Record<string, string[]> = {};
         const columns = profileColumns(body).filter(([k, v]) => {
           if (!locked.has(k)) return true;

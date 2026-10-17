@@ -529,6 +529,8 @@ kbd { display: inline-block; min-width: 18px; padding: 0 5px; border-radius: 5px
 .viewer-pages button { display: inline-flex; align-items: center; gap: 6px; border: 0; background: none; padding: 4px 14px; border-radius: 999px; font: inherit; font-weight: 600; color: var(--muted); cursor: pointer; }
 .viewer-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--warn); }
 .viewer-paging { display: inline-flex; align-items: center; gap: 2px; font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.viewer-paging .icon-button { position: relative; }
+.viewer-paging .viewer-dot { position: absolute; top: 4px; right: 4px; }
 .viewer-pages button.active { background: var(--surface); color: var(--text); box-shadow: var(--shadow-sm); }
 .viewer-meta { font-size: 13px; }
 .viewer-tools { margin-left: auto; display: inline-flex; align-items: center; gap: 2px; }

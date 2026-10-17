@@ -9,6 +9,7 @@ import {
 import { clientName, clientPictureUrl, loadClient, type ClientRow } from "../../clients/model";
 import { auditContext, writeAudit } from "../../lib/audit";
 import { decryptBytes } from "../../lib/crypto";
+import { inspectPdf } from "../../lib/documents";
 import { exec, one, rows, transaction, type Conn } from "../../lib/db";
 import { queueEmail } from "../../lib/email";
 import { queueSupportEvent } from "../../lib/events";
@@ -96,6 +97,46 @@ interface DocRow {
   size_bytes: number;
   file_name: string;
   sha256: string;
+  /** Null only for a PDF stored before pages were counted, until a reviewer first opens it. */
+  pages: number | null;
+}
+
+const isPdf = (mime: string) => mime === "application/pdf";
+
+/**
+ * What one reviewer has opened of a client's documents, from the audit log.
+ * A photo counts once fetched. A PDF counts when the review screen drew every
+ * page, or when the reviewer downloaded it to read elsewhere.
+ */
+async function openedBy(conn: Conn, staffId: number, clientId: number) {
+  const events = await rows<{ action: string; doc: number; page: number | null; download: string | null }>(
+    conn,
+    `SELECT action, CAST(meta_json->>'$.documentId' AS UNSIGNED) AS doc, CAST(meta_json->>'$.page' AS UNSIGNED) AS page, meta_json->>'$.download' AS download
+     FROM audit_log WHERE entity_type = 'client' AND entity_id = ? AND actor_type = 'staff' AND actor_id = ? AND action IN ('kyc.document_viewed', 'kyc.document_page_viewed')`,
+    [String(clientId), staffId],
+  );
+  const seen = new Map<number, { fetched: boolean; downloaded: boolean; pages: Set<number> }>();
+  for (const e of events) {
+    const doc = Number(e.doc);
+    const s = seen.get(doc) ?? { fetched: false, downloaded: false, pages: new Set<number>() };
+    if (e.action === "kyc.document_viewed") {
+      s.fetched = true;
+      if (e.download === "true") s.downloaded = true;
+    } else if (e.page) s.pages.add(Number(e.page));
+    seen.set(doc, s);
+  }
+  return {
+    /** Pages of a PDF the review screen drew for this reviewer. */
+    pagesOf: (d: DocRow) => [...(seen.get(d.id)?.pages ?? [])].sort((a, b) => a - b),
+    fully: (d: DocRow) => {
+      const s = seen.get(d.id);
+      if (!s?.fetched) return false;
+      if (!isPdf(d.mime) || s.downloaded) return true;
+      const total = d.pages ?? 1;
+      for (let p = 1; p <= total; p++) if (!s.pages.has(p)) return false;
+      return true;
+    },
+  };
 }
 
 const ageOn = (dob: string, now = new Date()) => {
@@ -162,7 +203,7 @@ export function staffKycRouter(deps: AppDeps): Router {
   }
 
   const documentsOf = (submissionId: number) =>
-    rows<DocRow>(db, "SELECT id, submission_id, slot, mime, size_bytes, file_name, sha256 FROM kyc_documents WHERE submission_id = ? ORDER BY slot", [submissionId]);
+    rows<DocRow>(db, "SELECT id, submission_id, slot, mime, size_bytes, file_name, sha256, pages FROM kyc_documents WHERE submission_id = ? ORDER BY slot", [submissionId]);
 
   type Outcome = {
     status: "approved" | "rejected";
@@ -257,16 +298,11 @@ export function staffKycRouter(deps: AppDeps): Router {
     if (block) throw block;
   }
 
-  /** Approving needs every page opened by this reviewer: each view is audited as kyc.document_viewed. */
+  /** Approving needs every document, and every page of a PDF, opened by this reviewer (see openedBy). */
   async function assertDocumentsOpened(conn: Conn, staff: StaffContext, row: Row) {
-    const unseen = await one<{ n: number }>(
-      conn,
-      `SELECT COUNT(*) AS n FROM kyc_documents d WHERE d.submission_id = ? AND NOT EXISTS (
-         SELECT 1 FROM audit_log a WHERE a.entity_type = 'client' AND a.entity_id = ? AND a.occurred_at >= ? AND a.action = 'kyc.document_viewed'
-           AND a.actor_type = 'staff' AND a.actor_id = ? AND a.meta_json->'$.documentId' = d.id)`,
-      [row.id, String(row.client_id), row.submitted_at, staff.id],
-    );
-    if (Number(unseen?.n)) throw badRequest("Open every page of the document before approving.");
+    const docs = await rows<DocRow>(conn, "SELECT id, submission_id, slot, mime, size_bytes, file_name, sha256, pages FROM kyc_documents WHERE submission_id = ?", [row.id]);
+    const opened = await openedBy(conn, staff.id, row.client_id);
+    if (!docs.every(opened.fully)) throw badRequest("Open every page of the document before approving.");
   }
 
   async function assertProfileComplete(conn: Conn, clientId: number) {
@@ -410,16 +446,12 @@ export function staffKycRouter(deps: AppDeps): Router {
       const latest = await latestSubmissions(db, row.client_id);
       const isLatest = latest[row.category]?.id === row.id;
       const history = await rows<Row>(db, `${SELECT} WHERE s.client_id = ? AND s.category = ? AND s.id <> ? ORDER BY s.id DESC LIMIT 20`, [row.client_id, row.category, row.id]);
-      // Pages this reviewer has opened (approving needs all of them).
-      const viewed = new Set(
-        (await rows<{ doc: number }>(
-          db,
-          `SELECT DISTINCT CAST(meta_json->>'$.documentId' AS UNSIGNED) AS doc FROM audit_log
-           WHERE entity_type = 'client' AND entity_id = ? AND action = 'kyc.document_viewed' AND actor_type = 'staff' AND actor_id = ?`,
-          [String(row.client_id), staff.id],
-        )).map((v) => Number(v.doc)),
-      );
-      const file = (d: DocRow) => ({ id: d.id, slot: d.slot, type: d.mime, bytes: d.size_bytes, name: d.file_name, url: `/api/staff/kyc/documents/${d.id}`, viewedByMe: viewed.has(d.id) });
+      // What this reviewer has opened (approving needs every document and every page of a PDF).
+      const opened = await openedBy(db, staff.id, row.client_id);
+      const file = (d: DocRow) => ({
+        id: d.id, slot: d.slot, type: d.mime, bytes: d.size_bytes, name: d.file_name, url: `/api/staff/kyc/documents/${d.id}`, pages: d.pages,
+        viewedByMe: opened.fully(d), ...(isPdf(d.mime) ? { viewedPages: opened.pagesOf(d) } : {}),
+      });
 
       // The other category's latest submission, so a reviewer can compare without leaving this one.
       const otherLatest = latest[otherCategory(row.category)];
@@ -566,15 +598,23 @@ export function staffKycRouter(deps: AppDeps): Router {
     "/documents/:docId",
     openDocuments,
     handler(async (req, res) => {
-      const doc = await one<{ id: number; submission_id: number; slot: number; mime: string; file_name: string; bytes_enc: Buffer }>(
+      const doc = await one<{ id: number; submission_id: number; slot: number; mime: string; file_name: string; pages: number | null; bytes_enc: Buffer }>(
         db,
-        "SELECT id, submission_id, slot, mime, file_name, bytes_enc FROM kyc_documents WHERE id = ?",
+        "SELECT id, submission_id, slot, mime, file_name, pages, bytes_enc FROM kyc_documents WHERE id = ?",
         [parse(id, req.params.docId)],
       );
       if (!doc) throw notFound();
       const sub = await loadVisible(req, doc.submission_id);
       const bytes = decryptBytes(config.dataKey, doc.bytes_enc, kycDocumentContext(doc.submission_id, doc.slot));
-      await transaction(db, (conn) => writeAudit(conn, ctx(req), { action: "kyc.document_viewed", entityType: "client", entityId: sub.client_id, meta: { submissionId: sub.id, documentId: doc.id } }));
+      // PDFs stored before pages were counted are counted now, before any page can be marked as seen.
+      if (isPdf(doc.mime) && doc.pages === null) {
+        await exec(db, "UPDATE kyc_documents SET pages = ? WHERE id = ? AND pages IS NULL", [(await inspectPdf(bytes)).pages ?? 1, doc.id]);
+      }
+      // A download (?download=1) means the reviewer reads the whole file elsewhere, so it counts for every page.
+      const download = req.query.download === "1";
+      await transaction(db, (conn) =>
+        writeAudit(conn, ctx(req), { action: "kyc.document_viewed", entityType: "client", entityId: sub.client_id, meta: { submissionId: sub.id, documentId: doc.id, ...(download ? { download: true } : {}) } }),
+      );
       const image = doc.mime.startsWith("image/") && doc.mime !== "image/heic";
       res.setHeader("Cache-Control", "no-store");
       res.setHeader("Content-Type", doc.mime);
@@ -583,6 +623,35 @@ export function staffKycRouter(deps: AppDeps): Router {
       const ext = doc.mime === "application/pdf" ? "pdf" : doc.mime.split("/")[1];
       res.setHeader("Content-Disposition", image ? "inline" : `attachment; filename="client-${sub.client_id}-${sub.category}-${doc.slot}.${ext}"`);
       res.send(bytes);
+    }),
+  );
+
+  // The review screen reports each PDF page it drew: approving needs all of them.
+  router.post(
+    "/documents/:docId/pages",
+    openDocuments,
+    handler(async (req, res) => {
+      const staff = staffOf(req);
+      const { page } = parse(z.object({ page: z.number().int().min(1) }).strict(), req.body ?? {});
+      const doc = await one<{ id: number; submission_id: number; mime: string; pages: number | null }>(db, "SELECT id, submission_id, mime, pages FROM kyc_documents WHERE id = ?", [
+        parse(id, req.params.docId),
+      ]);
+      if (!doc) throw notFound();
+      const sub = await loadVisible(req, doc.submission_id);
+      if (!isPdf(doc.mime) || page > (doc.pages ?? 1)) throw badRequest("That page is not part of this document.");
+      await transaction(db, async (conn) => {
+        const seen = await rows<{ action: string; page: number | null }>(
+          conn,
+          `SELECT action, CAST(meta_json->>'$.page' AS UNSIGNED) AS page FROM audit_log WHERE entity_type = 'client' AND entity_id = ? AND actor_type = 'staff' AND actor_id = ?
+             AND action IN ('kyc.document_viewed', 'kyc.document_page_viewed') AND meta_json->'$.documentId' = ?`,
+          [String(sub.client_id), staff.id, doc.id],
+        );
+        // Only a reviewer who fetched the file can have seen its pages; each page is recorded once.
+        if (!seen.some((e) => e.action === "kyc.document_viewed")) throw badRequest("Open the document first.");
+        if (seen.some((e) => e.action === "kyc.document_page_viewed" && Number(e.page) === page)) return;
+        await writeAudit(conn, ctx(req), { action: "kyc.document_page_viewed", entityType: "client", entityId: sub.client_id, meta: { submissionId: sub.id, documentId: doc.id, page } });
+      });
+      res.status(204).end();
     }),
   );
 

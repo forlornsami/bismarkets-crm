@@ -3,7 +3,7 @@ import { ArrowLeft, BadgeCheck, CheckCircle2, Clock, ExternalLink, FileText, Hou
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { Link, useLocation } from "wouter";
 import { DataGrid, gridQuery, type Column, type GridState } from "../components/DataGrid";
-import { DecisionError, DocumentViewer, plainProblem, ReviewDecision, ReviewLayout, Waiting, Warnings, type ReviewFile, type ReviewWarning } from "../components/ReviewWorkbench";
+import { DecisionError, DocumentViewer, listOf, plainProblem, ReviewDecision, ReviewLayout, Waiting, Warnings, type ReviewFile, type ReviewWarning } from "../components/ReviewWorkbench";
 import { Avatar, Badge, Dialog, ErrorText, Field, PageHeader, Spinner, useFeedback } from "../components/ui";
 import { ApiError, api, formatDate, qs, type Page } from "../lib/api";
 import { KYC_TYPES } from "../../shared/kyc-types";
@@ -37,8 +37,12 @@ interface KycFile {
   bytes: number;
   name: string;
   url: string;
-  /** This reviewer has already opened it (the server's record). */
+  /** Pages the server counted: 1 for a photo, null for a PDF not counted yet. */
+  pages?: number | null;
+  /** This reviewer has already opened it, every page of a PDF (the server's record). */
   viewedByMe?: boolean;
+  /** PDF pages this reviewer has already seen. */
+  viewedPages?: number[];
 }
 
 /** The client's latest submission of the other category, for context. */
@@ -377,7 +381,7 @@ function ApproveLater({ id, clientId, checklist, hasFiles, blocked, unopened }: 
         <textarea className="input" value={reason} onChange={(e) => setReason(e.target.value)} rows={2} maxLength={500} autoFocus />
       </label>
       {reasonProblem && <small className="error-text">{reasonProblem}</small>}
-      {unopened.length > 0 && <p className="muted tight">Open the {unopened.map((u) => u.toLowerCase()).join(" and ")} before approving.</p>}
+      {unopened.length > 0 && <p className="muted tight">Open {listOf(unopened)} before approving.</p>}
       <DecisionError error={send.error} />
       <div className="actions actions-left">
         <button type="submit" className="button button-primary" disabled={send.isPending || !ready}>
@@ -544,6 +548,10 @@ export function KycWorkbench({ id }: { id: string }) {
   const [heldBy, setHeldBy] = useState<string | null>(null);
   const [away, setAway] = useState(false);
   const [viewed, setViewed] = useState<ReadonlySet<number>>(() => new Set());
+  // PDF pages seen so far, and each PDF's page count as the viewer read it.
+  const [pagesSeen, setPagesSeen] = useState<ReadonlyMap<number, ReadonlySet<number>>>(() => new Map());
+  const [pageCounts, setPageCounts] = useState<ReadonlyMap<number, number>>(() => new Map());
+  const reported = useRef(new Set<string>());
   const [showOther, setShowOther] = useState(false);
   const decided = useRef(false);
   const lastActive = useRef(Date.now());
@@ -553,9 +561,24 @@ export function KycWorkbench({ id }: { id: string }) {
   useEffect(() => {
     const seen = d?.files.filter((f) => f.viewedByMe).map((f) => f.id) ?? [];
     if (seen.length) setViewed((prev) => (seen.every((x) => prev.has(x)) ? prev : new Set([...prev, ...seen])));
+    for (const f of d?.files ?? []) {
+      for (const p of f.viewedPages ?? []) reported.current.add(`${f.id}:${p}`);
+      if (f.viewedPages?.length) setPagesSeen((prev) => new Map(prev).set(f.id, new Set([...(prev.get(f.id) ?? []), ...f.viewedPages!])));
+    }
     if (d && d.status === "pending" && d.claimedBy && d.claimedBy.id !== me) setHeldBy(d.claimedBy.name ?? "Another reviewer");
   }, [d, me]);
   const markViewed = useCallback((fileId: number) => setViewed((prev) => (prev.has(fileId) ? prev : new Set(prev).add(fileId))), []);
+  // Each PDF page drawn is reported once; it counts here only after the server recorded it, as approving checks there.
+  const markPage = useCallback((fileId: number, page: number, pages: number) => {
+    setPageCounts((prev) => (prev.get(fileId) === pages ? prev : new Map(prev).set(fileId, pages)));
+    const key = `${fileId}:${page}`;
+    if (reported.current.has(key)) return;
+    reported.current.add(key);
+    api.post(`/api/staff/kyc/documents/${fileId}/pages`, { page }).then(
+      () => setPagesSeen((prev) => new Map(prev).set(fileId, new Set(prev.get(fileId) ?? []).add(page))),
+      () => reported.current.delete(key),
+    );
+  }, []);
 
   // Reload the item to learn who holds it now, or whether it was decided meanwhile.
   const refresh = async () => {
@@ -670,7 +693,19 @@ export function KycWorkbench({ id }: { id: string }) {
     );
   const p = d.profile;
   const files = reviewFiles(d.files);
-  const unopened = files.filter((f) => !viewed.has(f.id)).map((f) => f.label);
+  // What is left to open of each file, worded for the hint ("the back", "page 2 of the document"); null once fully opened.
+  const leftToOpen = (f: ReviewFile) => {
+    if (viewed.has(f.id)) return null;
+    const what = `the ${f.label.toLowerCase()}`;
+    const total = f.type === "application/pdf" ? (f.pages ?? pageCounts.get(f.id)) : undefined;
+    const seen = pagesSeen.get(f.id);
+    if (!total || !seen?.size) return what;
+    const missing = Array.from({ length: total }, (_, i) => i + 1).filter((p) => !seen.has(p));
+    if (!missing.length) return null;
+    return missing.length === 1 ? `page ${missing[0]} of ${what}` : missing.length <= 3 ? `pages ${listOf(missing.map(String))} of ${what}` : `${missing.length} more pages of ${what}`;
+  };
+  const unopened = files.map(leftToOpen).filter((u): u is string => u !== null);
+  const opened = new Set(files.filter((f) => leftToOpen(f) === null).map((f) => f.id));
   const otherCategory: Category = d.category === "identity" ? "address" : "identity";
   const other = d.other ?? null;
   const otherFiles = reviewFiles(otherFilesOf(other));
@@ -726,8 +761,10 @@ export function KycWorkbench({ id }: { id: string }) {
       evidence={
         <DocumentViewer
           files={showingOther ? otherFiles : files}
-          viewed={showingOther ? undefined : viewed}
+          viewed={showingOther ? undefined : opened}
+          pagesSeen={showingOther ? undefined : pagesSeen}
           onViewed={showingOther ? undefined : markViewed}
+          onPageViewed={showingOther ? undefined : markPage}
           banner={
             showingOther &&
             other && (

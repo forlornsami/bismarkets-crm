@@ -15,6 +15,8 @@ export interface ReviewFile {
   bytes: number;
   url: string;
   label: string;
+  /** Pages the server counted (null for a PDF it could not count yet). */
+  pages?: number | null;
 }
 
 export interface ReviewWarning {
@@ -50,10 +52,8 @@ export function DecisionError({ error }: { error: unknown }) {
   );
 }
 
-const lowerList = (items: string[]) => {
-  const words = items.map((w) => w.toLowerCase());
-  return words.length < 2 ? (words[0] ?? "") : `${words.slice(0, -1).join(", ")} and ${words[words.length - 1]}`;
-};
+/** "a, b and c" */
+export const listOf = (items: string[]) => (items.length < 2 ? (items[0] ?? "") : `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`);
 
 // ---------- Shortcut setting ----------
 // Single-key shortcuts can be switched off (WCAG 2.1.4). The choice is kept in
@@ -187,10 +187,12 @@ async function openFile(file: ReviewFile): Promise<Opened> {
 const MAX_AREA = 16_000_000;
 const MAX_SIDE = 8192;
 
-/** One page drawn to fit the stage, then zoomed and turned; turning never clips. */
-function PageCanvas({ opened, page, turn, zoom, box, label }: { opened: Exclude<Opened, { kind: "failed" }>; page: number; turn: number; zoom: number; box: { w: number; h: number }; label: string }) {
+/** One page drawn to fit the stage, then zoomed and turned; turning never clips. `onDrawn` runs each time a PDF page is on screen. */
+function PageCanvas({ opened, page, turn, zoom, box, label, onDrawn }: { opened: Exclude<Opened, { kind: "failed" }>; page: number; turn: number; zoom: number; box: { w: number; h: number }; label: string; onDrawn?: (page: number) => void }) {
   const ref = useRef<HTMLCanvasElement>(null);
   const [error, setError] = useState<string | null>(null);
+  const drawn = useRef(onDrawn);
+  drawn.current = onDrawn;
   const rotation = ((turn % 360) + 360) % 360;
   useEffect(() => {
     const canvas = ref.current;
@@ -244,6 +246,7 @@ function PageCanvas({ opened, page, turn, zoom, box, label }: { opened: Exclude<
         if (cancelled) return;
         place(off.width, off.height, cssW, cssH)?.drawImage(off, 0, 0);
         off.width = off.height = 0;
+        drawn.current?.(page);
       } catch (e) {
         if (!cancelled && (e as { name?: string })?.name !== "RenderingCancelledException") setError("This page could not be drawn.");
       }
@@ -260,8 +263,20 @@ function PageCanvas({ opened, page, turn, zoom, box, label }: { opened: Exclude<
 /**
  * Large document viewer: photos and PDFs drawn to fit, with zoom, rotate,
  * front/back and page switching. Tabs show which documents are not opened yet.
+ * A photo counts as opened once it is on screen (`onViewed`); a PDF page by
+ * page (`onPageViewed`), or as a whole when it is downloaded.
  */
-export function DocumentViewer({ files, viewed, onViewed, banner }: { files: ReviewFile[]; viewed?: ReadonlySet<number>; onViewed?: (fileId: number) => void; banner?: ReactNode }) {
+export function DocumentViewer({
+  files, viewed, pagesSeen, onViewed, onPageViewed, banner,
+}: {
+  files: ReviewFile[];
+  viewed?: ReadonlySet<number>;
+  /** PDF pages already seen, by file: later pages not seen yet get a dot on "Next page". */
+  pagesSeen?: ReadonlyMap<number, ReadonlySet<number>>;
+  onViewed?: (fileId: number) => void;
+  onPageViewed?: (fileId: number, page: number, pages: number) => void;
+  banner?: ReactNode;
+}) {
   const [index, setIndex] = useState(0);
   const [page, setPage] = useState(1);
   const [zoom, setZoom] = useState(1);
@@ -276,6 +291,8 @@ export function DocumentViewer({ files, viewed, onViewed, banner }: { files: Rev
   const alive = useRef(true);
   const viewedRef = useRef(onViewed);
   viewedRef.current = onViewed;
+  const pageViewedRef = useRef(onPageViewed);
+  pageViewedRef.current = onPageViewed;
   // A different set of files (such as the client's other document) starts at its first page.
   // Reset while rendering, so a page from the old position is never fetched by mistake.
   const filesKey = files.map((f) => f.id).join(",");
@@ -288,6 +305,7 @@ export function DocumentViewer({ files, viewed, onViewed, banner }: { files: Rev
   const file = files[shownKey === filesKey ? Math.min(index, files.length - 1) : 0];
   const current = file ? opened[file.id] : undefined;
   const pages = current?.kind === "pdf" ? current.doc.numPages : 1;
+  const unseenAhead = Boolean(file && pagesSeen && !viewed?.has(file.id) && Array.from({ length: pages - page }, (_, i) => page + 1 + i).some((p) => !pagesSeen.get(file.id)?.has(p)));
 
   useEffect(() => {
     alive.current = true;
@@ -317,9 +335,9 @@ export function DocumentViewer({ files, viewed, onViewed, banner }: { files: Rev
       setOpened((prev) => ({ ...prev, [file.id]: o }));
     });
   }, [file, opened]);
-  // A document counts as opened once it is on screen.
+  // A photo counts as opened once it is on screen; PDF pages are counted as they are drawn.
   useEffect(() => {
-    if (file && current && current.kind !== "failed") viewedRef.current?.(file.id);
+    if (file && current?.kind === "image") viewedRef.current?.(file.id);
   }, [file?.id, current]);
 
   const step = (dir: number) => setZoom((z) => Math.min(4, Math.max(0.5, Math.round((z + dir * 0.25) * 100) / 100)));
@@ -368,8 +386,10 @@ export function DocumentViewer({ files, viewed, onViewed, banner }: { files: Rev
 
   if (!file) return <div className="viewer viewer-empty muted">No documents were attached.</div>;
   const drawable = current && current.kind !== "failed";
+  // A download counts as opening every page: the reviewer reads the whole file elsewhere.
+  const downloadUrl = `${file.url}?download=1`;
   const download = (text: ReactNode, hint: ReactNode, icon: ReactNode = <FileText size={44} />) => (
-    <a className="viewer-file" href={file.url} onClick={() => onViewed?.(file.id)}>
+    <a className="viewer-file" href={downloadUrl} download onClick={() => onViewed?.(file.id)}>
       {icon}
       <strong>{text}</strong>
       <span className="muted">{hint}</span>
@@ -415,8 +435,16 @@ export function DocumentViewer({ files, viewed, onViewed, banner }: { files: Rev
             <span>
               Page {page} of {pages}
             </span>
-            <button type="button" className="icon-button" aria-label="Next page" disabled={page >= pages} onClick={() => setPage(page + 1)}>
+            <button
+              type="button"
+              className="icon-button"
+              aria-label={unseenAhead ? "Next page (not opened yet)" : "Next page"}
+              title={unseenAhead ? "The next pages are not opened yet" : undefined}
+              disabled={page >= pages}
+              onClick={() => setPage(page + 1)}
+            >
               <ChevronRight size={17} />
+              {unseenAhead && <span className="viewer-dot" aria-hidden />}
             </button>
           </span>
         )}
@@ -442,7 +470,7 @@ export function DocumentViewer({ files, viewed, onViewed, banner }: { files: Rev
               <RotateCw size={17} />
             </button>
             {isPdf(file.type) ? (
-              <a className="icon-button" title="Download the original PDF" aria-label="Download the original PDF" href={file.url}>
+              <a className="icon-button" title="Download the original PDF" aria-label="Download the original PDF" href={downloadUrl} download onClick={() => onViewed?.(file.id)}>
                 <Download size={17} />
               </a>
             ) : (
@@ -479,13 +507,22 @@ export function DocumentViewer({ files, viewed, onViewed, banner }: { files: Rev
               <button type="button" className="button" onClick={() => retry(file.id)}>
                 Try again
               </button>
-              <a className="button button-ghost" href={file.url} onClick={() => onViewed?.(file.id)}>
+              <a className="button button-ghost" href={downloadUrl} download onClick={() => onViewed?.(file.id)}>
                 <Download size={15} /> Download
               </a>
             </span>
           </div>
         ) : (
-          <PageCanvas key={file.id} opened={current} page={Math.min(page, pages)} turn={turn} zoom={zoom} box={box} label={pages > 1 ? `${file.label}, page ${page} of ${pages}` : file.label} />
+          <PageCanvas
+            key={file.id}
+            opened={current}
+            page={Math.min(page, pages)}
+            turn={turn}
+            zoom={zoom}
+            box={box}
+            label={pages > 1 ? `${file.label}, page ${page} of ${pages}` : file.label}
+            onDrawn={current.kind === "pdf" ? (p) => pageViewedRef.current?.(file.id, p, pages) : undefined}
+          />
         )}
       </div>
       {shortcutsOn && <p className="muted tight viewer-hint shortcut-hint">← → pages · + − zoom · 0 fit · [ ] turn · double-click to zoom, drag to move</p>}
@@ -527,7 +564,7 @@ export interface ReviewDecisionProps {
   blockedText?: string | null;
   /** Why approving is not possible (rejecting still is). */
   approveBlocked?: string | null;
-  /** Documents the reviewer has not opened yet; approving waits for them. */
+  /** What the reviewer has not opened yet, ready to read ("the back", "page 2 of the document"); approving waits for them. */
   unopened?: string[];
   approveLabel?: string;
   onApprove: (ticked: string[], internalNote?: string) => void;
@@ -671,7 +708,7 @@ export function ReviewDecision(props: ReviewDecisionProps) {
           {canDecide && props.approveBlocked ? (
             <p className="notice notice-warn tight">{props.approveBlocked}</p>
           ) : canDecide && unopened.length > 0 ? (
-            <p className="muted tight">Open the {lowerList(unopened)} before approving.</p>
+            <p className="muted tight">Open {listOf(unopened)} before approving.</p>
           ) : (
             !allTicked &&
             canDecide && (

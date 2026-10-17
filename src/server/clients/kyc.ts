@@ -46,8 +46,9 @@ export interface KycUpload extends KycUploadForm {
   /**
    * `bytes` and `mime` are what is stored; `sha256` is the hash of the file as
    * sent, for duplicate checks, and `sentMime`/`sentBytes` describe that file.
+   * `pages` is 1 for a photo, and null for a PDF pdf.js cannot read.
    */
-  files: { bytes: Buffer; mime: string; name: string; sha256: string; sentMime: DocumentMime; sentBytes: number }[];
+  files: { bytes: Buffer; mime: string; name: string; sha256: string; sentMime: DocumentMime; sentBytes: number; pages: number | null }[];
 }
 
 /**
@@ -86,7 +87,7 @@ export async function readKycUpload(body: unknown, contentType: string | undefin
 export async function prepareKycFiles(upload: KycUploadForm): Promise<KycUpload["files"]> {
   const files: KycUpload["files"] = [];
   for (const [i, f] of upload.sent.entries()) {
-    let stored: { bytes: Buffer; mime: string };
+    let stored: { bytes: Buffer; mime: string; pages: number | null };
     try {
       stored = await prepareDocument(f.original, f.mime);
     } catch (error) {
@@ -94,7 +95,7 @@ export async function prepareKycFiles(upload: KycUploadForm): Promise<KycUpload[
       throw error;
     }
     const name = stored.mime === f.mime ? f.name : f.name.replace(/\.(heic|heif)$/i, "") + ".jpg";
-    files.push({ bytes: stored.bytes, mime: stored.mime, name, sha256: f.sha256, sentMime: f.mime, sentBytes: f.original.length });
+    files.push({ bytes: stored.bytes, mime: stored.mime, name, sha256: f.sha256, sentMime: f.mime, sentBytes: f.original.length, pages: stored.pages });
   }
   return files;
 }
@@ -171,8 +172,8 @@ export async function storeSubmission(
   const submissionId = result.insertId;
   for (const [i, f] of input.files.entries()) {
     const slot = i + 1;
-    await exec(conn, "INSERT INTO kyc_documents (submission_id, slot, mime, size_bytes, sha256, file_name, bytes_enc) VALUES (?, ?, ?, ?, ?, ?, ?)", [
-      submissionId, slot, f.mime, f.bytes.length, f.sha256, f.name, encryptBytes(config.dataKey, f.bytes, kycDocumentContext(submissionId, slot)),
+    await exec(conn, "INSERT INTO kyc_documents (submission_id, slot, mime, size_bytes, sha256, file_name, pages, bytes_enc) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [
+      submissionId, slot, f.mime, f.bytes.length, f.sha256, f.name, f.pages, encryptBytes(config.dataKey, f.bytes, kycDocumentContext(submissionId, slot)),
     ]);
   }
   await saveProfileSnapshot(conn, config, submissionId, input.profile);
@@ -230,10 +231,15 @@ export type LatestSubmissions = Awaited<ReturnType<typeof latestSubmissions>>;
 export const lockClient = (conn: Conn, clientId: number) =>
   one<{ id: number; status: ClientRow["status"] }>(conn, "SELECT id, status FROM clients WHERE id = ? FOR UPDATE", [clientId]);
 
-/** Profile fields (snake_case) that are under review or verified, so neither the client nor most staff may change them. */
-export function lockedProfileFields(latest: LatestSubmissions): SnapshotField[] {
+/**
+ * Profile fields (snake_case) that are under review or verified, so neither the
+ * client nor most staff may change them. A blank field was never checked, so it
+ * stays open to fill in (staff may upload for a client whose profile is empty).
+ */
+export function lockedProfileFields(latest: LatestSubmissions, profile: Pick<ClientRow, SnapshotField>): SnapshotField[] {
   const held = (s: SubmissionRow | null) => s?.status === "pending" || s?.status === "approved";
-  return [...(held(latest.identity) ? VERIFIED_FIELDS.identity : []), ...(held(latest.address) ? VERIFIED_FIELDS.address : [])];
+  const fields = [...(held(latest.identity) ? VERIFIED_FIELDS.identity : []), ...(held(latest.address) ? VERIFIED_FIELDS.address : [])];
+  return fields.filter((f) => !sameProfileValue(profile[f], ""));
 }
 
 export type KycOverall = "none" | "partial" | "pending" | "approved" | "rejected";
@@ -299,7 +305,7 @@ export async function kycEnvelope(conn: Conn, client: ClientRow) {
     email_verified: client.email_verified_at !== null,
     profile_complete: missing.length === 0,
     missing_profile_fields: missing,
-    locked_profile_fields: lockedProfileFields(latest),
+    locked_profile_fields: lockedProfileFields(latest, client),
     is_kyc_approved: overall === "approved",
     overall_status: overall === "none" ? "not_submitted" : overall,
     identity: category("identity"),
