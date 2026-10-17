@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Lock } from "lucide-react";
-import { useEffect } from "react";
+import { lazy, Suspense, useEffect } from "react";
 import { Route, Switch } from "wouter";
 import { StepUpHost } from "./components/StepUp";
 import { EmptyState, PageHeader, Spinner } from "./components/ui";
@@ -22,9 +22,29 @@ import { AuthScreen, Login } from "./pages/Login";
 import { Roles } from "./pages/Roles";
 import { StaffDetail, StaffList } from "./pages/Staff";
 
-function Guarded({ permission, children }: { permission: string | string[]; children: React.ReactNode }) {
+// The money screens load when first opened, so the rest of the CRM stays small.
+const DepositsQueue = lazy(() => import("./pages/Deposits").then((m) => ({ default: m.DepositsQueue })));
+const DepositWorkbench = lazy(() => import("./pages/Deposits").then((m) => ({ default: m.DepositWorkbench })));
+const WithdrawalsQueue = lazy(() => import("./pages/Withdrawals").then((m) => ({ default: m.WithdrawalsQueue })));
+const WithdrawalWorkbench = lazy(() => import("./pages/Withdrawals").then((m) => ({ default: m.WithdrawalWorkbench })));
+const PaymentMethods = lazy(() => import("./pages/PaymentMethods").then((m) => ({ default: m.PaymentMethods })));
+
+const Loading = ({ children }: { children: React.ReactNode }) => (
+  <Suspense
+    fallback={
+      <div className="center-screen loading-block">
+        <Spinner size={22} />
+      </div>
+    }
+  >
+    {children}
+  </Suspense>
+);
+
+/** `permission`: every one of them is needed; `anyOf`: one of them is enough. */
+function Guarded({ permission = [], anyOf, children }: { permission?: string | string[]; anyOf?: string[]; children: React.ReactNode }) {
   const can = useCan();
-  return can(...[permission].flat()) ? (
+  return can(...[permission].flat()) && (!anyOf || anyOf.some((p) => can(p))) ? (
     <>{children}</>
   ) : (
     <div className="panel">
@@ -135,6 +155,46 @@ export function App() {
                 <KycWorkbench key={params.id} id={params.id} />
               </Guarded>
             )}
+          </Route>
+          <Route path="/deposits">
+            <Guarded permission="deposit.view">
+              <Loading>
+                <DepositsQueue />
+              </Loading>
+            </Guarded>
+          </Route>
+          <Route path="/deposits/:id">
+            {(params) => (
+              <Guarded permission={["deposit.view", "deposit.proof"]}>
+                {/* A fresh screen for every item, so nothing from the last one carries over. */}
+                <Loading>
+                  <DepositWorkbench key={params.id} id={params.id} />
+                </Loading>
+              </Guarded>
+            )}
+          </Route>
+          <Route path="/withdrawals">
+            <Guarded permission="withdrawal.view">
+              <Loading>
+                <WithdrawalsQueue />
+              </Loading>
+            </Guarded>
+          </Route>
+          <Route path="/withdrawals/:id">
+            {(params) => (
+              <Guarded permission="withdrawal.view">
+                <Loading>
+                  <WithdrawalWorkbench key={params.id} id={params.id} />
+                </Loading>
+              </Guarded>
+            )}
+          </Route>
+          <Route path="/payment-methods">
+            <Guarded anyOf={["payment.manage", "deposit.view", "withdrawal.view"]}>
+              <Loading>
+                <PaymentMethods />
+              </Loading>
+            </Guarded>
           </Route>
           <Route path="/emails">
             <Guarded permission="comms.view">

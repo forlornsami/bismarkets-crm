@@ -517,7 +517,7 @@ export function DocumentViewer({
         )}
         <span className="muted viewer-meta">
           {isPdf(file.type) ? "PDF · " : ""}
-          {kb(file.bytes)}
+          {file.bytes > 0 ? kb(file.bytes) : ""}
         </span>
         {drawable && (
           <span className="viewer-tools">
@@ -654,6 +654,14 @@ export interface ReviewDecisionProps {
   approveBlocked?: string | null;
   /** What the reviewer has not opened yet, ready to read ("the back", "page 2 of the document"); approving waits for them. */
   unopened?: string[];
+  /** Something the reviewer still has to do before approving, such as a field to fill in; shown as a hint, not a warning. */
+  approveHint?: string | null;
+  /** Approving needs an internal note, for this reason (the note box opens). */
+  noteRequired?: string | null;
+  /** Why rejecting is not possible (approving may still be). */
+  rejectBlocked?: string | null;
+  /** An example for the internal note box. */
+  notePlaceholder?: string;
   approveLabel?: string;
   /** Opens the rejection with this reason filled in; each new `key` opens it again. */
   rejectWith?: { reason: string; key: number } | null;
@@ -693,17 +701,23 @@ export function ReviewDecision(props: ReviewDecisionProps) {
     setRejecting(true);
     reasonRef.current?.focus();
   }, [rejectWith?.key]);
+  const noteRequired = props.noteRequired ?? null;
+  useEffect(() => {
+    if (noteRequired) setNoteOpen(true);
+  }, [noteRequired]);
   const allTicked = checklist.every((c) => ticked.includes(c.key));
-  const mayApprove = canDecide && !props.approveBlocked && unopened.length === 0;
   const internalNote = note.trim() || undefined;
+  const noteMissing = Boolean(noteRequired && !internalNote);
+  const mayApprove = canDecide && !props.approveBlocked && unopened.length === 0 && !props.approveHint && !noteMissing;
+  const mayReject = canDecide && !props.rejectBlocked;
   const noteProblem = plainProblem(note, "note");
   const reasonProblem = plainProblem(reason, "reason");
   const toggle = (key: string) => setTicked((t) => (t.includes(key) ? t.filter((k) => k !== key) : [...t, key]));
   const approve = () => allTicked && !busy && mayApprove && !noteProblem && props.onApprove(ticked, internalNote);
-  const reject = () => reason.trim().length >= 5 && !reasonProblem && !noteProblem && !busy && canDecide && props.onReject(reason.trim(), ticked, internalNote);
+  const reject = () => reason.trim().length >= 5 && !reasonProblem && !noteProblem && !busy && mayReject && props.onReject(reason.trim(), ticked, internalNote);
   const keys: Record<string, (e: KeyboardEvent) => void> = {
     a: approve,
-    r: () => canDecide && !busy && setRejecting(true),
+    r: () => mayReject && !busy && setRejecting(true),
     s: () => !busy && props.onSkip?.(),
     "?": () => setHelp(true),
     Escape: (e) => {
@@ -742,7 +756,7 @@ export function ReviewDecision(props: ReviewDecisionProps) {
         (noteOpen ? (
           <label className="review-note">
             <span className="field-label">Internal note for staff (never shown to the client)</span>
-            <textarea className="input" rows={2} maxLength={500} value={note} onChange={(e) => setNote(e.target.value)} placeholder="For example: asked a colleague to check the address" autoFocus />
+            <textarea className="input" rows={2} maxLength={500} value={note} onChange={(e) => setNote(e.target.value)} placeholder={props.notePlaceholder ?? "For example: asked a colleague to check the address"} autoFocus />
             {noteProblem && <small className="error-text">{noteProblem}</small>}
           </label>
         ) : (
@@ -793,7 +807,7 @@ export function ReviewDecision(props: ReviewDecisionProps) {
             {busy ? <Spinner /> : <Check size={17} />} {props.approveLabel ?? "Approve and next"} {k("A")}
           </button>
           <div className="review-buttons-row">
-            <button type="button" className="button button-danger" disabled={!canDecide || busy} onClick={() => setRejecting(true)}>
+            <button type="button" className="button button-danger" disabled={!mayReject || busy} onClick={() => setRejecting(true)} title={canDecide && props.rejectBlocked ? props.rejectBlocked : undefined}>
               <X size={15} /> Reject {k("R")}
             </button>
             {props.onSkip && (
@@ -806,6 +820,10 @@ export function ReviewDecision(props: ReviewDecisionProps) {
             <p className="notice notice-warn tight">{props.approveBlocked}</p>
           ) : canDecide && unopened.length > 0 ? (
             <p className="muted tight">Open {listOf(unopened)} before approving.</p>
+          ) : canDecide && props.approveHint ? (
+            <p className="muted tight">{props.approveHint}</p>
+          ) : canDecide && noteMissing ? (
+            <p className="muted tight">{noteRequired}</p>
           ) : (
             !allTicked &&
             canDecide && (
@@ -814,6 +832,7 @@ export function ReviewDecision(props: ReviewDecisionProps) {
               </p>
             )
           )}
+          {canDecide && props.rejectBlocked && <p className="muted tight">{props.rejectBlocked}</p>}
         </div>
       )}
       <Dialog open={help} title="Keyboard shortcuts" onClose={() => setHelp(false)}>

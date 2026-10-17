@@ -3,6 +3,7 @@ import {
   ArrowUpFromLine,
   BadgeCheck,
   ChevronsLeft,
+  CreditCard,
   ChevronsRight,
   LayoutDashboard,
   LogOut,
@@ -29,6 +30,7 @@ import { Avatar, ThemeSwitch } from "../components/ui";
 import { api } from "../lib/api";
 import { useLogo } from "../lib/branding";
 import { useCan, useSession } from "../lib/session";
+import { useDepositsForMe, useWithdrawalsForMe } from "../components/money";
 import { useKycSummary } from "./Kyc";
 
 interface NavItem {
@@ -36,8 +38,10 @@ interface NavItem {
   label: string;
   icon: LucideIcon;
   permission?: string;
+  /** Shown when the staff member holds any one of these. */
+  anyOf?: string[];
   soon?: boolean;
-  badge?: "kyc";
+  badge?: "kyc" | "deposits" | "withdrawals";
 }
 
 const NAV: { title: string; items: NavItem[] }[] = [
@@ -52,8 +56,8 @@ const NAV: { title: string; items: NavItem[] }[] = [
   {
     title: "Money",
     items: [
-      { href: "/deposits", label: "Deposits", icon: ArrowDownToLine, permission: "deposit.view", soon: true },
-      { href: "/withdrawals", label: "Withdrawals", icon: ArrowUpFromLine, permission: "withdrawal.view", soon: true },
+      { href: "/deposits", label: "Deposits", icon: ArrowDownToLine, permission: "deposit.view", badge: "deposits" },
+      { href: "/withdrawals", label: "Withdrawals", icon: ArrowUpFromLine, permission: "withdrawal.view", badge: "withdrawals" },
     ],
   },
   {
@@ -78,6 +82,7 @@ const NAV: { title: string; items: NavItem[] }[] = [
       { href: "/staff", label: "Staff", icon: UserCog, permission: "staff.view" },
       { href: "/roles", label: "Roles", icon: Shield, permission: "role.view" },
       { href: "/audit", label: "Audit log", icon: ScrollText, permission: "audit.view" },
+      { href: "/payment-methods", label: "Payment methods", icon: CreditCard, anyOf: ["payment.manage", "deposit.view", "withdrawal.view"] },
       { href: "/settings/email", label: "Email settings", icon: AtSign, permission: "settings.view" },
       { href: "/settings/branding", label: "Branding", icon: Palette, permission: "settings.view" },
     ],
@@ -98,6 +103,14 @@ function readCollapsed() {
 export function Layout({ children, onSignedOut }: { children: ReactNode; onSignedOut: () => void }) {
   const can = useCan();
   const kycWaiting = useKycSummary(can("kyc.view")).data?.pending ?? 0;
+  // Money badges count only what this staff member can act on.
+  const depositsForMe = useDepositsForMe();
+  const withdrawalsForMe = useWithdrawalsForMe();
+  const counts: Record<NonNullable<NavItem["badge"]>, { n: number; title: string }> = {
+    kyc: { n: kycWaiting, title: "waiting for review" },
+    deposits: { n: depositsForMe, title: "deposits waiting for you" },
+    withdrawals: { n: withdrawalsForMe, title: "withdrawals waiting for you" },
+  };
   const [location] = useLocation();
   const logo = useLogo();
   const [collapsed, setCollapsed] = useState(readCollapsed);
@@ -142,7 +155,7 @@ export function Layout({ children, onSignedOut }: { children: ReactNode; onSigne
         </div>
         <nav className="sidebar-nav">
           {NAV.map((s) => {
-            const items = s.items.filter((n) => !n.permission || can(n.permission));
+            const items = s.items.filter((n) => (!n.permission || can(n.permission)) && (!n.anyOf || n.anyOf.some((p) => can(p))));
             if (items.length === 0) return null;
             return (
               <div key={s.title} className="nav-section">
@@ -159,9 +172,9 @@ export function Layout({ children, onSignedOut }: { children: ReactNode; onSigne
                     <Link key={n.href} href={n.href} className={n === current ? "nav-link active" : "nav-link"} title={collapsed ? n.label : undefined} aria-current={n === current ? "page" : undefined}>
                       <Icon size={18} />
                       <span className="nav-label">{n.label}</span>
-                      {n.badge === "kyc" && kycWaiting > 0 && (
-                        <span className="nav-count" title={`${kycWaiting} waiting for review`}>
-                          {kycWaiting > 99 ? "99+" : kycWaiting}
+                      {n.badge && counts[n.badge].n > 0 && (
+                        <span className="nav-count" title={`${counts[n.badge].n} ${counts[n.badge].title}`}>
+                          {counts[n.badge].n > 99 ? "99+" : counts[n.badge].n}
                         </span>
                       )}
                     </Link>

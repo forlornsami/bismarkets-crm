@@ -23,6 +23,7 @@ import {
 import { useState } from "react";
 import { Link, useLocation } from "wouter";
 import { DataGrid, gridQuery, type Column, type GridState } from "../components/DataGrid";
+import { ClientWallet } from "../components/money";
 import { Avatar, Badge, Dialog, EmptyState, ErrorText, Field, PageHeader, Spinner, useFeedback } from "../components/ui";
 import { api, formatDate, qs, type Page } from "../lib/api";
 import { useCan, useSession } from "../lib/session";
@@ -588,13 +589,17 @@ export function ClientDetail({ id }: { id: string }) {
 
       <div className="columns columns-wide">
         <ClientKyc clientId={d.id} status={d.kycStatus} />
-        <section className="panel">
-          <div className="card-head">
-            <h2 className="flush">Notice for the client</h2>
-          </div>
-          {d.importantNotice ? <p>{d.importantNotice}</p> : <p className="muted">None. Staff who can edit clients can add one under Edit details; the client sees it on their profile.</p>}
-        </section>
+        {can("wallet.view") ? (
+          <ClientWallet clientId={d.id} />
+        ) : (
+          <ClientNotice notice={d.importantNotice} />
+        )}
       </div>
+      {can("wallet.view") && (
+        <div className="columns columns-wide">
+          <ClientNotice notice={d.importantNotice} />
+        </div>
+      )}
       <div className="columns columns-wide">
         <Notes id={id} />
         <Sessions id={id} />
@@ -611,6 +616,17 @@ export function ClientDetail({ id }: { id: string }) {
       <StatusDialog c={d} target={statusDialog} onClose={() => setStatusDialog(null)} onDone={refresh} />
       <ImpersonateDialog c={d} open={impersonating} onClose={() => setImpersonating(false)} onDone={refresh} />
     </>
+  );
+}
+
+function ClientNotice({ notice }: { notice: string | null }) {
+  return (
+    <section className="panel">
+      <div className="card-head">
+        <h2 className="flush">Notice for the client</h2>
+      </div>
+      {notice ? <p>{notice}</p> : <p className="muted">None. Staff who can edit clients can add one under Edit details; the client sees it on their profile.</p>}
+    </section>
   );
 }
 
@@ -726,6 +742,21 @@ function kycDetail(a: Activity, reasons: "all" | "client" | "none") {
   return parts.filter(Boolean).join(" · ") || null;
 }
 
+// For deposit and withdrawal entries: the request's reference (D-… or W-…), so staff can find it.
+function moneyDetail(a: Activity) {
+  if (!/^(deposit|withdrawal)\./.test(a.action)) return null;
+  let meta = a.meta;
+  if (typeof meta === "string") {
+    try {
+      meta = JSON.parse(meta);
+    } catch {
+      return null;
+    }
+  }
+  const ref = meta && typeof meta === "object" ? (meta as { reference?: unknown }).reference : null;
+  return typeof ref === "string" && ref ? `Request ${ref}` : null;
+}
+
 function ActivityPanel({ id }: { id: string }) {
   const can = useCan();
   const reasons = can("kyc.documents") ? "all" : can("kyc.view") ? "client" : "none";
@@ -744,6 +775,7 @@ function ActivityPanel({ id }: { id: string }) {
           <li key={a.id} className={a.actorType === "staff" ? "by-staff" : ""}>
             <strong>{actionLabel(a.action)}</strong>
             {kycDetail(a, reasons) && <small>{kycDetail(a, reasons)}</small>}
+            {moneyDetail(a) && <small>{moneyDetail(a)}</small>}
             <small className="muted">
               {formatDate(a.at)} · {a.actorType === "staff" ? `by ${a.actor}` : a.actorType === "client" ? "by the client" : "system"}
               {a.ip ? ` · ${a.ip}` : ""}
