@@ -102,4 +102,5 @@ export async function prepareProof(original: Buffer): Promise<PreparedProof> {
   }
 }
 
-export const depositProofContext = (reference: string) => `deposit_proof:${reference}`;
+/** Bound to the deposit and its client, so a proof copied onto another deposit does not open. */
+export const depositProofContext = (depositId: number, clientId: number, reference: string) => `deposit_proof:${depositId}:${clientId}:${reference}`;

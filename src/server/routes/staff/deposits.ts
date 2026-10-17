@@ -636,7 +636,7 @@ export function staffDepositsRouter(deps: AppDeps): Router {
       const r = await loadVisible(req, parse(moneyId, req.params.id));
       const proof = await one<{ mime: string; bytes_enc: Buffer }>(db, "SELECT mime, bytes_enc FROM deposit_proofs WHERE deposit_id = ?", [r.id]);
       if (!proof) throw notFound("This deposit has no payment proof.");
-      const body = decryptBytes(config.dataKey, proof.bytes_enc, depositProofContext(r.reference));
+      const body = decryptBytes(config.dataKey, proof.bytes_enc, depositProofContext(r.id, r.client_id, r.reference));
       await transaction(db, (conn) =>
         writeAudit(conn, ctx(req), { action: "deposit.proof_viewed", entityType: "client", entityId: r.client_id, meta: { depositId: r.id, reference: r.reference } }),
       );

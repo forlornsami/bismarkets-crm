@@ -6,6 +6,7 @@ import sharp from "sharp";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { WITHDRAWAL_CHECKLIST, WITHDRAWAL_REJECT_REASONS } from "../src/shared/money";
 import { lockClient } from "../src/server/clients/kyc";
+import { payoutAccountContext, payoutIbanContext, withdrawalDestinationContext } from "../src/server/clients/money";
 import { writeAudit } from "../src/server/lib/audit";
 import { encryptBytes, encryptField, sha256 } from "../src/server/lib/crypto";
 import { exec, one, rows, transaction } from "../src/server/lib/db";
@@ -104,15 +105,19 @@ describe.skipIf(!hasDb)("staff withdrawals", () => {
     const r = await exec(
       env.db,
       `INSERT INTO client_payout_methods (client_id, payment_method_id, method_name, account_name, account_number_enc, iban_enc, fingerprint, qr_mime, qr_bytes_enc, qr_token, is_default, created_at, details_changed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+       VALUES (?, ?, ?, ?, '', NULL, ?, ?, ?, ?, 1, ?, ?)`,
       [
         clientId, type, opts.methodName ?? (kind === "bank" ? "My HBL" : "My Tron wallet"), opts.accountName ?? (kind === "bank" ? "Ali Khan" : ""),
-        encryptField(env.config.dataKey, accountNumber, `payout_method:${clientId}:account_number`),
-        iban ? encryptField(env.config.dataKey, iban, `payout_method:${clientId}:iban`) : null,
         destinationFingerprint(env.config.dataKey, type, iban || accountNumber),
         opts.qr ? "image/png" : null, opts.qr && token ? encryptBytes(env.config.dataKey, opts.qr, `payout_qr:${clientId}:${token}`) : null, token, at, at,
       ],
     );
+    await exec(env.db, "UPDATE client_payout_methods SET account_number_enc = ?, iban_enc = ?, details_changed_at = ? WHERE id = ?", [
+      encryptField(env.config.dataKey, accountNumber, payoutAccountContext(r.insertId, clientId)),
+      iban ? encryptField(env.config.dataKey, iban, payoutIbanContext(r.insertId, clientId)) : null,
+      at,
+      r.insertId,
+    ]);
     return {
       id: r.insertId, clientId, type, kind, methodName: opts.methodName ?? (kind === "bank" ? "My HBL" : "My Tron wallet"),
       accountName: opts.accountName ?? (kind === "bank" ? "Ali Khan" : ""), accountNumber, iban, token, qr: opts.qr ?? null,
@@ -132,13 +137,16 @@ describe.skipIf(!hasDb)("staff withdrawals", () => {
       const w = await exec(
         conn,
         `INSERT INTO withdrawals (reference, client_id, wallet_id, payout_method_id, payment_method_id, method_name, amount_cents, needs_second_approval, destination_enc, destination_fingerprint, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)`,
         [
           reference, p.clientId, wallet.id, p.id, p.type, p.methodName, cents, opts.flag ? 1 : 0,
-          encryptField(env.config.dataKey, JSON.stringify(snapshot), `withdrawal:${reference}`), destinationFingerprint(env.config.dataKey, p.type, p.iban || p.accountNumber),
-          opts.createdAt ?? new Date(),
+          destinationFingerprint(env.config.dataKey, p.type, p.iban || p.accountNumber), opts.createdAt ?? new Date(),
         ],
       );
+      await exec(conn, "UPDATE withdrawals SET destination_enc = ? WHERE id = ?", [
+        encryptField(env.config.dataKey, JSON.stringify(snapshot), withdrawalDestinationContext(w.insertId, p.clientId, reference)),
+        w.insertId,
+      ]);
       await postLedger(conn, { kind: "withdrawal_hold", sourceType: "withdrawal", sourceId: w.insertId, clientId: p.clientId, staffId: null, memo: "test hold" }, [
         { account: walletAccount(p.clientId), amount: -cents },
         { account: holdAccount(p.clientId), amount: cents },
@@ -699,6 +707,19 @@ describe.skipIf(!hasDb)("staff withdrawals", () => {
     expect((await reject(agentA, w.id)).status).toBe(200);
   });
 
+  it("does not open a destination moved over from another withdrawal", async () => {
+    const small = await withdraw((await regular()).payout, 5_000);
+    const big = await withdraw((await regular()).payout, 90_000);
+    const sealed = (await one<{ destination_enc: Buffer }>(env.db, "SELECT destination_enc FROM withdrawals WHERE id = ?", [small.id]))!.destination_enc;
+    // Reference and copy moved together onto the larger withdrawal.
+    await exec(env.db, "UPDATE withdrawals SET reference = 'W-MOVED001' WHERE id = ?", [small.id]);
+    await exec(env.db, "UPDATE withdrawals SET reference = ?, destination_enc = ? WHERE id = ?", [small.reference, sealed, big.id]);
+    const view = await agentA.agent.get(W(big.id));
+    expect(view.body.warnings).toContainEqual({ tone: "bad", text: "The destination of this withdrawal could not be read, so it cannot be approved or paid. You can still reject it." });
+    expect(view.body.destination).toMatchObject({ accountNumber: "" });
+    for (const id of [small.id, big.id]) expect((await reject(agentA, id)).status).toBe(200);
+  });
+
   it("shows the client's QR code only to payout staff, from the review screen, while it is the one they asked with", async () => {
     const clientId = await makeClient();
     await fund(clientId, 100_000, { method: cryptoDeposit });
@@ -835,8 +856,12 @@ describe.skipIf(!hasDb)("staff withdrawals", () => {
       env.db,
       `INSERT INTO withdrawals (reference, client_id, wallet_id, payout_method_id, payment_method_id, method_name, amount_cents, destination_enc, destination_fingerprint)
        SELECT ?, client_id, wallet_id, payout_method_id, payment_method_id, method_name, amount_cents, ?, destination_fingerprint FROM withdrawals WHERE id = ?`,
-      ["W-NOHOLD01", encryptField(env.config.dataKey, JSON.stringify({ methodName: "My HBL", kind: "bank", accountName: "Ali Khan", accountNumber: payout.accountNumber }), "withdrawal:W-NOHOLD01"), w.id],
+      ["W-NOHOLD01", Buffer.alloc(0), w.id],
     );
+    await exec(env.db, "UPDATE withdrawals SET destination_enc = ? WHERE id = ?", [
+      encryptField(env.config.dataKey, JSON.stringify({ methodName: "My HBL", kind: "bank", accountName: "Ali Khan", accountNumber: payout.accountNumber }), withdrawalDestinationContext(copy.insertId, clientId, "W-NOHOLD01")),
+      copy.insertId,
+    ]);
     expect((await approve(agentA, copy.insertId)).body.status).toBe("approved");
     const before = await wallet(clientId);
     const refused = await pay(managerA, copy.insertId);

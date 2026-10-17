@@ -77,7 +77,7 @@ describe.skipIf(!hasDb)("staff deposits", () => {
     );
     const proof = o.proof ?? (await screenshot());
     await exec(env.db, "INSERT INTO deposit_proofs (deposit_id, mime, size_bytes, sha256, file_name, editor, bytes_enc) VALUES (?, 'image/png', ?, ?, 'payment.png', ?, ?)", [
-      r.insertId, proof.length, sha256(proof), o.editor ?? null, encryptBytes(env.config.dataKey, proof, depositProofContext(reference)),
+      r.insertId, proof.length, sha256(proof), o.editor ?? null, encryptBytes(env.config.dataKey, proof, depositProofContext(r.insertId, clientId, reference)),
     ]);
     return { id: r.insertId, reference, proof };
   }

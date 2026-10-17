@@ -392,10 +392,12 @@ describe.skipIf(!hasDb)("client money API", () => {
     expect(row.submitted_ip).not.toBe("");
     const proof = (await one<{ mime: string; sha256: string; file_name: string; editor: string | null; size_bytes: number; bytes_enc: Buffer }>(env.db, "SELECT * FROM deposit_proofs WHERE deposit_id = ?", [row.id]))!;
     expect(proof).toMatchObject({ mime: "image/png", sha256: sha256(annProof), file_name: "IMG_2041", editor: null });
-    const stored = decryptBytes(env.config.dataKey, proof.bytes_enc, depositProofContext(annUsd));
+    const stored = decryptBytes(env.config.dataKey, proof.bytes_enc, depositProofContext(Number(row.id), ann.id, annUsd));
     expect(stored.length).toBe(proof.size_bytes);
     expect(await sharp(stored).metadata()).toMatchObject({ format: "png", width: 400, height: 300 });
-    expect(() => decryptBytes(env.config.dataKey, proof.bytes_enc, depositProofContext("D-OTHER"))).toThrow();
+    // Bound to its deposit: it does not open as another deposit's proof, or another client's.
+    expect(() => decryptBytes(env.config.dataKey, proof.bytes_enc, depositProofContext(Number(row.id) + 1, ann.id, annUsd))).toThrow();
+    expect(() => decryptBytes(env.config.dataKey, proof.bytes_enc, depositProofContext(Number(row.id), ben.id, annUsd))).toThrow();
 
     expect(await audits("deposit.requested", ann.id)).toEqual([
       {
@@ -581,8 +583,8 @@ describe.skipIf(!hasDb)("client money API", () => {
 
     const stored = (await one<{ account_number_enc: Buffer; iban_enc: Buffer; fingerprint: string }>(env.db, "SELECT * FROM client_payout_methods WHERE id = ?", [annBank]))!;
     expect(stored.account_number_enc.includes("4567")).toBe(false);
-    expect(decryptField(env.config.dataKey, stored.account_number_enc, `payout_method:${ann.id}:account_number`)).toBe("0123 4567 8901");
-    expect(decryptField(env.config.dataKey, stored.iban_enc, `payout_method:${ann.id}:iban`)).toBe("PK36MEZN0000000123456789");
+    expect(decryptField(env.config.dataKey, stored.account_number_enc, `payout_method:${annBank}:${ann.id}:account_number`)).toBe("0123 4567 8901");
+    expect(decryptField(env.config.dataKey, stored.iban_enc, `payout_method:${annBank}:${ann.id}:iban`)).toBe("PK36MEZN0000000123456789");
     expect(stored.fingerprint).toBe(destinationFingerprint(env.config.dataKey, m.wBank, "PK36MEZN0000000123456789"));
 
     const [added] = await audits("payout_method.added", ann.id);
@@ -815,7 +817,7 @@ describe.skipIf(!hasDb)("client money API", () => {
     ))!;
     // A first withdrawal always needs a second person (the default setting).
     expect(row).toMatchObject({ needs_second_approval: 1, payment_method_id: m.wBank, payout_method_id: annBank, status: "pending" });
-    expect(JSON.parse(decryptField(env.config.dataKey, row.destination_enc, `withdrawal:${w1}`))).toEqual({
+    expect(JSON.parse(decryptField(env.config.dataKey, row.destination_enc, `withdrawal:${row.id}:${ann.id}:${w1}`))).toEqual({
       methodName: "Meezan Bank Ltd", typeName: "Bank transfer", kind: "bank", network: "", accountName: "Ann Lee", accountNumber: "0123 4567 8901", iban: "", swift: "", payoutMethodId: annBank, qrToken: null,
     });
     expect(row.destination_fingerprint).toBe((await one<{ fingerprint: string }>(env.db, "SELECT fingerprint FROM client_payout_methods WHERE id = ?", [annBank]))!.fingerprint);
@@ -927,7 +929,9 @@ describe.skipIf(!hasDb)("client money API", () => {
 
   it("never pays out to an account whose details cannot be read", async () => {
     const sealed = (await one<{ account_number_enc: Buffer }>(env.db, "SELECT account_number_enc FROM client_payout_methods WHERE id = ?", [annBep]))!.account_number_enc;
-    await exec(env.db, "UPDATE client_payout_methods SET account_number_enc = ? WHERE id = ?", [Buffer.from(sealed).fill(7, 20, 24), annBep]);
+    // A value copied from the client's other account does not open: each is bound to its own row.
+    const other = (await one<{ account_number_enc: Buffer }>(env.db, "SELECT account_number_enc FROM client_payout_methods WHERE id = ?", [annBank]))!.account_number_enc;
+    await exec(env.db, "UPDATE client_payout_methods SET account_number_enc = ? WHERE id = ?", [other, annBep]);
     expect(errorOf(await withdraw(ann, { method: String(annBep), amount: "50", verification_code: await issueCode(ann.email), wallet_key: ann.key }), "method")).toBe(
       "This account could not be read. Remove it and add it again.",
     );

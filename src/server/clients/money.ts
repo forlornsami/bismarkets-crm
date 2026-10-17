@@ -305,8 +305,11 @@ export const presentPayoutType = (t: PayoutTypeRow) => ({
 
 // ---------- Saved payout accounts ----------
 
-export const payoutAccountContext = (clientId: number) => `payout_method:${clientId}:account_number`;
-export const payoutIbanContext = (clientId: number) => `payout_method:${clientId}:iban`;
+// Each sealed value is bound to its own row and client, so a copy pasted onto another row does not open.
+export const payoutAccountContext = (id: number, clientId: number) => `payout_method:${id}:${clientId}:account_number`;
+export const payoutIbanContext = (id: number, clientId: number) => `payout_method:${id}:${clientId}:iban`;
+/** A withdrawal's copy of its destination. */
+export const withdrawalDestinationContext = (id: number, clientId: number, reference: string) => `withdrawal:${id}:${clientId}:${reference}`;
 export const payoutQrContext = (clientId: number, token: string) => `payout_qr:${clientId}:${token}`;
 /** The secret part of a QR image's URL. */
 export const newQrToken = () => randomBytes(16).toString("hex");
@@ -337,7 +340,7 @@ export const PAYOUT_METHOD = `SELECT m.id, m.client_id, m.payment_method_id, m.m
   FROM client_payout_methods m JOIN payment_methods t ON t.id = m.payment_method_id`;
 
 /** The account number and IBAN, decrypted exactly as the client sent them. */
-export function openPayoutMethod(config: Config, m: Pick<PayoutMethodRow, "client_id" | "account_number_enc" | "iban_enc">) {
+export function openPayoutMethod(config: Config, m: Pick<PayoutMethodRow, "id" | "client_id" | "account_number_enc" | "iban_enc">) {
   let unreadable = false;
   const open = (sealed: Buffer | null, context: string) => {
     if (!sealed) return "";
@@ -348,8 +351,8 @@ export function openPayoutMethod(config: Config, m: Pick<PayoutMethodRow, "clien
       return "";
     }
   };
-  const accountNumber = open(m.account_number_enc, payoutAccountContext(m.client_id));
-  const iban = open(m.iban_enc, payoutIbanContext(m.client_id));
+  const accountNumber = open(m.account_number_enc, payoutAccountContext(m.id, m.client_id));
+  const iban = open(m.iban_enc, payoutIbanContext(m.id, m.client_id));
   /** unreadable: a stored detail failed to decrypt (shown empty, and never paid out to). */
   return { accountNumber, iban, unreadable };
 }

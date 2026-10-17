@@ -4,6 +4,7 @@ import { NOT_PLAIN, WITHDRAWAL_CHECKLIST, WITHDRAWAL_REJECT_REASONS, type Withdr
 import type { Permission } from "@shared/permissions";
 import type { AppDeps } from "../../app";
 import { lockClient } from "../../clients/kyc";
+import { withdrawalDestinationContext } from "../../clients/money";
 import { clientName, type ClientRow } from "../../clients/model";
 import { notifyClient } from "../../clients/notifications";
 import { auditContext, writeAudit } from "../../lib/audit";
@@ -300,9 +301,9 @@ export function staffWithdrawalsRouter(deps: AppDeps): Router {
   }
 
   /** The destination snapshot, or null when it cannot be decrypted (then nothing may be approved or paid). */
-  function readDestination(r: Pick<Row, "reference" | "destination_enc" | "kind" | "type_name" | "type_network" | "method_name">): Destination | null {
+  function readDestination(r: Pick<Row, "id" | "client_id" | "reference" | "destination_enc" | "kind" | "type_name" | "type_network" | "method_name">): Destination | null {
     try {
-      const raw = JSON.parse(decryptBytes(config.dataKey, r.destination_enc, `withdrawal:${r.reference}`).toString("utf8")) as Record<string, unknown>;
+      const raw = JSON.parse(decryptBytes(config.dataKey, r.destination_enc, withdrawalDestinationContext(r.id, r.client_id, r.reference)).toString("utf8")) as Record<string, unknown>;
       const text = (k: string) => (typeof raw[k] === "string" ? (raw[k] as string) : "");
       const payoutMethodId = Number(raw.payoutMethodId);
       return {

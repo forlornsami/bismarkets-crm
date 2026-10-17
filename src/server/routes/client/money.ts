@@ -5,6 +5,7 @@ import { lockClient } from "../../clients/kyc";
 import {
   assertClientMayMoveMoney, DEPOSIT_METHOD, DEPOSIT_ROW, depositMinimum, formFlag, formId, formText, lastFour, newQrToken, openPayoutMethod, paged, pageQuery,
   PAYOUT_METHOD, PAYOUT_TYPE, payoutAccountContext, payoutFields, payoutIbanContext, payoutQrContext, payableMethod, presentDeposit, presentDepositMethod, presentPayoutMethod,
+  withdrawalDestinationContext,
   presentPayoutType, presentWithdrawal, QR_TOKEN, readMoneyForm, safeFileName, WITHDRAWAL_ROW,
   type DepositMethodRow, type DepositRow, type MoneyForm, type PayoutFields, type PayoutMethodRow, type PayoutTypeRow, type WithdrawalRow,
 } from "../../clients/money";
@@ -420,7 +421,7 @@ export function clientMoneyRouter(deps: AppDeps): Router {
         // The stored copy is re-encoded (HEIC becomes JPEG, GIF becomes PNG); its name follows the new type.
         const fileName = proof.mime === proof.sentMime ? request.fileName : `${request.fileName.replace(/\.[A-Za-z0-9]{1,5}$/, "")}.${EXTENSION[proof.mime]}`;
         await exec(conn, "INSERT INTO deposit_proofs (deposit_id, mime, size_bytes, sha256, file_name, editor, bytes_enc) VALUES (?, ?, ?, ?, ?, ?, ?)", [
-          id, proof.mime, proof.bytes.length, proof.sha256, fileName.slice(0, 160), proof.editor, encryptBytes(config.dataKey, proof.bytes, depositProofContext(reference)),
+          id, proof.mime, proof.bytes.length, proof.sha256, fileName.slice(0, 160), proof.editor, encryptBytes(config.dataKey, proof.bytes, depositProofContext(id, client.id, reference)),
         ]);
         await writeAudit(conn, ctx(req), {
           action: "deposit.requested", entityType: "client", entityId: client.id,
@@ -511,14 +512,16 @@ export function clientMoneyRouter(deps: AppDeps): Router {
             conn,
             `INSERT INTO withdrawals (reference, client_id, wallet_id, payout_method_id, payment_method_id, method_name, amount_cents, needs_second_approval,
                destination_enc, destination_fingerprint, requested_ip)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [
-              reference, client.id, locked.id, payout.id, payout.payment_method_id, payout.method_name, cents, needsSecond ? 1 : 0,
-              encryptField(config.dataKey, JSON.stringify(destination), `withdrawal:${reference}`), payout.fingerprint, req.clientIp,
-            ],
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)`,
+            [reference, client.id, locked.id, payout.id, payout.payment_method_id, payout.method_name, cents, needsSecond ? 1 : 0, payout.fingerprint, req.clientIp],
           );
           return { id: r.insertId, reference };
         });
+        // Sealed once the row exists, as the copy is bound to its id.
+        await exec(conn, "UPDATE withdrawals SET destination_enc = ? WHERE id = ?", [
+          encryptField(config.dataKey, JSON.stringify(destination), withdrawalDestinationContext(id, client.id, reference)),
+          id,
+        ]);
         await postLedger(conn, { kind: "withdrawal_hold", sourceType: "withdrawal", sourceId: id, clientId: client.id, staffId: null, memo: `Withdrawal ${reference}` }, [
           { account: walletAccount(client.id), amount: -cents },
           { account: holdAccount(client.id), amount: cents },
@@ -597,9 +600,9 @@ export function clientMoneyRouter(deps: AppDeps): Router {
     });
   }
 
-  const sealedDetails = (clientId: number, typeId: number, f: PayoutFields) => ({
-    account: encryptField(config.dataKey, f.account_number, payoutAccountContext(clientId)),
-    iban: f.iban ? encryptField(config.dataKey, f.iban, payoutIbanContext(clientId)) : null,
+  const sealedDetails = (id: number, clientId: number, typeId: number, f: PayoutFields) => ({
+    account: encryptField(config.dataKey, f.account_number, payoutAccountContext(id, clientId)),
+    iban: f.iban ? encryptField(config.dataKey, f.iban, payoutIbanContext(id, clientId)) : null,
     fingerprint: destinationFingerprint(config.dataKey, typeId, f.iban || f.account_number),
   });
 
@@ -627,17 +630,19 @@ export function clientMoneyRouter(deps: AppDeps): Router {
         const saved = await countSaved(conn, client.id);
         if (saved >= MAX_PAYOUT_METHODS) throw tooMany();
         const isDefault = saved === 0 || formFlag(form.values.is_default) === true;
-        const sealed = sealedDetails(client.id, type.id, fields);
         const token = qr ? newQrToken() : null;
+        // Inserted first, as the sealed details are bound to the row's id.
         const r = await exec(
           conn,
           `INSERT INTO client_payout_methods (client_id, payment_method_id, method_name, account_name, account_number_enc, iban_enc, swift, fingerprint, qr_mime, qr_bytes_enc, qr_token, is_default, created_ip)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, '', NULL, ?, '', ?, ?, ?, ?, ?)`,
           [
-            client.id, type.id, fields.method_name, fields.account_name, sealed.account, sealed.iban, fields.swift, sealed.fingerprint,
+            client.id, type.id, fields.method_name, fields.account_name, fields.swift,
             qr?.mime ?? null, qr && token ? encryptBytes(config.dataKey, qr.bytes, payoutQrContext(client.id, token)) : null, token, isDefault ? 1 : 0, req.clientIp,
           ],
         );
+        const sealed = sealedDetails(r.insertId, client.id, type.id, fields);
+        await exec(conn, "UPDATE client_payout_methods SET account_number_enc = ?, iban_enc = ?, fingerprint = ? WHERE id = ?", [sealed.account, sealed.iban, sealed.fingerprint, r.insertId]);
         if (isDefault) await exec(conn, "UPDATE client_payout_methods SET is_default = 0 WHERE client_id = ? AND id <> ? AND is_default = 1", [client.id, r.insertId]);
         await writeAudit(conn, ctx(req), {
           action: "payout_method.added", entityType: "client", entityId: client.id,
@@ -714,7 +719,7 @@ export function clientMoneyRouter(deps: AppDeps): Router {
 
         const sets: [string, unknown][] = [["method_name", fields.method_name]];
         if (detailsChanged) {
-          const sealed = sealedDetails(client.id, type.id, fields);
+          const sealed = sealedDetails(id, client.id, type.id, fields);
           sets.push(["payment_method_id", type.id], ["account_name", fields.account_name], ["account_number_enc", sealed.account], ["iban_enc", sealed.iban], ["swift", fields.swift], ["fingerprint", sealed.fingerprint]);
         }
         if (qr) {
