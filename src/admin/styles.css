@@ -640,7 +640,10 @@ body.no-scroll { overflow: hidden; }
   .input, select.input, textarea.input, .input-small { font-size: 16px; }
   .input, .input-small { min-height: 44px; }
   .button { min-height: 44px; }
-  .button-small { min-height: 36px; }
+  .button-small { min-height: 44px; }
+  .segmented button { width: 44px; height: 40px; }
+  /* Links inside sentences get a taller tap area without moving the text around them. */
+  .content p a, .content .muted a, .content dd > a { display: inline-block; padding: 13px 0; margin: -13px 0; }
   .icon-button { width: 44px; height: 44px; }
   .check { padding: 8px 0; font-size: 14px; }
   .check input { width: 18px; height: 18px; margin-top: 1px; }
