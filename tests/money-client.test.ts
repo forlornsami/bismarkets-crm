@@ -347,6 +347,21 @@ describe.skipIf(!hasDb)("client money API", () => {
     const padded = Object.fromEntries(Array.from({ length: 30 }, (_, i) => [`x${i}`, "1"]));
     expect(errorOf(await deposit(cal, { ...ok, ...padded }, proof), "file_name")).toBe("Attach a screenshot of your payment.");
     expect(errorOf(await deposit(cal, { ...ok, note: "a".repeat(5000) }, proof), "note")).toBe("This is too long.");
+    // The parts are counted with the boundary the parser uses: a decoy or escaped boundary is refused.
+    const raw = (fields: Record<string, string>) =>
+      Buffer.concat([
+        ...Object.entries(fields).map(([k, v]) => Buffer.from(`--XyZ123\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`)),
+        Buffer.from('--XyZ123\r\nContent-Disposition: form-data; name="file_name"; filename="p.png"\r\nContent-Type: image/png\r\n\r\n'),
+        proof,
+        Buffer.from("\r\n--XyZ123--\r\n"),
+      ]);
+    const rawDeposit = (type: string, fields: Record<string, string>) => api().post("/api/deposits").set(bearer(cal.token)).set("Content-Type", type).send(raw(fields));
+    for (const type of ["multipart/form-data; xboundary=DECOY; boundary=XyZ123", 'multipart/form-data; foo="boundary=DECOY"; boundary=XyZ123', "multipart/form-data; boundary=XyZ123; boundary=XyZ123"]) {
+      expect([type, errorOf(await rawDeposit(type, { ...ok, ...padded }), "file_name")]).toEqual([type, "Attach a screenshot of your payment."]);
+    }
+    for (const type of ["multipart/form-data; boundary=XyZ123", 'multipart/form-data; charset=utf-8; boundary="XyZ123"']) {
+      expect([type, errorOf(await rawDeposit(type, { ...ok, method: "999999" }), "method")]).toEqual([type, "Choose a deposit method."]);
+    }
     expect(errorOf(await deposit(cal, { ...ok, method: String(m.off) }, proof), "method")).toBe("Choose a deposit method.");
     expect(errorOf(await deposit(cal, { ...ok, method: String(m.empty) }, proof), "method")).toBe("Choose a deposit method.");
     expect(errorOf(await deposit(cal, { ...ok, method: String(m.wBank) }, proof), "method")).toBe("Choose a deposit method.");

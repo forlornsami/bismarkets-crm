@@ -288,8 +288,11 @@ function settleMethod(m: MethodInput): { method: MethodInput; problems: { field:
       out.askQr = false;
       if (!/bank|wire/i.test(out.name)) problem("name", "Name a bank payout type with the word \"bank\" or \"wire\" (for example \"Bank transfer\"), so the portal and app show the bank form.");
     } else {
+      const compact = out.name.replace(/\s+/g, "");
+      // A name with another network's word too would make the portal file wallets under the wrong type.
+      const others = (Object.keys(NETWORK_WORD) as Exclude<Network, "">[]).filter((n) => n !== out.network && NETWORK_WORD[n].word.test(compact));
       if (!out.network) problem("network", "Choose the network.");
-      else if (!NETWORK_WORD[out.network].word.test(out.name.replace(/\s+/g, "")) || /bank|wire|iban/i.test(out.name)) {
+      else if (!NETWORK_WORD[out.network].word.test(compact) || others.length || /bank|wire|iban/i.test(out.name)) {
         problem("name", `Name this payout type after its network (for example "${NETWORK_WORD[out.network].example}"), so the portal and app show the right form.`);
       }
     }

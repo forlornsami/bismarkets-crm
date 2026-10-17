@@ -552,9 +552,12 @@ export function clientMoneyRouter(deps: AppDeps): Router {
   const loadPayoutMethod = (conn: Conn, clientId: number, id: number) =>
     one<PayoutMethodRow>(conn, `${PAYOUT_METHOD} WHERE m.id = ? AND m.client_id = ? AND m.deleted_at IS NULL`, [id, clientId]);
 
-  /** A payout type the client may save an account for. `anyState` allows a disabled one (an account already saved under it). */
-  async function payoutType(conn: Conn, id: number | null, anyState = false) {
-    const type = id ? await one<PayoutTypeRow>(conn, `${PAYOUT_TYPE} AND id = ?`, [id]) : undefined;
+  /**
+   * A payout type the client may save an account for. `anyState` allows a disabled one (an account already saved under it).
+   * `lock` holds it while the account is saved, so staff cannot change its network meanwhile.
+   */
+  async function payoutType(conn: Conn, id: number | null, anyState = false, lock = false) {
+    const type = id ? await one<PayoutTypeRow>(conn, `${PAYOUT_TYPE} AND id = ?${lock ? " FOR SHARE" : ""}`, [id]) : undefined;
     if (!type || (!anyState && !type.is_enabled)) throw fieldError("payment_method_id", NO_TYPE);
     return type;
   }
@@ -628,7 +631,10 @@ export function clientMoneyRouter(deps: AppDeps): Router {
       const id = await transaction(db, async (conn) => {
         await lockClient(conn, client.id);
         await assertClientMayMoveMoney(conn, client.id);
-        await payoutType(conn, type.id);
+        // Checked again against the type as it is now: staff may have changed it while the picture was read.
+        const lockedType = await payoutType(conn, type.id, false, true);
+        const fields = validate(payoutFields(lockedType), form.values);
+        if (lockedType.ask_qr && !qr) throw fieldError("file_name", QR_MISSING);
         const saved = await countSaved(conn, client.id);
         if (saved >= MAX_PAYOUT_METHODS) throw tooMany();
         const isDefault = saved === 0 || formFlag(form.values.is_default) === true;
@@ -639,16 +645,16 @@ export function clientMoneyRouter(deps: AppDeps): Router {
           `INSERT INTO client_payout_methods (client_id, payment_method_id, method_name, account_name, account_number_enc, iban_enc, swift, fingerprint, qr_mime, qr_bytes_enc, qr_token, is_default, created_ip)
            VALUES (?, ?, ?, ?, '', NULL, ?, '', ?, ?, ?, ?, ?)`,
           [
-            client.id, type.id, fields.method_name, fields.account_name, fields.swift,
+            client.id, lockedType.id, fields.method_name, fields.account_name, fields.swift,
             qr?.mime ?? null, qr && token ? encryptBytes(config.dataKey, qr.bytes, payoutQrContext(client.id, token)) : null, token, isDefault ? 1 : 0, req.clientIp,
           ],
         );
-        const sealed = sealedDetails(r.insertId, client.id, type.id, fields);
+        const sealed = sealedDetails(r.insertId, client.id, lockedType.id, fields);
         await exec(conn, "UPDATE client_payout_methods SET account_number_enc = ?, iban_enc = ?, fingerprint = ? WHERE id = ?", [sealed.account, sealed.iban, sealed.fingerprint, r.insertId]);
         if (isDefault) await exec(conn, "UPDATE client_payout_methods SET is_default = 0 WHERE client_id = ? AND id <> ? AND is_default = 1", [client.id, r.insertId]);
         await writeAudit(conn, ctx(req), {
           action: "payout_method.added", entityType: "client", entityId: client.id,
-          meta: { id: r.insertId, type: type.name, kind: type.kind, ending: lastFour(fields.account_number), qr: Boolean(qr), default: isDefault },
+          meta: { id: r.insertId, type: lockedType.name, kind: lockedType.kind, ending: lastFour(fields.account_number), qr: Boolean(qr), default: isDefault },
         });
         await warnNewDestination(conn, client.id, fields, "added");
         return r.insertId;
@@ -659,10 +665,10 @@ export function clientMoneyRouter(deps: AppDeps): Router {
   );
 
   /** What an update asks for, merged over the saved account: a field that is not sent keeps its value. */
-  async function readPayoutUpdate(conn: Conn, before: PayoutMethodRow, form: MoneyForm) {
+  async function readPayoutUpdate(conn: Conn, before: PayoutMethodRow, form: MoneyForm, lock = false) {
     const typeId = form.values.payment_method_id === undefined ? before.payment_method_id : formId(form.values.payment_method_id);
     // Keeping an account under a type that was switched off is fine; moving one to it is not.
-    const type = await payoutType(conn, typeId, typeId === before.payment_method_id);
+    const type = await payoutType(conn, typeId, typeId === before.payment_method_id, lock);
     const opened = openPayoutMethod(config, before);
     const current: Record<string, unknown> = { method_name: before.method_name, account_name: before.account_name, account_number: opened.accountNumber, iban: opened.iban, swift: before.swift };
     for (const key of ["method_name", "account_name", "account_number", "iban", "swift"]) if (form.values[key] !== undefined) current[key] = form.values[key];
@@ -701,7 +707,7 @@ export function clientMoneyRouter(deps: AppDeps): Router {
         await assertClientMayMoveMoney(conn, client.id);
         const before = await loadPayoutMethod(conn, client.id, id);
         if (!before) throw payoutNotFound();
-        const { type, fields, changed } = await readPayoutUpdate(conn, before, form);
+        const { type, fields, changed } = await readPayoutUpdate(conn, before, form, true);
         // A QR picture of the old address no longer matches: it goes unless a new one comes with the change.
         const keepQr = !changed.includes("account_number") && !changed.includes("payment_method_id") && type.kind === "crypto";
         const dropQr = !qr && Boolean(before.qr_token) && !keepQr;

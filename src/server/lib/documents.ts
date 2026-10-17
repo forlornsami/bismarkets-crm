@@ -123,7 +123,12 @@ let running = 0;
 const waiting: (() => void)[] = [];
 
 /** Runs `code` in a fresh worker and resolves with its one message; it is stopped after `timeoutMs`. */
-async function inWorker<T extends { error?: string }>(code: string, workerData: { module: string; bytes: Buffer }, timeoutMs: number, maxOldGenerationSizeMb: number): Promise<T> {
+export async function inWorker<T extends { error?: string }>(
+  code: string,
+  workerData: { module: string; bytes: Buffer } & Record<string, unknown>,
+  timeoutMs: number,
+  maxOldGenerationSizeMb: number,
+): Promise<T> {
   // A finished worker hands its slot straight to the next one waiting.
   if (running < 2) running++;
   else await new Promise<void>((resolve) => waiting.push(resolve));

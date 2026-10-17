@@ -1,19 +1,34 @@
-import jsQR from "jsqr";
+import { createRequire } from "node:module";
 import sharp from "sharp";
 import { NETWORK_ADDRESS } from "../clients/money";
+import { inWorker } from "./documents";
 
 type Network = keyof typeof NETWORK_ADDRESS;
 
-/** The text a QR code picture holds, or null when no code can be read in it. */
-export async function readQrText(image: Buffer): Promise<string | null> {
+// jsQR runs on the calling thread, and a crafted picture (fine stripes, noise) can keep it busy
+// for many seconds, so it reads in a short-lived worker that is stopped when it takes too long.
+const requireHere = createRequire(import.meta.url);
+const QR_WORKER = `
+const { parentPort, workerData } = require("node:worker_threads");
+const jsQR = require(workerData.module);
+const { bytes, width, height } = workerData;
+const found = jsQR(new Uint8ClampedArray(bytes.buffer, bytes.byteOffset, bytes.length), width, height);
+parentPort.postMessage({ text: found ? found.data : null });`;
+const QR_TIMEOUT_MS = 5_000;
+
+/** The text a QR code picture holds, or null when no code can be read in it (in time). */
+export async function readQrText(image: Buffer, timeoutMs = QR_TIMEOUT_MS): Promise<string | null> {
   try {
     // Scaled down first: a QR code reads as well at this size, and reading costs time per pixel.
     const { data, info } = await sharp(image, { limitInputPixels: 4096 * 4096 })
-      .resize({ width: 1200, height: 1200, fit: "inside", withoutEnlargement: true })
+      .resize({ width: 1000, height: 1000, fit: "inside", withoutEnlargement: true })
       .ensureAlpha()
       .raw()
       .toBuffer({ resolveWithObject: true });
-    return jsQR(new Uint8ClampedArray(data.buffer, data.byteOffset, data.length), info.width, info.height)?.data ?? null;
+    const { text } = await inWorker<{ text?: string | null; error?: string }>(
+      QR_WORKER, { module: requireHere.resolve("jsqr"), bytes: data, width: info.width, height: info.height }, timeoutMs, 128,
+    );
+    return text ?? null;
   } catch {
     return null;
   }

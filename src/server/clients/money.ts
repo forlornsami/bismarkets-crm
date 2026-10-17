@@ -140,11 +140,30 @@ const MAX_FORM_PARTS = 24;
 /** The longest text value any money form field needs (a reason or a name is far shorter). */
 const MAX_FORM_TEXT = 4096;
 
-/** How many parts a multipart body has, counted by its boundary without parsing it; null without a boundary. */
-function partCount(body: Buffer, contentType: string): number | null {
-  const match = /boundary=(?:"([^"]{1,70})"|([^;\s]{1,70}))/i.exec(contentType);
-  const boundary = match?.[1] ?? match?.[2];
-  if (!boundary) return null;
+// A boundary as MIME allows it (RFC 2046): up to 70 of these characters, not ending in a space.
+const BOUNDARY = /^[0-9A-Za-z'()+_,\-./:=? ]{0,69}[0-9A-Za-z'()+_,\-./:=?]$/;
+
+/**
+ * The boundary of a multipart/form-data body, or null when the type is anything else or unclear:
+ * only a boundary and a charset may follow the type, each once, without escapes.
+ */
+function formBoundary(contentType: string): string | null {
+  const [type, ...params] = contentType.split(";");
+  if (type?.trim().toLowerCase() !== "multipart/form-data") return null;
+  let boundary: string | null = null;
+  for (const param of params) {
+    if (!param.trim()) continue;
+    const m = /^\s*([A-Za-z-]{1,20})=(?:"([^"\\]*)"|([^\s"\\]*))\s*$/.exec(param);
+    if (!m) return null;
+    const name = m[1]!.toLowerCase();
+    if (name === "boundary" && boundary === null) boundary = m[2] ?? m[3]!;
+    else if (name !== "charset") return null;
+  }
+  return boundary !== null && BOUNDARY.test(boundary) ? boundary : null;
+}
+
+/** How many parts a multipart body has, counted by its boundary without parsing it. */
+function partCount(body: Buffer, boundary: string): number {
   const marker = Buffer.from(`--${boundary}`);
   let seen = 0;
   for (let at = body.indexOf(marker); at !== -1 && seen <= MAX_FORM_PARTS + 1; at = body.indexOf(marker, at + marker.length)) seen++;
@@ -157,11 +176,12 @@ export async function readMoneyForm(req: Request, brokenField: string, brokenMes
   const body = req.body as unknown;
   const files = new Map<string, File>();
   if (Buffer.isBuffer(body)) {
-    const parts = partCount(body, req.get("content-type") ?? "");
-    if (parts === null || parts > MAX_FORM_PARTS) throw fieldError(brokenField, brokenMessage);
+    const boundary = formBoundary(req.get("content-type") ?? "");
+    if (boundary === null || partCount(body, boundary) > MAX_FORM_PARTS) throw fieldError(brokenField, brokenMessage);
     let form: FormData;
     try {
-      form = await new Response(new Uint8Array(body), { headers: { "content-type": req.get("content-type") ?? "" } }).formData();
+      // The parser gets the boundary that was counted, and nothing else from the header.
+      form = await new Response(new Uint8Array(body), { headers: { "content-type": `multipart/form-data; boundary="${boundary}"` } }).formData();
     } catch {
       throw fieldError(brokenField, brokenMessage);
     }
