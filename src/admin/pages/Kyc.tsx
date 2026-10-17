@@ -4,8 +4,9 @@ import { useEffect, useRef, useState } from "react";
 import { Link, useLocation } from "wouter";
 import { DataGrid, gridQuery, type Column, type GridState } from "../components/DataGrid";
 import { DocumentViewer, ReviewDecision, ReviewLayout, Waiting, Warnings, type ReviewWarning } from "../components/ReviewWorkbench";
-import { Badge, ErrorText, PageHeader, Spinner, useFeedback } from "../components/ui";
+import { Badge, Dialog, ErrorText, Field, PageHeader, Spinner, useFeedback } from "../components/ui";
 import { ApiError, api, formatDate, qs, type Page } from "../lib/api";
+import { KYC_TYPES } from "../../shared/kyc-types";
 import { useCan, useSession } from "../lib/session";
 
 export interface KycSubmission {
@@ -20,6 +21,9 @@ export interface KycSubmission {
   decidedAt: string | null;
   decidedBy: string | null;
   documents: number;
+  source: "client" | "staff";
+  uploadedBy: string | null;
+  staffNote: string | null;
   claimedBy: { id: number; name: string | null; until: string } | null;
 }
 
@@ -183,6 +187,67 @@ export function KycReview() {
 }
 
 /** One submission at a time: documents on the left, checks and the decision on the right. */
+/** Approves a document that was rejected earlier, for example after the client explained it. */
+function ApproveLater({ id, clientId, checklist, hasFiles }: { id: number; clientId: number; checklist: { key: string; label: string }[]; hasFiles: boolean }) {
+  const client = useQueryClient();
+  const { toast } = useFeedback();
+  const [open, setOpen] = useState(false);
+  const [reason, setReason] = useState("");
+  const [ticked, setTicked] = useState<string[]>([]);
+  const send = useMutation({
+    mutationFn: () => api.post<KycSubmission>(`/api/staff/kyc/${id}/change`, { status: "approved", reason: reason.trim(), checklist: ticked }),
+    onSuccess: (res) => {
+      toast(`Approved ${res.client.name}'s ${res.documentType}. The client has been told.`);
+      setOpen(false);
+      client.setQueryData(["kyc-detail", id], (old: KycDetail | undefined) => (old ? { ...old, ...res } : old));
+      for (const key of [["kyc"], ["kyc-summary"], ["client", String(clientId)], ["client-kyc", clientId], ["client-activity", String(clientId)]]) void client.invalidateQueries({ queryKey: key });
+    },
+  });
+  if (!open)
+    return (
+      <button type="button" className="button button-small" onClick={() => setOpen(true)}>
+        Approve now
+      </button>
+    );
+  const ready = reason.trim().length >= 5 && (!hasFiles || checklist.every((c) => ticked.includes(c.key)));
+  return (
+    <form
+      className="stack"
+      onSubmit={(e) => {
+        e.preventDefault();
+        send.mutate();
+      }}
+    >
+      <p className="muted tight">This replaces the rejection. The client is told the document is approved.</p>
+      {hasFiles && (
+        <ul className="review-checklist">
+          {checklist.map((c) => (
+            <li key={c.key}>
+              <label>
+                <input type="checkbox" checked={ticked.includes(c.key)} onChange={() => setTicked((t) => (t.includes(c.key) ? t.filter((k) => k !== c.key) : [...t, c.key]))} />
+                <span>{c.label}</span>
+              </label>
+            </li>
+          ))}
+        </ul>
+      )}
+      <label>
+        Why it is approved now (kept in the audit log)
+        <textarea className="input" value={reason} onChange={(e) => setReason(e.target.value)} rows={2} maxLength={500} autoFocus />
+      </label>
+      {send.error && <ErrorText error={send.error} />}
+      <div className="actions actions-left">
+        <button type="submit" className="button button-primary" disabled={send.isPending || !ready}>
+          {send.isPending && <Spinner />} Approve
+        </button>
+        <button type="button" className="button button-ghost" onClick={() => setOpen(false)}>
+          Cancel
+        </button>
+      </div>
+    </form>
+  );
+}
+
 /** Takes back an approval when a document has expired or turns out to be wrong; the client is asked to upload again. */
 function RequestNewDocument({ id, clientId, reasons }: { id: number; clientId: number; reasons: string[] }) {
   const client = useQueryClient();
@@ -223,7 +288,7 @@ function RequestNewDocument({ id, clientId, reasons }: { id: number; clientId: n
       </div>
       <label>
         Reason shown to the client
-        <textarea value={reason} onChange={(e) => setReason(e.target.value)} rows={3} maxLength={500} autoFocus />
+        <textarea className="input" value={reason} onChange={(e) => setReason(e.target.value)} rows={3} maxLength={500} autoFocus />
       </label>
       {send.error && <ErrorText error={send.error} />}
       <div className="actions actions-left">
@@ -393,6 +458,7 @@ export function KycWorkbench({ id }: { id: string }) {
             </div>
           )}
           {d.status === "approved" && mayDecide && <RequestNewDocument id={sid} clientId={d.client.id} reasons={d.reasons} />}
+          {d.status === "rejected" && mayDecide && <ApproveLater id={sid} clientId={d.client.id} checklist={d.checklist} hasFiles={d.files.length > 0} />}
           {d.history.length > 0 && (
             <>
               <h3>Earlier attempts</h3>
@@ -426,6 +492,7 @@ export function ClientKyc({ clientId, status }: { clientId: number; status: "non
     enabled: can("kyc.view"),
   });
   const latest = (category: KycSubmission["category"]) => list.data?.items.find((s) => s.category === category);
+  const [action, setAction] = useState<{ category: KycSubmission["category"]; mode: "upload" | "approve" } | null>(null);
   return (
     <section className="panel">
       <div className="card-head">
@@ -451,11 +518,110 @@ export function ClientKyc({ clientId, status }: { clientId: number; status: "non
                   <KycStatusBadge status="none" />
                 )}
                 {s?.rejectReason && <small className="muted block">Reason: {s.rejectReason}</small>}
+                {s?.source === "staff" && (
+                  <small className="muted block">
+                    {s.documents ? `Uploaded by ${s.uploadedBy}` : `Added without documents by ${s.uploadedBy}`}
+                    {s.staffNote ? `: ${s.staffNote}` : ""}
+                  </small>
+                )}
+                {(!s || s.status === "rejected") && (can("kyc.upload") || can("kyc.override")) && (
+                  <span className="kyc-actions">
+                    {can("kyc.upload") && (
+                      <button type="button" className="button button-small" onClick={() => setAction({ category: cat, mode: "upload" })}>
+                        Upload for client
+                      </button>
+                    )}
+                    {can("kyc.override") && (
+                      <button type="button" className="button button-small" onClick={() => setAction({ category: cat, mode: "approve" })}>
+                        Approve without documents
+                      </button>
+                    )}
+                  </span>
+                )}
               </dd>,
             ];
           })}
         </dl>
       )}
+      {action && <StaffKycDialog clientId={clientId} category={action.category} mode={action.mode} onClose={() => setAction(null)} />}
     </section>
+  );
+}
+
+/** Upload documents for the client, or approve without documents. Both ask for a 2FA code and are audited. */
+function StaffKycDialog({ clientId, category, mode, onClose }: { clientId: number; category: KycSubmission["category"]; mode: "upload" | "approve"; onClose: () => void }) {
+  const client = useQueryClient();
+  const { toast } = useFeedback();
+  const types = KYC_TYPES[category].subTypes;
+  const [subType, setSubType] = useState<number>(types[0]!.id);
+  const [files, setFiles] = useState<(File | null)[]>([null, null]);
+  const [note, setNote] = useState("");
+  const needs = types.find((t) => t.id === subType)?.documents ?? 1;
+  const what = category === "identity" ? "proof of identity" : "proof of address";
+  const send = useMutation({
+    mutationFn: () => {
+      if (mode === "approve") return api.post<KycSubmission>("/api/staff/kyc/approve-without-documents", { clientId, category, subType, reason: note.trim() });
+      const form = new FormData();
+      form.set("client_id", String(clientId));
+      form.set("type", String(KYC_TYPES[category].type));
+      form.set("sub_type", String(subType));
+      form.set("note", note.trim());
+      files.slice(0, needs).forEach((f, i) => f && form.set(`document${i + 1}`, f));
+      return api.form<KycSubmission>("/api/staff/kyc/upload", form);
+    },
+    onSuccess: () => {
+      toast(mode === "approve" ? `The client's ${what} is approved without documents.` : `Uploaded. The ${what} is now waiting for another reviewer.`);
+      for (const key of [["kyc"], ["kyc-summary"], ["client", String(clientId)], ["client-kyc", clientId], ["client-activity", String(clientId)], ["clients"]]) void client.invalidateQueries({ queryKey: key });
+      onClose();
+    },
+  });
+  const ready = note.trim().length >= 5 && (mode === "approve" || files.slice(0, needs).every(Boolean));
+  return (
+    <Dialog open title={mode === "approve" ? `Approve ${what} without documents` : `Upload ${what} for the client`} onClose={onClose}>
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          send.mutate();
+        }}
+      >
+        <p className="muted">
+          {mode === "approve"
+            ? "Use this only when the client was verified another way. The client is told they are verified, and the reason is kept in the audit log."
+            : "For documents the client sent another way, such as by email. Another reviewer approves them from the KYC queue."}
+        </p>
+        <Field label="Document type">
+          <select className="input" value={subType} onChange={(e) => setSubType(Number(e.target.value))}>
+            {types.map((t) => (
+              <option key={t.id} value={t.id}>
+                {t.name}
+              </option>
+            ))}
+          </select>
+        </Field>
+        {mode === "upload" &&
+          Array.from({ length: needs }, (_, i) => (
+            <Field key={i} label={needs === 2 ? (i === 0 ? "Front" : "Back") : "Document"} hint="Image or PDF, up to 10 MB">
+              <input
+                className="input"
+                type="file"
+                accept="image/jpeg,image/png,image/webp,image/heic,application/pdf"
+                onChange={(e) => setFiles((f) => f.map((old, j) => (j === i ? (e.target.files?.[0] ?? null) : old)))}
+              />
+            </Field>
+          ))}
+        <Field label={mode === "approve" ? "How the client was verified" : "Where these documents came from"} hint="Kept in the audit log. You'll be asked for your 2FA code.">
+          <textarea className="input" value={note} onChange={(e) => setNote(e.target.value)} rows={2} maxLength={500} required />
+        </Field>
+        <ErrorText error={send.error} />
+        <div className="actions">
+          <button type="button" className="button" onClick={onClose}>
+            Cancel
+          </button>
+          <button type="submit" className="button button-primary" disabled={send.isPending || !ready}>
+            {send.isPending && <Spinner />} {mode === "approve" ? "Approve without documents" : "Upload"}
+          </button>
+        </div>
+      </form>
+    </Dialog>
   );
 }

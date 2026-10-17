@@ -5,7 +5,7 @@ import { documentType } from "../src/server/clients/kyc";
 import { decryptField } from "../src/server/lib/crypto";
 import { one } from "../src/server/lib/db";
 import { outboxContext } from "../src/server/lib/email";
-import { createStaff, hasDb, post, setup, signIn, stepUp, type SignedIn, type TestEnv } from "./helpers";
+import { createStaff, hasDb, ORIGIN, post, setup, signIn, stepUp, type SignedIn, type TestEnv } from "./helpers";
 
 const GOOD = "Sunny-Day-42!";
 const png = readFileSync(new URL("../src/admin/public/brand/apple-touch-icon.png", import.meta.url));
@@ -26,6 +26,7 @@ describe.skipIf(!hasDb)("KYC", () => {
   let reviewer: SignedIn;
   let second: SignedIn;
   let sales: SignedIn;
+  let boss: SignedIn;
   let token: string;
   let clientId: number;
   const api = () => request(env.app);
@@ -44,6 +45,8 @@ describe.skipIf(!hasDb)("KYC", () => {
     reviewer = await signIn(env, "comp@bis.test");
     sales = await signIn(env, "sales@bis.test");
     second = await signIn(env, "comp2@bis.test");
+    await createStaff(env.db, "boss@bis.test", "super_admin");
+    boss = await signIn(env, "boss@bis.test");
     await api().post("/api/send-otp").send({ email: "kyc@client.test" });
     const row = await one<{ body_enc: Buffer; template: string }>(env.db, "SELECT body_enc, template FROM email_outbox ORDER BY id DESC LIMIT 1");
     const code = /code is (\d{6})/.exec(decryptField(env.config.dataKey, row!.body_enc, outboxContext("kyc@client.test", row!.template)))![1];
@@ -174,6 +177,68 @@ describe.skipIf(!hasDb)("KYC", () => {
     expect((await api().get("/api/notifications").set(auth())).body.data[0]).toMatchObject({ title: "Please upload a new proof of address", body: "Please send a bill from this year" });
     expect(await one(env.db, "SELECT id FROM audit_log WHERE action = 'kyc.new_document_requested' AND entity_id = ?", [String(clientId)])).toBeTruthy();
     expect(await one(env.db, "SELECT id FROM email_outbox WHERE template = 'kyc_new_document' AND to_email = 'kyc@client.test'")).toBeTruthy();
+  });
+
+  it("changes a decision later in either direction, with a reason, 2FA and an audit entry", async () => {
+    const all = (await reviewer.agent.get(`/api/staff/kyc?status=all&clientId=${clientId}`)).body.items as { id: number; category: string; status: string }[];
+    const address = all.find((i) => i.category === "address")!;
+    const identity = all.find((i) => i.category === "identity" && i.status === "approved")!;
+    expect(address.status).toBe("rejected");
+    expect((await post(sales, `/api/staff/kyc/${address.id}/change`, { status: "approved", reason: "Checked the bill again" })).status).toBe(403);
+    expect((await post(reviewer, `/api/staff/kyc/${address.id}/change`, { status: "approved", reason: "ok" })).status).toBe(400);
+    expect((await post(reviewer, `/api/staff/kyc/${address.id}/change`, { status: "approved", reason: "Checked the bill again" })).status).toBe(400);
+    expect((await post(reviewer, `/api/staff/kyc/${address.id}/change`, { status: "rejected", reason: "Already rejected" })).status).toBe(400);
+    const approved = await post(reviewer, `/api/staff/kyc/${address.id}/change`, { status: "approved", reason: "Checked the bill again", checklist: ALL.address });
+    expect(approved.status).toBe(200);
+    expect((await api().get("/api/kyc").set(auth())).body).toMatchObject({ is_kyc_approved: true, overall_status: "approved" });
+
+    const rejected = await post(reviewer, `/api/staff/kyc/${identity.id}/change`, { status: "rejected", reason: "The passport has expired, please send a valid one" });
+    expect(rejected.body.status).toBe("rejected");
+    const seen = (await api().get("/api/kyc").set(auth())).body;
+    expect(seen).toMatchObject({ is_kyc_approved: false, overall_status: "rejected" });
+    expect(seen.identity).toMatchObject({ status: 2, can_submit: true, message: "The passport has expired, please send a valid one" });
+    const audit = await one<{ n: number }>(env.db, "SELECT COUNT(*) AS n FROM audit_log WHERE action = 'kyc.decision_changed' AND entity_id = ?", [String(clientId)]);
+    expect(Number(audit?.n)).toBe(2);
+  });
+
+  it("lets staff upload documents for a client, which another reviewer must approve", async () => {
+    const send = (s: SignedIn, files: Buffer[], extra: Record<string, string> = {}) => {
+      let r = s.agent.post("/api/staff/kyc/upload").set("Origin", ORIGIN).set("X-CSRF-Token", s.csrf)
+        .field("client_id", String(clientId)).field("type", "3").field("sub_type", "2").field("note", extra.note ?? "Sent by email on 16 October");
+      files.forEach((f, i) => (r = r.attach(`document${i + 1}`, f, { filename: "passport.png", contentType: "image/png" })));
+      return r;
+    };
+    expect((await send(sales, [png])).status).toBe(403);
+    expect((await send(reviewer, [Buffer.from("<html>nope</html>")])).status).toBe(422);
+    expect((await send(reviewer, [png], { note: "x" })).status).toBe(400);
+    const res = await send(reviewer, [png]);
+    expect(res.status).toBe(201);
+    expect(res.body).toMatchObject({ status: "pending", source: "staff", uploadedBy: "comp", documents: 1 });
+    expect((await send(reviewer, [png])).status).toBe(400);
+    expect((await api().get("/api/kyc").set(auth())).body.identity).toMatchObject({ status: 0, status_label: "Pending" });
+    const detail = (await reviewer.agent.get(`/api/staff/kyc/${res.body.id}`)).body;
+    expect(detail.warnings.some((w: { text: string }) => w.text.includes("on the client's behalf"))).toBe(true);
+    // Four eyes: the uploader cannot approve their own upload.
+    expect((await post(reviewer, `/api/staff/kyc/${res.body.id}/decision`, { decision: "approve", checklist: ALL.identity })).status).toBe(403);
+    expect((await post(second, `/api/staff/kyc/${res.body.id}/decision`, { decision: "approve", checklist: ALL.identity })).status).toBe(200);
+    expect(await one(env.db, "SELECT id FROM audit_log WHERE action = 'kyc.uploaded_by_staff' AND entity_id = ?", [String(clientId)])).toBeTruthy();
+  });
+
+  it("approves without documents only with the override permission", async () => {
+    const address = ((await reviewer.agent.get(`/api/staff/kyc?status=all&clientId=${clientId}&category=address`)).body.items as { id: number }[])[0]!;
+    await post(reviewer, `/api/staff/kyc/${address.id}/change`, { status: "rejected", reason: "Please send a newer statement" });
+    const body = { clientId, category: "address", subType: 1, reason: "Verified by video call with compliance" };
+    expect((await post(reviewer, "/api/staff/kyc/approve-without-documents", body)).status).toBe(403);
+    await stepUp(env, boss);
+    expect((await post(boss, "/api/staff/kyc/approve-without-documents", { ...body, subType: 9 })).status).toBe(400);
+    const res = await post(boss, "/api/staff/kyc/approve-without-documents", body);
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ status: "approved", documents: 0, source: "staff", staffNote: "Verified by video call with compliance" });
+    expect((await post(boss, "/api/staff/kyc/approve-without-documents", body)).status).toBe(400);
+    expect((await api().get("/api/kyc").set(auth())).body).toMatchObject({ is_kyc_approved: true, overall_status: "approved" });
+    // Approving a document-less item again after a rejection also needs the override.
+    await post(boss, `/api/staff/kyc/${res.body.id}/change`, { status: "rejected", reason: "Please send a bank statement after all" });
+    expect((await post(reviewer, `/api/staff/kyc/${res.body.id}/change`, { status: "approved", reason: "Fine after all" })).status).toBe(403);
   });
 
   it("removes a profile picture when the client asks", async () => {

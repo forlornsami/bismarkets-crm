@@ -1,30 +1,12 @@
+import type { Config } from "../config";
+import { encryptBytes, sha256 } from "../lib/crypto";
 import type { Conn } from "../lib/db";
-import { one, rows } from "../lib/db";
+import { exec, one, rows } from "../lib/db";
+import { fieldError } from "./errors";
 import type { ClientRow } from "./model";
+import { KYC_TYPES } from "../../shared/kyc-types";
 
-// The document types the portal and app offer. Ids and names match what both
-// front ends send and look up (type 3 = identity, 4 = proof of address).
-export const KYC_TYPES = {
-  identity: {
-    type: 3,
-    label: "Identity",
-    subTypes: [
-      { id: 1, name: "ID Card", documents: 2 },
-      { id: 2, name: "Passport", documents: 1 },
-      { id: 3, name: "Driving License", documents: 2 },
-    ],
-  },
-  address: {
-    type: 4,
-    label: "Proof of address",
-    subTypes: [
-      { id: 1, name: "Bank Statement", documents: 1 },
-      { id: 2, name: "Utility Bill", documents: 1 },
-      { id: 3, name: "Credit Card Statement", documents: 1 },
-      { id: 4, name: "ID Card Back", documents: 1 },
-    ],
-  },
-} as const;
+export { KYC_TYPES };
 
 export type KycCategory = keyof typeof KYC_TYPES;
 export const categoryForType = (type: number): KycCategory | null => (type === 3 ? "identity" : type === 4 ? "address" : null);
@@ -41,6 +23,72 @@ export function documentType(bytes: Buffer): string | null {
   if (bytes.subarray(0, 5).toString("latin1") === "%PDF-") return "application/pdf";
   if (bytes.subarray(4, 8).toString("latin1") === "ftyp" && /^(heic|heix|mif1|msf1|heif)$/.test(bytes.subarray(8, 12).toString("latin1"))) return "image/heic";
   return null;
+}
+
+export const kycDocumentContext = (submissionId: number, slot: number) => `kyc_document:${submissionId}:${slot}`;
+
+export interface KycUpload {
+  category: KycCategory;
+  subType: (typeof KYC_TYPES)[KycCategory]["subTypes"][number];
+  files: { bytes: Buffer; mime: string; name: string }[];
+  form: FormData;
+}
+
+/**
+ * Reads a multipart KYC upload (type, sub_type, document1, document2) the way
+ * the portal and app send it. Files are checked by their bytes.
+ */
+export async function parseKycUpload(body: unknown, contentType: string | undefined): Promise<KycUpload> {
+  if (!Buffer.isBuffer(body) || !contentType) throw fieldError("document1", "Attach your document.");
+  let form: FormData;
+  try {
+    form = await new Response(new Uint8Array(body), { headers: { "content-type": contentType } }).formData();
+  } catch {
+    throw fieldError("document1", "Attach your document.");
+  }
+  const category = categoryForType(Number(form.get("type")));
+  if (!category) throw fieldError("type", "Choose identity or proof of address.");
+  const subType = subTypeOf(category, Number(form.get("sub_type")));
+  if (!subType) throw fieldError("sub_type", "Choose a document type.");
+  const files: KycUpload["files"] = [];
+  for (let slot = 1; slot <= subType.documents; slot++) {
+    const file = form.get(`document${slot}`);
+    if (!file || typeof file !== "object") {
+      throw fieldError(`document${slot}`, subType.documents === 2 ? "Attach both the front and the back." : "Attach your document.");
+    }
+    const bytes = Buffer.from(await (file as File).arrayBuffer());
+    if (bytes.length === 0 || bytes.length > KYC_MAX_BYTES) throw fieldError(`document${slot}`, "Each file must be an image or PDF no larger than 10 MB.");
+    const mime = documentType(bytes);
+    if (!mime) throw fieldError(`document${slot}`, "Each file must be an image or PDF no larger than 10 MB.");
+    files.push({ bytes, mime, name: ((file as File).name || `document${slot}`).replace(/[^\w.\- ]+/g, "_").slice(0, 160) });
+  }
+  return { category, subType, files, form };
+}
+
+/** Saves a submission and its encrypted files in the caller's transaction. */
+export async function storeSubmission(
+  conn: Conn,
+  config: Config,
+  input: { clientId: number; category: KycCategory; subType: number; files: KycUpload["files"]; ip: string; uploadedBy?: number; note?: string | null; status?: "pending" | "approved" },
+) {
+  const staff = input.uploadedBy !== undefined;
+  const result = await exec(
+    conn,
+    `INSERT INTO kyc_submissions (client_id, category, sub_type, source, uploaded_by, staff_note, submitted_ip, status, decided_at, decided_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      input.clientId, input.category, input.subType, staff ? "staff" : "client", input.uploadedBy ?? null, input.note ?? null, input.ip,
+      input.status ?? "pending", input.status === "approved" ? new Date() : null, input.status === "approved" ? input.uploadedBy ?? null : null,
+    ],
+  );
+  const submissionId = result.insertId;
+  for (const [i, f] of input.files.entries()) {
+    const slot = i + 1;
+    await exec(conn, "INSERT INTO kyc_documents (submission_id, slot, mime, size_bytes, sha256, file_name, bytes_enc) VALUES (?, ?, ?, ?, ?, ?, ?)", [
+      submissionId, slot, f.mime, f.bytes.length, sha256(f.bytes), f.name, encryptBytes(config.dataKey, f.bytes, kycDocumentContext(submissionId, slot)),
+    ]);
+  }
+  return submissionId;
 }
 
 /** Profile fields a client must fill in before sending documents. */

@@ -46,7 +46,9 @@ export const PERMISSION_GROUPS = {
     label: "KYC",
     permissions: {
       "kyc.view": "View KYC submissions and documents",
-      "kyc.decide": "Approve or reject KYC",
+      "kyc.decide": "Approve or reject KYC, and change a decision later",
+      "kyc.upload": "Upload KYC documents on behalf of a client",
+      "kyc.override": "Approve KYC without documents, or approve documents you uploaded yourself",
       "kyc.settings": "Manage KYC document types and tiers",
     },
   },
@@ -198,7 +200,7 @@ export const DEFAULT_ROLES: readonly DefaultRole[] = [
     description: "KYC and AML decisions, risk scores and account freezes.",
     permissions: [
       "client.view", "client.view_all", "client.status", "client.notes", "client.pii.reveal",
-      "kyc.view", "kyc.decide", "kyc.settings", "aml.view", "aml.decide", "aml.freeze",
+      "kyc.view", "kyc.decide", "kyc.upload", "kyc.settings", "aml.view", "aml.decide", "aml.freeze",
       "deposit.view", "withdrawal.view", "wallet.view", "mt5.view", "ib.view", "audit.view", "report.view",
     ],
   },

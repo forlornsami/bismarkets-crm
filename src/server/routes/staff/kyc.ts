@@ -1,27 +1,34 @@
-import { Router, type Request } from "express";
+import express, { Router, type Request } from "express";
 import { z } from "zod";
 import type { AppDeps } from "../../app";
-import { KYC_CHECKLIST, KYC_REJECT_REASONS, KYC_TYPES, latestSubmissions, overallStatus, subTypeOf, type KycCategory } from "../../clients/kyc";
+import { KYC_CHECKLIST, KYC_MAX_BYTES, KYC_REJECT_REASONS, KYC_TYPES, kycDocumentContext, latestSubmissions, overallStatus, parseKycUpload, storeSubmission, subTypeOf, type KycCategory } from "../../clients/kyc";
 import { clientName } from "../../clients/model";
 import { auditContext, writeAudit } from "../../lib/audit";
-import { decryptBytes } from "../../lib/crypto";
+import { decryptBytes, sha256 } from "../../lib/crypto";
 import { exec, one, rows, transaction } from "../../lib/db";
 import { queueEmail } from "../../lib/email";
 import { queueSupportEvent } from "../../lib/events";
 import { notifyClient } from "../../clients/notifications";
-import { badRequest, handler, notFound, parse } from "../../lib/http";
+import { badRequest, forbidden, handler, notFound, parse } from "../../lib/http";
 import { likeTerm, listQuery, toPage } from "../../lib/pagination";
 import { requirePermission, requireStepUp, staffActor, staffOf, type StaffContext } from "../../staff/session";
 import { activeClaim, assertNotClaimedByOther, claim, CLAIM_MINUTES, release } from "../../lib/review";
-import { kycDocumentContext } from "../client/kyc";
 
 const id = z.coerce.number().int().positive();
+// The portal shows a rejection reason exactly as written, but only when it is plain text.
+const plain = (v: string) => !/[<>{}`\\]|https?:|\bwww\./i.test(v);
+const PLAIN_MESSAGE = "Write the reason as plain text, without links or symbols like < > { }";
+const reasonText = z.string().trim().min(5, "Write a short reason (at least 5 characters)").max(500).refine(plain, PLAIN_MESSAGE);
 
 interface Row {
   id: number;
   client_id: number;
   category: KycCategory;
   sub_type: number;
+  source: "client" | "staff";
+  uploaded_by: number | null;
+  uploader_name: string | null;
+  staff_note: string | null;
   status: "pending" | "approved" | "rejected";
   reject_reason: string | null;
   submitted_at: Date;
@@ -37,10 +44,11 @@ interface Row {
   documents: number;
 }
 
-const SELECT = `SELECT s.id, s.client_id, s.category, s.sub_type, s.status, s.reject_reason, s.submitted_at, s.decided_at,
+const SELECT = `SELECT s.id, s.client_id, s.category, s.sub_type, s.source, s.uploaded_by, up.name AS uploader_name, s.staff_note, s.status, s.reject_reason, s.submitted_at, s.decided_at,
   u.name AS decider_name, s.claimed_by, s.claimed_until, cl.name AS claimer_name, c.first_name, c.last_name, c.email, c.country,
   (SELECT COUNT(*) FROM kyc_documents d WHERE d.submission_id = s.id) AS documents
-  FROM kyc_submissions s JOIN clients c ON c.id = s.client_id LEFT JOIN staff_users u ON u.id = s.decided_by LEFT JOIN staff_users cl ON cl.id = s.claimed_by`;
+  FROM kyc_submissions s JOIN clients c ON c.id = s.client_id LEFT JOIN staff_users u ON u.id = s.decided_by LEFT JOIN staff_users cl ON cl.id = s.claimed_by
+  LEFT JOIN staff_users up ON up.id = s.uploaded_by`;
 
 const present = (r: Row) => ({
   id: r.id,
@@ -54,6 +62,9 @@ const present = (r: Row) => ({
   decidedAt: r.decided_at?.toISOString() ?? null,
   decidedBy: r.decider_name,
   documents: Number(r.documents),
+  source: r.source,
+  uploadedBy: r.source === "staff" ? (r.uploader_name ?? "staff") : null,
+  staffNote: r.staff_note,
   claimedBy: activeClaim(r) ? { id: r.claimed_by!, name: r.claimer_name, until: r.claimed_until!.toISOString() } : null,
 });
 
@@ -79,6 +90,71 @@ export function staffKycRouter(deps: AppDeps): Router {
     const row = await one<Row>(conn, `${SELECT} WHERE s.id = ?${s.sql}${lock ? " FOR UPDATE OF s" : ""}`, [submissionId, ...s.params]);
     if (!row) throw notFound("That submission does not exist or its client is not assigned to you.");
     return row;
+  }
+
+  type Outcome = {
+    status: "approved" | "rejected";
+    reason: string | null;
+    checklist?: string[];
+    action: string;
+    meta?: Record<string, unknown>;
+    /** Wording for a withdrawn approval, which asks the client for a new document. */
+    askAgain?: boolean;
+  };
+
+  /** Records a decision and tells the client and the support service, in the caller's transaction. */
+  async function settle(conn: Parameters<typeof exec>[0], req: Request, row: Row, o: Outcome) {
+    const staff = staffOf(req);
+    await exec(
+      conn,
+      "UPDATE kyc_submissions SET status = ?, reject_reason = ?, decided_at = CURRENT_TIMESTAMP(3), decided_by = ?, claimed_by = NULL, claimed_until = NULL, checklist = COALESCE(?, checklist) WHERE id = ?",
+      [o.status, o.status === "rejected" ? o.reason : null, staff.id, o.checklist ? JSON.stringify(o.checklist) : null, row.id],
+    );
+    const before = await one<{ kyc_status: string }>(conn, "SELECT kyc_status FROM clients WHERE id = ? FOR UPDATE", [row.client_id]);
+    const overall = overallStatus(await latestSubmissions(conn, row.client_id));
+    await exec(conn, "UPDATE clients SET kyc_status = ?, kyc_approved_at = IF(? = 'approved', COALESCE(kyc_approved_at, CURRENT_TIMESTAMP(3)), NULL) WHERE id = ?", [overall, overall, row.client_id]);
+    await writeAudit(conn, ctx(req), {
+      action: o.action, entityType: "client", entityId: row.client_id,
+      before: { status: row.status, decided_by: row.decider_name, kyc_status: before?.kyc_status }, after: { status: o.status, kyc_status: overall },
+      meta: { submissionId: row.id, category: row.category, reason: o.reason, ...(o.checklist ? { checklist: o.checklist } : {}), ...o.meta },
+    });
+    const what = row.category === "identity" ? "proof of identity" : "proof of address";
+    await queueSupportEvent(conn, config, { event: `kyc.${row.category}.${o.status}`, clientId: row.client_id, referenceId: row.id });
+    if (overall === "approved" && before?.kyc_status !== "approved") await queueSupportEvent(conn, config, { event: "kyc.approved", clientId: row.client_id, referenceId: row.id });
+    if (o.status === "rejected") await queueSupportEvent(conn, config, { event: "kyc.rejected", clientId: row.client_id, referenceId: row.id });
+    const fullyVerified = overall === "approved";
+    if (o.status === "approved") {
+      await notifyClient(conn, row.client_id, { type: "kyc", title: `Your ${what} is approved`, body: fullyVerified ? "Your account is now fully verified." : "Thank you. We will let you know when the rest of your documents are checked.", link: "/profile", linkLabel: "View profile" });
+      await queueEmail(conn, config, {
+        to: row.email, template: "kyc_approved", subject: "Your document was approved", clientId: row.client_id,
+        text: `Hello ${row.first_name},\n\nYour ${what} has been approved.${fullyVerified ? " Your account is now fully verified." : ""}\n\nBIS Markets`,
+      });
+    } else {
+      const title = o.askAgain ? `Please upload a new ${what}` : `Your ${what} needs another look`;
+      await notifyClient(conn, row.client_id, { type: "kyc", title, body: o.reason ?? "Please upload a new document.", link: "/profile", linkLabel: o.askAgain ? "Upload now" : "Upload again" });
+      await queueEmail(conn, config, {
+        to: row.email, template: o.askAgain ? "kyc_new_document" : "kyc_rejected", subject: o.askAgain ? title : "Your document needs another look", clientId: row.client_id,
+        text: o.askAgain
+          ? `Hello ${row.first_name},\n\nWe need a new ${what} from you.\n\n${o.reason}\n\nPlease upload it in the client portal: ${config.portalUrl}/profile\n\nBIS Markets`
+          : `Hello ${row.first_name},\n\nWe could not approve your ${what}.\n\nReason: ${o.reason}\n\nPlease upload a new document in the client portal: ${config.portalUrl}/profile\n\nBIS Markets`,
+      });
+    }
+  }
+
+  /** Staff who uploaded documents themselves need kyc.override to approve them (four eyes). */
+  function assertMayApprove(req: Request, row: Row) {
+    const staff = staffOf(req);
+    if (row.uploaded_by === staff.id && !staff.permissions.has("kyc.override")) {
+      throw forbidden("You uploaded these documents, so another reviewer must approve them.");
+    }
+    if (Number(row.documents) === 0 && !staff.permissions.has("kyc.override")) {
+      throw forbidden("Approving without documents needs the \"approve without documents\" permission.");
+    }
+  }
+
+  async function assertLatest(conn: Parameters<typeof exec>[0], row: Row) {
+    const latest = await latestSubmissions(conn, row.client_id);
+    if (latest[row.category]?.id !== row.id) throw badRequest("The client has a newer submission for this. Change that one instead.");
   }
 
   router.get(
@@ -218,6 +294,14 @@ export function staffKycRouter(deps: AppDeps): Router {
 
       // Automatic checks the reviewer would otherwise have to work out by hand.
       const warnings: Warning[] = [];
+      if (row.source === "staff") {
+        warnings.push({
+          tone: "info",
+          text: docs.length
+            ? `Uploaded by ${row.uploader_name ?? "staff"} on the client's behalf${row.staff_note ? `: ${row.staff_note}` : "."}`
+            : `Added without documents by ${row.uploader_name ?? "staff"}${row.staff_note ? `: ${row.staff_note}` : "."}`,
+        });
+      }
       if (profile?.dob) {
         const age = ageOn(profile.dob);
         if (age < 18) warnings.push({ tone: "bad", text: `The client is ${age} by the date of birth they entered, under 18.` });
@@ -311,43 +395,108 @@ export function staffKycRouter(deps: AppDeps): Router {
         assertNotClaimedByOther(row, staff.id);
         const required = KYC_CHECKLIST[row.category].map((c) => c.key);
         const ticked = required.filter((k) => body.checklist.includes(k));
-        if (body.decision === "approve" && ticked.length !== required.length) throw badRequest("Tick every check before approving.");
+        if (body.decision === "approve") {
+          if (ticked.length !== required.length) throw badRequest("Tick every check before approving.");
+          assertMayApprove(req, row);
+        }
         const status = body.decision === "approve" ? "approved" : "rejected";
-        await exec(
-          conn,
-          "UPDATE kyc_submissions SET status = ?, reject_reason = ?, decided_at = CURRENT_TIMESTAMP(3), decided_by = ?, claimed_by = NULL, claimed_until = NULL, checklist = ? WHERE id = ?",
-          [status, status === "rejected" ? body.reason : null, staff.id, JSON.stringify(ticked), row.id],
-        );
-        const before = await one<{ kyc_status: string }>(conn, "SELECT kyc_status FROM clients WHERE id = ? FOR UPDATE", [row.client_id]);
-        const overall = overallStatus(await latestSubmissions(conn, row.client_id));
-        await exec(conn, "UPDATE clients SET kyc_status = ?, kyc_approved_at = IF(? = 'approved', COALESCE(kyc_approved_at, CURRENT_TIMESTAMP(3)), NULL) WHERE id = ?", [overall, overall, row.client_id]);
-        await writeAudit(conn, ctx(req), {
-          action: `kyc.${status}`, entityType: "client", entityId: row.client_id,
-          before: { status: row.status, kyc_status: before?.kyc_status }, after: { status, kyc_status: overall },
-          meta: { submissionId: row.id, category: row.category, reason: body.reason ?? null, checklist: ticked },
-        });
-        const what = row.category === "identity" ? "proof of identity" : "proof of address";
-        await queueSupportEvent(conn, config, { event: `kyc.${row.category}.${status}`, clientId: row.client_id, referenceId: row.id });
-        if (overall === "approved" && before?.kyc_status !== "approved") await queueSupportEvent(conn, config, { event: "kyc.approved", clientId: row.client_id, referenceId: row.id });
-        if (status === "rejected") await queueSupportEvent(conn, config, { event: "kyc.rejected", clientId: row.client_id, referenceId: row.id });
-        await notifyClient(
-          conn,
-          row.client_id,
-          status === "approved"
-            ? { type: "kyc", title: `Your ${what} is approved`, body: overall === "approved" ? "Your account is now fully verified." : "Thank you. We will let you know when the rest of your documents are checked.", link: "/profile", linkLabel: "View profile" }
-            : { type: "kyc", title: `Your ${what} needs another look`, body: body.reason ?? "Please upload a new document.", link: "/profile", linkLabel: "Upload again" },
-        );
-        await queueEmail(conn, config, {
-          to: row.email,
-          template: `kyc_${status}`,
-          subject: status === "approved" ? "Your document was approved" : "Your document needs another look",
-          text:
-            status === "approved"
-              ? `Hello ${row.first_name},\n\nYour ${what} has been approved.${overall === "approved" ? " Your account is now fully verified." : ""}\n\nBIS Markets`
-              : `Hello ${row.first_name},\n\nWe could not approve your ${what}.\n\nReason: ${body.reason}\n\nPlease upload a new document in the client portal: ${config.portalUrl}/profile\n\nBIS Markets`,
-          clientId: row.client_id,
-        });
+        await settle(conn, req, row, { status, reason: body.reason ?? null, checklist: ticked, action: `kyc.${status}` });
         return loadVisible(req, row.id, conn);
+      });
+      res.json(present(updated));
+    }),
+  );
+
+  // Change a decision later: approve a rejected document, or reject an approved one.
+  router.post(
+    "/:id/change",
+    requirePermission("kyc.decide"),
+    stepUp,
+    handler(async (req, res) => {
+      const body = parse(
+        z.object({ status: z.enum(["approved", "rejected"]), reason: reasonText, checklist: z.array(z.string().max(32)).max(10).default([]) }).strict(),
+        req.body,
+      );
+      const updated = await transaction(db, async (conn) => {
+        const row = await loadVisible(req, parse(id, req.params.id), conn, true);
+        if (row.status === "pending") throw badRequest("This submission has not been decided yet. Approve or reject it from the review screen.");
+        if (row.status === body.status) throw badRequest(`This submission is already ${row.status}.`);
+        await assertLatest(conn, row);
+        let checklist: string[] | undefined;
+        if (body.status === "approved") {
+          assertMayApprove(req, row);
+          if (Number(row.documents) > 0) {
+            const required = KYC_CHECKLIST[row.category].map((c) => c.key);
+            checklist = required.filter((k) => body.checklist.includes(k));
+            if (checklist.length !== required.length) throw badRequest("Tick every check before approving.");
+          }
+        }
+        // An approval's reason is for the audit log; a rejection's reason is shown to the client.
+        await settle(conn, req, row, { status: body.status, reason: body.reason, checklist, action: "kyc.decision_changed", meta: { from: row.status, to: body.status } });
+        return loadVisible(req, row.id, conn);
+      });
+      res.json(present(updated));
+    }),
+  );
+
+  // Upload documents on the client's behalf, for example ones they emailed in.
+  router.post(
+    "/upload",
+    requirePermission("kyc.upload"),
+    stepUp,
+    express.raw({ type: "multipart/form-data", limit: 2 * KYC_MAX_BYTES + 256 * 1024 }),
+    handler(async (req, res) => {
+      const upload = await parseKycUpload(req.body, req.get("content-type"));
+      const clientId = parse(id, upload.form.get("client_id"));
+      const note = parse(reasonText, String(upload.form.get("note") ?? ""));
+      const staff = staffOf(req);
+      const created = await transaction(db, async (conn) => {
+        const s = scope(staff);
+        const client = await one<{ id: number; status: string }>(conn, `SELECT c.id, c.status FROM clients c WHERE c.id = ?${s.sql} FOR UPDATE`, [clientId, ...s.params]);
+        if (!client) throw notFound("That client does not exist or is not assigned to you.");
+        if (client.status === "closed") throw badRequest("This account is closed. Reopen it before adding documents.");
+        const current = (await latestSubmissions(conn, clientId))[upload.category];
+        if (current && current.status !== "rejected") {
+          throw badRequest(current.status === "approved" ? "This is already approved. Change that decision first if the document needs replacing." : "A document is already waiting for review. Decide that one first.");
+        }
+        const submissionId = await storeSubmission(conn, config, { clientId, category: upload.category, subType: upload.subType.id, files: upload.files, ip: req.clientIp, uploadedBy: staff.id, note });
+        const overall = overallStatus(await latestSubmissions(conn, clientId));
+        await exec(conn, "UPDATE clients SET kyc_status = ? WHERE id = ?", [overall, clientId]);
+        await writeAudit(conn, ctx(req), {
+          action: "kyc.uploaded_by_staff", entityType: "client", entityId: clientId,
+          meta: { submissionId, category: upload.category, subType: upload.subType.name, note, files: upload.files.map((f) => ({ type: f.mime, bytes: f.bytes.length, sha256: sha256(f.bytes) })) },
+        });
+        const what = upload.category === "identity" ? "proof of identity" : "proof of address";
+        await notifyClient(conn, clientId, { type: "kyc", title: `We added your ${what}`, body: "Our team uploaded this document for you. It is now being checked.", link: "/profile", linkLabel: "View profile" });
+        return loadVisible(req, submissionId, conn);
+      });
+      res.status(201).json(present(created));
+    }),
+  );
+
+  // Approve without documents, for example a client verified another way. Needs kyc.override.
+  router.post(
+    "/approve-without-documents",
+    requirePermission("kyc.override"),
+    stepUp,
+    handler(async (req, res) => {
+      const body = parse(
+        z.object({ clientId: id, category: z.enum(["identity", "address"]), subType: z.coerce.number().int().positive(), reason: reasonText }).strict()
+          .refine((v) => subTypeOf(v.category, v.subType), { message: "Choose a document type.", path: ["subType"] }),
+        req.body,
+      );
+      const staff = staffOf(req);
+      const updated = await transaction(db, async (conn) => {
+        const s = scope(staff);
+        const client = await one<{ id: number }>(conn, `SELECT c.id FROM clients c WHERE c.id = ?${s.sql} FOR UPDATE`, [body.clientId, ...s.params]);
+        if (!client) throw notFound("That client does not exist or is not assigned to you.");
+        const current = (await latestSubmissions(conn, body.clientId))[body.category];
+        if (current?.status === "approved") throw badRequest("This is already approved.");
+        if (current?.status === "pending") throw badRequest("A document is waiting for review. Open it and approve or reject it instead.");
+        const submissionId = await storeSubmission(conn, config, { clientId: body.clientId, category: body.category, subType: body.subType, files: [], ip: req.clientIp, uploadedBy: staff.id, note: body.reason });
+        const row = await loadVisible(req, submissionId, conn, true);
+        await settle(conn, req, row, { status: "approved", reason: body.reason, action: "kyc.approved_without_documents" });
+        return loadVisible(req, submissionId, conn);
       });
       res.json(present(updated));
     }),
@@ -365,31 +514,11 @@ export function staffKycRouter(deps: AppDeps): Router {
           .refine((v) => !/[<>{}`\\]|https?:|\bwww\./i.test(v.reason), { message: "Write the reason as plain text, without links or symbols like < > { }", path: ["reason"] }),
         req.body,
       );
-      const staff = staffOf(req);
       const updated = await transaction(db, async (conn) => {
         const row = await loadVisible(req, parse(id, req.params.id), conn, true);
         if (row.status !== "approved") throw badRequest("Only an approved document can be requested again. Reject a pending one instead.");
-        const latest = await latestSubmissions(conn, row.client_id);
-        if (latest[row.category]?.id !== row.id) throw badRequest("The client has already sent a newer document.");
-        await exec(conn, "UPDATE kyc_submissions SET status = 'rejected', reject_reason = ?, decided_at = CURRENT_TIMESTAMP(3), decided_by = ? WHERE id = ?", [body.reason, staff.id, row.id]);
-        const overall = overallStatus(await latestSubmissions(conn, row.client_id));
-        await exec(conn, "UPDATE clients SET kyc_status = ?, kyc_approved_at = IF(? = 'approved', kyc_approved_at, NULL) WHERE id = ?", [overall, overall, row.client_id]);
-        await writeAudit(conn, ctx(req), {
-          action: "kyc.new_document_requested", entityType: "client", entityId: row.client_id,
-          before: { status: "approved", decided_by: row.decider_name }, after: { status: "rejected", kyc_status: overall },
-          meta: { submissionId: row.id, category: row.category, reason: body.reason },
-        });
-        const what = row.category === "identity" ? "proof of identity" : "proof of address";
-        await queueSupportEvent(conn, config, { event: `kyc.${row.category}.rejected`, clientId: row.client_id, referenceId: row.id });
-        await queueSupportEvent(conn, config, { event: "kyc.rejected", clientId: row.client_id, referenceId: row.id });
-        await notifyClient(conn, row.client_id, { type: "kyc", title: `Please upload a new ${what}`, body: body.reason, link: "/profile", linkLabel: "Upload now" });
-        await queueEmail(conn, config, {
-          to: row.email,
-          template: "kyc_new_document",
-          subject: `Please upload a new ${what}`,
-          text: `Hello ${row.first_name},\n\nWe need a new ${what} from you.\n\n${body.reason}\n\nPlease upload it in the client portal: ${config.portalUrl}/profile\n\nBIS Markets`,
-          clientId: row.client_id,
-        });
+        await assertLatest(conn, row);
+        await settle(conn, req, row, { status: "rejected", reason: body.reason, action: "kyc.new_document_requested", askAgain: true });
         return loadVisible(req, row.id, conn);
       });
       res.json(present(updated));

@@ -68,7 +68,7 @@ export function DocumentViewer({ files }: { files: ReviewFile[] }) {
     ArrowRight: () => setIndex((i) => (i + 1) % files.length),
     ArrowLeft: () => setIndex((i) => (i - 1 + files.length) % files.length),
   });
-  if (!file) return <div className="viewer viewer-empty muted">No files were attached.</div>;
+  if (!file) return <div className="viewer viewer-empty muted">No documents were attached.</div>;
   return (
     <div className="viewer">
       <div className="viewer-bar">
