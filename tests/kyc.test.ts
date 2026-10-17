@@ -315,12 +315,15 @@ describe.skipIf(!hasDb)("KYC", () => {
     expect(file.headers["content-disposition"]).toBe("inline");
     expect(file.headers["x-content-type-options"]).toBe("nosniff");
     expect(await sharp(file.body as Buffer).metadata()).toMatchObject({ format: "png", width: 640, height: 440 });
+    // The review screen compares what it got with this, so a copy changed on the way is not taken for a damaged file.
+    expect(file.headers["x-document-sha256"]).toBe(sha256(file.body as Buffer));
     // Files are only for the review screen to draw: never sent as a download, and refused to a link, image or tab.
     const bill = await view(reviewer, detail.other.files[0].url);
     expect(bill.headers["content-type"]).toBe("application/pdf");
     expect(bill.headers["content-disposition"]).toBe("inline");
     expect(bill.headers["content-security-policy"]).toContain("sandbox");
     expect(bill.headers["x-content-type-options"]).toBe("nosniff");
+    expect(bill.headers["x-document-sha256"]).toBe(sha256(bill.body as Buffer));
     const opened = await reviewer.agent.get(detail.files[1].url).set("Sec-Fetch-Dest", "empty").set("Sec-Fetch-Mode", "navigate");
     expect(opened.status).toBe(403);
     expect(opened.body.error.message).toBe("Open KYC documents from the review screen. If it is already open, reload it.");

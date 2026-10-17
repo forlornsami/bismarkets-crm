@@ -8,7 +8,7 @@ import {
 } from "../../clients/kyc";
 import { clientName, clientPictureUrl, loadClient, type ClientRow } from "../../clients/model";
 import { auditContext, writeAudit } from "../../lib/audit";
-import { decryptBytes } from "../../lib/crypto";
+import { decryptBytes, sha256 } from "../../lib/crypto";
 import { heicAsJpeg, inspectPdf } from "../../lib/documents";
 import { exec, one, rows, transaction, type Conn } from "../../lib/db";
 import { queueEmail } from "../../lib/email";
@@ -640,6 +640,9 @@ export function staffKycRouter(deps: AppDeps): Router {
       res.setHeader("Content-Type", heic ? "image/jpeg" : doc.mime);
       res.setHeader("Content-Security-Policy", "default-src 'none'; sandbox");
       res.setHeader("Content-Disposition", "inline");
+      // The review screen checks the copy it gets against this. A browser extension that catches files
+      // (a download manager, for one) can hand the page an empty or changed copy of a good document.
+      res.setHeader("X-Document-SHA256", sha256(body));
       res.send(body);
     }),
   );

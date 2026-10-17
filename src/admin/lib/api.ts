@@ -67,8 +67,19 @@ async function bytes(url: string): Promise<ArrayBuffer> {
     if (res.status === 401) sessionLostHandler?.();
     throw new ApiError(res.status, err.code ?? "ERROR", err.message ?? "Could not open the file.", err.details);
   }
-  return res.arrayBuffer();
+  const data = await res.arrayBuffer();
+  // The server sends each KYC document's SHA-256. A browser extension that catches files can hand the
+  // page an empty or changed copy, and that copy must not look like a damaged upload.
+  const expected = res.headers.get("X-Document-SHA256");
+  if (expected && globalThis.crypto?.subtle) {
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", data));
+    if (Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("") !== expected) throw new ApiError(0, "ALTERED", ALTERED);
+  }
+  return data;
 }
+
+const ALTERED =
+  "The file did not reach this browser as the CRM sent it. A browser extension, such as a download manager, may have caught it. Turn that extension off for this site, or use a private window, then try again.";
 
 /**
  * Saves a file the staff API sends as a download, asking for a 2FA code first

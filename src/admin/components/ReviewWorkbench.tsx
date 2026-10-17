@@ -192,7 +192,9 @@ async function openFile(file: ReviewFile): Promise<Opened> {
     const failed = (message: string, fileProblem: boolean): Opened => ({ kind: "failed", message, fileProblem });
     if (slow) return failed("This PDF took too long to open.", true);
     if (name === "PasswordException") return failed("This PDF is protected with a password.", true);
-    if (name === "InvalidPDFException") return failed("This file is damaged or is not a real PDF.", true);
+    // The server opens every PDF with this same pdf.js before sending it, so a copy that arrived intact
+    // and still does not open is this browser's problem, never a reason to reject the client's file.
+    if (name === "InvalidPDFException") return failed("This browser could not open the PDF, although the CRM checked that the file opens. Try again in a private window or another browser.", false);
     if (e instanceof ApiError) return failed(e.message, e.code === "UNREADABLE");
     // pdf.js starts its worker when the first file is read; a worker that fails to load is not the file's fault.
     if (!reading || (e instanceof Error && /worker/i.test(e.message))) return failed("The document could not be loaded. Check your connection and try again.", false);
