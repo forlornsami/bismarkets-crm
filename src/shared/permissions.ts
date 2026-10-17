@@ -65,20 +65,21 @@ export const PERMISSION_GROUPS = {
   deposits: {
     label: "Deposits",
     permissions: {
-      "deposit.view": "View deposits",
-      "deposit.process": "Approve deposits up to the limit",
-      "deposit.approve_large": "Approve deposits above the limit",
+      "deposit.view": "View deposits and their status",
+      "deposit.proof": "Open deposit payment proofs and the deposit review screen",
+      "deposit.process": "Check deposits and approve them (on their own up to the second-approval limit)",
+      "deposit.approve_large": "Give the second approval on deposits above the limit",
       "deposit.reject": "Reject deposits",
     },
   },
   withdrawals: {
     label: "Withdrawals",
     permissions: {
-      "withdrawal.view": "View withdrawals",
-      "withdrawal.process": "Process withdrawals up to the limit",
-      "withdrawal.approve": "Give the second approval on withdrawals",
-      "withdrawal.reject": "Reject withdrawals",
-      "withdrawal.pay": "Mark withdrawals as paid",
+      "withdrawal.view": "View withdrawals and their status",
+      "withdrawal.process": "Check withdrawals and approve them (on their own up to the second-approval limit)",
+      "withdrawal.approve": "Give the second approval on large and first withdrawals",
+      "withdrawal.reject": "Reject withdrawals before they are paid",
+      "withdrawal.pay": "Record withdrawals as paid, with the payout reference",
     },
   },
   wallet: {
@@ -178,9 +179,9 @@ export interface DefaultRole {
   permissions: readonly Permission[] | "all";
 }
 
-// Opening KYC documents is read-only too, so the auditor can check reviews.
+// Opening KYC documents and deposit proofs is read-only too, so the auditor can check reviews.
 const viewOnly = ALL_PERMISSIONS.filter(
-  (p) => p.endsWith(".view") || p === "audit.verify" || p === "client.view_all" || p === "kyc.documents",
+  (p) => p.endsWith(".view") || p === "audit.verify" || p === "client.view_all" || p === "kyc.documents" || p === "deposit.proof",
 );
 
 // System roles are seeded by `cli seed-roles`. Super Admin always holds every
@@ -207,7 +208,7 @@ export const DEFAULT_ROLES: readonly DefaultRole[] = [
     permissions: [
       "client.view", "client.view_all", "client.status", "client.notes", "client.pii.reveal",
       "kyc.view", "kyc.documents", "kyc.decide", "kyc.upload", "kyc.settings", "aml.view", "aml.decide", "aml.freeze",
-      "deposit.view", "withdrawal.view", "wallet.view", "mt5.view", "ib.view", "audit.view", "report.view",
+      "deposit.view", "deposit.proof", "withdrawal.view", "wallet.view", "mt5.view", "ib.view", "audit.view", "report.view",
     ],
   },
   {
@@ -216,7 +217,7 @@ export const DEFAULT_ROLES: readonly DefaultRole[] = [
     description: "Second approval on money movements and payment method management.",
     permissions: [
       "client.view", "client.view_all", "kyc.view",
-      "deposit.view", "deposit.process", "deposit.approve_large", "deposit.reject",
+      "deposit.view", "deposit.proof", "deposit.process", "deposit.approve_large", "deposit.reject",
       "withdrawal.view", "withdrawal.process", "withdrawal.approve", "withdrawal.reject", "withdrawal.pay",
       "wallet.view", "wallet.adjust", "wallet.reconcile", "mt5.view", "ib.view", "ib.payout",
       "report.view", "report.finance", "report.export", "payment.manage", "audit.view",
@@ -228,7 +229,7 @@ export const DEFAULT_ROLES: readonly DefaultRole[] = [
     description: "Processes deposits and withdrawals up to the approval limit.",
     permissions: [
       "client.view", "client.view_all", "kyc.view",
-      "deposit.view", "deposit.process", "deposit.reject",
+      "deposit.view", "deposit.proof", "deposit.process", "deposit.reject",
       "withdrawal.view", "withdrawal.process", "withdrawal.reject", "wallet.view", "mt5.view",
     ],
   },

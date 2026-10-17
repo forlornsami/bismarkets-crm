@@ -13,7 +13,9 @@ export type SupportEvent =
   | "kyc.approved" | "kyc.rejected"
   | "kyc.identity.approved" | "kyc.identity.rejected"
   | "kyc.address.approved" | "kyc.address.rejected"
-  | "account.disabled" | "account.enabled" | "session.revoked";
+  | "account.disabled" | "account.enabled" | "session.revoked"
+  // Money: the payload carries no amount or method (support refuses extra keys); the bell has the details.
+  | "deposit.approved" | "deposit.rejected" | "withdrawal.approved" | "withdrawal.rejected";
 
 export const SUPPORT_EVENTS_PATH = "/api/client-notifications/events/crm";
 const MAX_ATTEMPTS = 12;
@@ -52,9 +54,10 @@ export function signSupportEvent(secret: string, eventId: string, body: string, 
 const backoffMs = (attempt: number) => Math.min(6 * 3_600_000, 30_000 * 2 ** (attempt - 1));
 // Longer than a full batch of timed-out requests (20 x 10 s), so a claimed row is never sent twice.
 const LEASE_MS = 5 * 60_000;
-// A KYC push about a decision made a day ago is news to nobody; account and
-// session events still go out, since support acts on them.
-const KYC_MAX_AGE_MS = 24 * 3_600_000;
+// A push about a KYC or money decision made a day ago is news to nobody (the
+// bell still has it); account and session events still go out, since support acts on them.
+const PUSH_MAX_AGE_MS = 24 * 3_600_000;
+const PUSH_ONLY = /^(kyc|deposit|withdrawal)\./;
 
 /**
  * Sends due events. Rows are claimed with a short lease in their own
@@ -70,7 +73,7 @@ export async function deliverSupportEvents(db: Db, config: Config, doFetch: type
       "SELECT id, event_id, event, payload, attempts, created_at FROM webhook_outbox WHERE status = 'queued' AND next_attempt_at <= CURRENT_TIMESTAMP(3) ORDER BY id LIMIT ? FOR UPDATE SKIP LOCKED",
       [batch],
     );
-    const stale = list.filter((r) => r.event.startsWith("kyc.") && r.created_at.getTime() < Date.now() - KYC_MAX_AGE_MS);
+    const stale = list.filter((r) => PUSH_ONLY.test(r.event) && r.created_at.getTime() < Date.now() - PUSH_MAX_AGE_MS);
     if (stale.length) {
       await exec(conn, `UPDATE webhook_outbox SET status = 'failed', last_error = 'expired' WHERE id IN (${stale.map(() => "?").join(",")})`, stale.map((r) => r.id));
     }

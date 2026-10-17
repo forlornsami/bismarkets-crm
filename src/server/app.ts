@@ -13,14 +13,18 @@ import { clientErrorMiddleware } from "./clients/errors";
 import { clientAuthRouter } from "./routes/client/auth";
 import { clientKycRouter } from "./routes/client/kyc";
 import { clientAccountRouter } from "./routes/client/account";
+import { clientMoneyRouter } from "./routes/client/money";
 import { staffAuditRouter } from "./routes/staff/audit";
 import { staffAuthRouter } from "./routes/staff/auth";
 import { staffBrandingRouter } from "./routes/staff/branding";
 import { staffClientsRouter } from "./routes/staff/clients";
+import { staffDepositsRouter } from "./routes/staff/deposits";
 import { staffEmailsRouter } from "./routes/staff/emails";
 import { staffKycRouter } from "./routes/staff/kyc";
 import { staffMailRouter } from "./routes/staff/mail";
 import { staffMessagesRouter } from "./routes/staff/messages";
+import { staffMoneyRouter } from "./routes/staff/money";
+import { staffWithdrawalsRouter } from "./routes/staff/withdrawals";
 import { emailUnsubscribeRouter } from "./routes/unsubscribe";
 import type { TransportFactory } from "./lib/mailer";
 import { staffRolesRouter } from "./routes/staff/roles";
@@ -126,6 +130,9 @@ export function createApp(deps: AppDeps): Express {
   staff.use("/kyc", staffKycRouter(deps));
   staff.use("/mail-settings", staffMailRouter(deps));
   staff.use("/messages", staffMessagesRouter(deps));
+  staff.use("/deposits", staffDepositsRouter(deps));
+  staff.use("/withdrawals", staffWithdrawalsRouter(deps));
+  staff.use("/money", staffMoneyRouter(deps));
   app.use("/api/staff", staff);
 
   // ---- Client API: what the client portal and app call, with Bearer tokens. ----
@@ -153,7 +160,8 @@ export function createApp(deps: AppDeps): Express {
   client.use(clientAuthRouter(deps));
   client.use(clientKycRouter(deps));
   client.use(clientAccountRouter(deps));
-  // Later phases add the remaining portal endpoints (accounts, money, IB).
+  client.use(clientMoneyRouter(deps));
+  // Later phases add the remaining portal endpoints (MT5 accounts, transfers, IB).
   client.use((_req, _res, next) => next(new HttpError(404, "NOT_AVAILABLE", "This feature is not available yet.")));
   client.use(clientErrorMiddleware(log));
   app.use("/api", (req, res, next) => (req.path.startsWith("/staff/") || req.path === "/staff" ? next() : client(req, res, next)));

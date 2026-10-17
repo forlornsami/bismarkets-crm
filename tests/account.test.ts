@@ -74,7 +74,7 @@ describe.skipIf(!hasDb)("client notifications, devices and support events", () =
     expect((await api().get("/api/notifications").set(auth)).body.unread_count).toBe(0);
     expect(await one(env.db, "SELECT id FROM client_notifications WHERE client_id = ? AND read_at IS NOT NULL", [b.user.id])).toBeUndefined();
     const types = (await api().get("/api/notification-types").set(auth)).body.data;
-    expect(types.map((t: { value: string }) => t.value)).toEqual(["kyc", "security", "account"]);
+    expect(types.map((t: { value: string }) => t.value)).toEqual(["kyc", "security", "account", "deposit", "withdrawal"]);
   });
 
   it("lists signed-in devices and signs one or all others out", async () => {
