@@ -144,13 +144,27 @@ server {
   proxy_set_header X-Forwarded-Proto https;
 
   # A body over the limit is refused here, before the CRM sees it. Answer with
-  # JSON and the CORS header, or the portal's browser hides the 413.
+  # JSON and the CORS header, or the portal's browser hides the 413. Deposits
+  # and payout accounts answer with the field error the CRM itself would give,
+  # which the portal shows under the file.
   error_page 413 = @too_large;
   location @too_large {
     default_type application/json;
     add_header Access-Control-Allow-Origin $client_cors always;
     add_header Vary Origin always;
     return 413 '{"message":"The upload is too large."}';
+  }
+  location @proof_too_large {
+    default_type application/json;
+    add_header Access-Control-Allow-Origin $client_cors always;
+    add_header Vary Origin always;
+    return 422 '{"message":"Upload a screenshot or photo of your payment: JPG, PNG, WebP, HEIC or GIF, up to 10 MB.","errors":{"file_name":["Upload a screenshot or photo of your payment: JPG, PNG, WebP, HEIC or GIF, up to 10 MB."]}}';
+  }
+  location @qr_too_large {
+    default_type application/json;
+    add_header Access-Control-Allow-Origin $client_cors always;
+    add_header Vary Origin always;
+    return 422 '{"message":"Upload a picture of the QR code: JPG, PNG, WebP, HEIC or GIF, up to 10 MB.","errors":{"file_name":["Upload a picture of the QR code: JPG, PNG, WebP, HEIC or GIF, up to 10 MB."]}}';
   }
 
   location / {
@@ -168,22 +182,27 @@ server {
   # Deposit requests carry the payment screenshot (HEIC photos are converted).
   location = /api/deposits {
     client_max_body_size 11m;
+    error_page 413 = @proof_too_large;
     proxy_read_timeout 90s;
     proxy_pass http://127.0.0.1:3000;
   }
   # Saved payout accounts may carry the client's wallet QR image.
   location ~ ^/api/user-payment-methods(/[0-9]+)?$ {
     client_max_body_size 11m;
+    error_page 413 = @qr_too_large;
     proxy_read_timeout 90s;
     proxy_pass http://127.0.0.1:3000;
   }
 }
 ```
 
-nginx answers a larger body with `413` before the CRM sees it. On the client
-API host that answer is the JSON above, with the CORS header, so the portal
-can read it and shows its "file too large" message; the app reads the status.
-The staff panel is on its own origin and reads nginx's plain `413` directly.
+nginx answers a larger body before the CRM sees it. On the client API host the
+answer is JSON with the CORS header, so the portal can read it. For deposits
+and payout accounts it is the same `422` field error the CRM gives for a file
+over 10 MB, which the portal shows as written. Elsewhere it is
+`413` with a short message: the portal shows its own "file too large" message
+for KYC uploads, and the app reads the status. The staff panel is on its own
+origin and reads nginx's plain `413` directly.
 
 KYC uploads get a longer `proxy_read_timeout`: photos are converted before they
 are stored, and a two-sided HEIC upload can take up to two minutes when the
