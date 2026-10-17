@@ -9,6 +9,7 @@ import type { Config } from "./config";
 import type { Db } from "./lib/db";
 import { errorMiddleware, HttpError, notFound } from "./lib/http";
 import { buildAllowList, isAllowed, normalizeIp } from "./lib/ip";
+import { loggablePath } from "./lib/logger";
 import { clientErrorMiddleware } from "./clients/errors";
 import { clientAuthRouter } from "./routes/client/auth";
 import { clientKycRouter } from "./routes/client/kyc";
@@ -54,7 +55,7 @@ export function createApp(deps: AppDeps): Express {
       logger: log,
       // Never log cookies, auth headers, bodies or query strings.
       serializers: {
-        req: (req) => ({ id: req.id, method: req.method, url: String(req.url ?? "").split("?")[0] }),
+        req: (req) => ({ id: req.id, method: req.method, url: loggablePath(String(req.url ?? "")) }),
         res: (res) => ({ statusCode: res.statusCode }),
       },
     }),

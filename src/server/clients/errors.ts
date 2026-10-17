@@ -1,6 +1,7 @@
 import type { NextFunction, Request, Response } from "express";
 import { ZodError, type ZodType, type ZodTypeDef } from "zod";
 import { HttpError } from "../lib/http";
+import { loggablePath } from "../lib/logger";
 
 // The portal and app were written against a Laravel API, so the client API
 // answers errors in Laravel's shape: { message, errors: { field: [text] } }.
@@ -61,7 +62,7 @@ export function clientErrorMiddleware(log: { error: (obj: unknown, msg: string) 
     const status = (error as { status?: number }).status;
     if (status === 413) return void res.status(413).json({ message: "The upload is too large." });
     if (status === 400) return void res.status(400).json({ message: "Invalid request body." });
-    log.error({ err: error, path: req.path }, "Unhandled client API error");
+    log.error({ err: error, path: loggablePath(req.originalUrl) }, "Unhandled client API error");
     res.status(500).json({ message: "Something went wrong. Please try again." });
   };
 }

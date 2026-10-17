@@ -1,5 +1,6 @@
 import type { NextFunction, Request, RequestHandler, Response } from "express";
 import { ZodError, type ZodType, type ZodTypeDef } from "zod";
+import { loggablePath } from "./logger";
 
 export class HttpError extends Error {
   constructor(
@@ -52,7 +53,7 @@ export function errorMiddleware(log: { error: (obj: unknown, msg: string) => voi
       res.status(status).json({ error: { code: status === 413 ? "TOO_LARGE" : "BAD_REQUEST", message: "Invalid request body." } });
       return;
     }
-    log.error({ err: error, path: req.path }, "Unhandled request error");
+    log.error({ err: error, path: loggablePath(req.originalUrl) }, "Unhandled request error");
     res.status(500).json({ error: { code: "INTERNAL", message: "Something went wrong. Please try again." } });
   };
 }

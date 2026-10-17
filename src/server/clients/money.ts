@@ -318,15 +318,20 @@ export const PAYOUT_METHOD = `SELECT m.id, m.client_id, m.payment_method_id, m.m
 
 /** The account number and IBAN, decrypted exactly as the client sent them. */
 export function openPayoutMethod(config: Config, m: Pick<PayoutMethodRow, "client_id" | "account_number_enc" | "iban_enc">) {
+  let unreadable = false;
   const open = (sealed: Buffer | null, context: string) => {
     if (!sealed) return "";
     try {
       return decryptField(config.dataKey, sealed, context);
     } catch {
+      unreadable = true;
       return "";
     }
   };
-  return { accountNumber: open(m.account_number_enc, payoutAccountContext(m.client_id)), iban: open(m.iban_enc, payoutIbanContext(m.client_id)) };
+  const accountNumber = open(m.account_number_enc, payoutAccountContext(m.client_id));
+  const iban = open(m.iban_enc, payoutIbanContext(m.client_id));
+  /** unreadable: a stored detail failed to decrypt (shown empty, and never paid out to). */
+  return { accountNumber, iban, unreadable };
 }
 
 /**

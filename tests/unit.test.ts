@@ -3,6 +3,7 @@ import { canonical, entryHash, GENESIS_HASH } from "../src/server/lib/audit";
 import { decryptField, encryptField } from "../src/server/lib/crypto";
 import { buildAllowList, isAllowed, normalizeIp } from "../src/server/lib/ip";
 import { isBreachedPassword, passwordProblem } from "../src/server/lib/passwords";
+import { loggablePath } from "../src/server/lib/logger";
 import { base32Decode, base32Encode, hotp, verifyTotp } from "../src/server/lib/totp";
 import { splitStatements } from "../src/server/migrate";
 import { temporaryPassword } from "../src/server/staff/guards";
@@ -157,5 +158,14 @@ describe.skipIf(!process.env.CRM_TEST_DATABASE_URL)("database connections", () =
     const row = await one<{ tz: string }>(db, "SELECT @@session.time_zone AS tz");
     expect(row?.tz).toBe("+00:00");
     await db.end();
+  });
+});
+
+describe("request log paths", () => {
+  it("drops query strings and QR link tokens", () => {
+    expect(loggablePath("/api/payout-qr/ca02d5c2c06c97a8e7a6efb2614873b3")).toBe("/api/payout-qr/:token");
+    expect(loggablePath("/api/payment-qr/ca02d5c2c06c97a8e7a6efb2614873b3?v=1")).toBe("/api/payment-qr/:token");
+    expect(loggablePath("/api/user?token=secret")).toBe("/api/user");
+    expect(loggablePath("/api/staff/withdrawals/7/qr")).toBe("/api/staff/withdrawals/7/qr");
   });
 });

@@ -437,10 +437,15 @@ export function clientMoneyRouter(deps: AppDeps): Router {
 
   // ---------- Withdrawal requests ----------
 
-  const enabledPayoutMethod = (conn: Conn, clientId: number, id: number | null) =>
-    id
-      ? one<PayoutMethodRow>(conn, `${PAYOUT_METHOD} WHERE m.id = ? AND m.client_id = ? AND m.deleted_at IS NULL AND t.direction = 'withdrawal' AND t.is_enabled = 1`, [id, clientId])
-      : Promise.resolve(undefined);
+  /** The client's saved account to pay out to, or the field error that says why it cannot be used. */
+  async function usablePayoutMethod(conn: Conn, clientId: number, id: number | null) {
+    const payout = id
+      ? await one<PayoutMethodRow>(conn, `${PAYOUT_METHOD} WHERE m.id = ? AND m.client_id = ? AND m.deleted_at IS NULL AND t.direction = 'withdrawal'`, [id, clientId])
+      : undefined;
+    if (!payout) throw fieldError("method", NO_DESTINATION);
+    if (!payout.type_enabled) throw fieldError("method", `Withdrawals to ${payout.type_name} accounts are paused. Choose another account or contact support.`);
+    return payout;
+  }
 
   router.post(
     "/withdrawals",
@@ -453,7 +458,7 @@ export function clientMoneyRouter(deps: AppDeps): Router {
       const client = clientOf(req);
       const form = await readMoneyForm(req, "method", NO_DESTINATION);
       const methodId = formId(form.values.method);
-      if (!(await enabledPayoutMethod(db, client.id, methodId))) throw fieldError("method", NO_DESTINATION);
+      await usablePayoutMethod(db, client.id, methodId);
       const wallet = await walletOf(db, client.id);
       if (formText(form.values.wallet_key)?.trim() !== wallet.wallet_key) throw fieldError("wallet_key", REFRESH);
       const amount = parseAmount(form.values.amount);
@@ -476,8 +481,10 @@ export function clientMoneyRouter(deps: AppDeps): Router {
         const profile = (await loadClient(conn, client.id))!;
         const locked = await lockWallet(conn, client.id);
         // Read again under the locks: every change to saved payout accounts takes the client row lock first.
-        const payout = await enabledPayoutMethod(conn, client.id, methodId);
-        if (!payout) throw fieldError("method", NO_DESTINATION);
+        const payout = await usablePayoutMethod(conn, client.id, methodId);
+        const { accountNumber, iban, unreadable } = openPayoutMethod(config, payout);
+        // Details that cannot be read are never sent on as an empty destination.
+        if (unreadable || !accountNumber) throw fieldError("method", "This account could not be read. Remove it and add it again.");
         const settings = await loadMoneySettings(conn);
         checkLimits(settings);
         if (locked.available_cents < cents) throw fieldError("amount", `This is more than your available balance of ${money(locked.available_cents, "USD")}.`);
@@ -489,7 +496,6 @@ export function clientMoneyRouter(deps: AppDeps): Router {
         if (!(await checkEmailCode(conn, config, client.email, "withdrawal", code, true, client.id))) throw fieldError("verification_code", WRONG_CODE);
         const paidBefore = await one(conn, "SELECT id FROM withdrawals WHERE client_id = ? AND status = 'paid' LIMIT 1", [client.id]);
         const needsSecond = cents > settings.withdrawal_second_approval_cents || (settings.first_withdrawal_second_approval && !paidBefore);
-        const { accountNumber, iban } = openPayoutMethod(config, payout);
         // A copy of the destination as it is now, so a later edit cannot redirect this withdrawal.
         const destination = {
           methodName: payout.method_name, typeName: payout.type_name, kind: payout.kind, network: payout.network, accountName: payout.account_name,

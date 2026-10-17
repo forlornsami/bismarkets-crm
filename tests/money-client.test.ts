@@ -904,12 +904,23 @@ describe.skipIf(!hasDb)("client money API", () => {
 
   it("refuses a withdrawal to a type that was switched off", async () => {
     await exec(env.db, "UPDATE payment_methods SET is_enabled = 0 WHERE id = ?", [m.wBep]);
-    expect(errorOf(await withdraw(ann, { method: String(annBep), amount: "50", verification_code: await issueCode(ann.email), wallet_key: ann.key }), "method")).toBe("Choose where to send the money.");
+    expect(errorOf(await withdraw(ann, { method: String(annBep), amount: "50", verification_code: await issueCode(ann.email), wallet_key: ann.key }), "method")).toBe(
+      "Withdrawals to USDT BEP20 accounts are paused. Choose another account or contact support.",
+    );
     expect((await api().get("/api/payment-methods").set(bearer(ann.token))).body.data.map((r: { id: string }) => r.id)).not.toContain(String(m.wBep));
     // The account itself stays listed, and its default flag can still move.
     expect((await api().get("/api/user-payment-methods").set(bearer(ann.token))).body.data.map((r: { id: number }) => r.id)).toContain(annBep);
     expect((await savePayout(ann, { payment_method_id: String(m.wBep), method_name: "USDT BEP20", is_default: "1" }, undefined, annBep)).status).toBe(200);
     await exec(env.db, "UPDATE payment_methods SET is_enabled = 1 WHERE id = ?", [m.wBep]);
+  });
+
+  it("never pays out to an account whose details cannot be read", async () => {
+    const sealed = (await one<{ account_number_enc: Buffer }>(env.db, "SELECT account_number_enc FROM client_payout_methods WHERE id = ?", [annBep]))!.account_number_enc;
+    await exec(env.db, "UPDATE client_payout_methods SET account_number_enc = ? WHERE id = ?", [Buffer.from(sealed).fill(7, 20, 24), annBep]);
+    expect(errorOf(await withdraw(ann, { method: String(annBep), amount: "50", verification_code: await issueCode(ann.email), wallet_key: ann.key }), "method")).toBe(
+      "This account could not be read. Remove it and add it again.",
+    );
+    await exec(env.db, "UPDATE client_payout_methods SET account_number_enc = ? WHERE id = ?", [sealed, annBep]);
   });
 
   it("keeps at most three withdrawals in progress", async () => {

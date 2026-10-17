@@ -1,3 +1,4 @@
+import QRCode from "qrcode";
 import sharp from "sharp";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { DEPOSIT_CHECKLIST, DEPOSIT_REJECT_REASONS } from "@shared/money";
@@ -725,7 +726,7 @@ describe.skipIf(!hasDb)("staff deposits", () => {
     });
 
     it("stores a crypto deposit method's QR code as a clean PNG and shows it to staff", async () => {
-      const qr = await sharp({ create: { width: 300, height: 300, channels: 3, background: "#000000" } }).jpeg().withExifMerge({ IFD0: { Software: "Adobe Photoshop 25.0" } }).toBuffer();
+      const qr = await sharp(await QRCode.toBuffer(TRC20, { width: 300 })).jpeg().withExifMerge({ IFD0: { Software: "Adobe Photoshop 25.0" } }).toBuffer();
       const upload = (s: SignedIn, id: number, body: Buffer, type = "image/jpeg") => s.agent.post(`${methods}/${id}/qr`).set("Origin", ORIGIN).set("X-CSRF-Token", s.csrf).set("Content-Type", type).send(body);
       expect((await upload(agent, crypto, qr)).status).toBe(403);
       expect((await upload(manager, usdBank, qr)).body.error.message).toBe("Only crypto deposit methods have a QR code.");
@@ -733,6 +734,13 @@ describe.skipIf(!hasDb)("staff deposits", () => {
       expect((await upload(manager, crypto, Buffer.from("<svg/>"), "image/svg+xml")).status).toBe(400);
       const tiny = await sharp({ create: { width: 20, height: 20, channels: 3, background: "#000" } }).png().toBuffer();
       expect((await upload(manager, crypto, tiny, "image/png")).status).toBe(400);
+      // Clients scan it, so it must hold the method's own address.
+      const blank = await sharp({ create: { width: 300, height: 300, channels: 3, background: "#000000" } }).png().toBuffer();
+      expect((await upload(manager, crypto, blank, "image/png")).body.error.message).toBe("No QR code could be read in this picture. Upload a clear picture of the QR code alone.");
+      expect((await upload(manager, crypto, await QRCode.toBuffer("TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE", { width: 300 }), "image/png")).body.error.message).toBe(
+        `This QR code does not hold the method's wallet address (${TRC20}). Upload the QR code of that address.`,
+      );
+      expect((await upload(manager, crypto, await QRCode.toBuffer(`${TRC20}9`, { width: 300 }), "image/png")).status).toBe(400);
       const res = await upload(manager, crypto, qr);
       expect(res.status).toBe(200);
       expect(res.body).toMatchObject({ id: crypto, hasQr: true, qrUrl: expect.stringMatching(new RegExp(`^/api/staff/money/methods/${crypto}/qr\\?v=[0-9a-f]{12}$`)) });
@@ -747,14 +755,35 @@ describe.skipIf(!hasDb)("staff deposits", () => {
       const meta = await sharp(shown.body as Buffer).metadata();
       expect([meta.format, meta.width, meta.exif]).toEqual(["png", 300, undefined]);
       expect((await dealing.agent.get(res.body.qrUrl)).status).toBe(403);
-      // A new image gets a new address.
-      const second = await upload(manager, crypto, await sharp({ create: { width: 200, height: 200, channels: 3, background: "#111" } }).png().toBuffer(), "image/png");
+      // A new image gets a new address; a payment link naming the address is fine.
+      const second = await upload(manager, crypto, await QRCode.toBuffer(`tron:${TRC20}?amount=10`, { width: 200 }), "image/png");
       expect(second.body.qrUrl).not.toBe(res.body.qrUrl);
+      const changedAudit = await one<{ after_json: Record<string, unknown> }>(env.db, "SELECT after_json FROM audit_log WHERE action = 'payment_method.qr_changed' AND entity_id = ? ORDER BY id DESC LIMIT 1", [String(crypto)]);
+      expect(changedAudit!.after_json).toMatchObject({ text: `tron:${TRC20}?amount=10` });
       const removed = await del(manager, `${methods}/${crypto}/qr`);
       expect(removed.body).toMatchObject({ hasQr: false, qrUrl: null });
       expect((await sales.agent.get(`${methods}/${crypto}/qr`)).status).toBe(404);
       const trail = await rows<{ action: string }>(env.db, "SELECT action FROM audit_log WHERE entity_type = 'payment_method' AND entity_id = ? ORDER BY id", [String(crypto)]);
       expect(trail.map((a) => a.action)).toEqual(["payment_method.qr_changed", "payment_method.qr_changed", "payment_method.qr_removed"]);
+
+      // A new wallet address takes the old QR code with it.
+      const bep = (await post(manager, methods, { direction: "deposit", kind: "crypto", name: "USDT BEP20", network: "bep20", walletAddress: "0x52908400098527886E0F7030069857D2E4169EE7" })).body;
+      expect((await upload(manager, bep.id, await QRCode.toBuffer("0x52908400098527886e0f7030069857d2e4169ee7", { width: 300 }), "image/png")).body.hasQr).toBe(true);
+      const moved = await patch(manager, `${methods}/${bep.id}`, { walletAddress: "0x1111111111111111111111111111111111111111" });
+      expect(moved.body).toMatchObject({ walletAddress: "0x1111111111111111111111111111111111111111", hasQr: false, qrUrl: null });
+      const audit = await one<{ meta_json: Record<string, unknown> }>(env.db, "SELECT meta_json FROM audit_log WHERE action = 'payment_method.updated' AND entity_id = ? ORDER BY id DESC LIMIT 1", [String(bep.id)]);
+      expect(audit!.meta_json).toMatchObject({ accountChanged: true, qrRemoved: true });
+    });
+
+    it("keeps a payout type's network while clients have accounts saved under it", async () => {
+      const type = (await post(manager, methods, { direction: "withdrawal", kind: "crypto", name: "USDT TRC20", network: "trc20" })).body;
+      expect((await patch(manager, `${methods}/${type.id}`, { name: "USDT BEP20", network: "bep20" })).body).toMatchObject({ network: "bep20" });
+      const clientId = await makeClient();
+      await exec(env.db, "INSERT INTO client_payout_methods (client_id, payment_method_id, method_name, account_number_enc, fingerprint) VALUES (?, ?, 'Mine', ?, ?)", [clientId, type.id, Buffer.from("x"), "f".repeat(64)]);
+      const refused = await patch(manager, `${methods}/${type.id}`, { name: "USDT TRC20", network: "trc20" });
+      expect([refused.status, refused.body.error.message]).toEqual([409, "Clients have accounts saved under this payout type. Add a new type for the other network and disable this one."]);
+      // Other changes are fine.
+      expect((await patch(manager, `${methods}/${type.id}`, { name: "USDT BEP20 (BSC)", isEnabled: false })).body).toMatchObject({ name: "USDT BEP20 (BSC)", isEnabled: false });
     });
   });
 

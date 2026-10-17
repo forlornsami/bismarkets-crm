@@ -11,6 +11,7 @@ import { sha256 } from "../../lib/crypto";
 import { exec, one, rows, transaction, type Conn } from "../../lib/db";
 import { badRequest, conflict, forbidden, handler, notFound, parse, unauthorized } from "../../lib/http";
 import { imageInfo } from "../../lib/images";
+import { qrNamesAddress, readQrText } from "../../lib/qr";
 import { MAX_AMOUNT_MINOR, rateMicros } from "../../money/amounts";
 import { walletOf } from "../../money/ledger";
 import { clientScope, moneyId } from "../../money/review";
@@ -423,14 +424,26 @@ export function staffMoneyRouter(deps: AppDeps): Router {
         if (row.direction === "deposit" && Number(row.open_count) > 0 && changed.some((k) => (ACCOUNT_FIELDS as readonly string[]).includes(k))) {
           throw conflict("Deposits waiting for review were paid to this account. Review them first, or add a new method and disable this one.");
         }
-        await exec(conn, `UPDATE payment_methods SET ${changed.map((k) => `${COLUMNS[k]} = ?`).join(", ")}, updated_by = ? WHERE id = ?`, [
+        // Clients' saved wallets were checked against this network, and their withdrawals are paid on it.
+        if (row.direction === "withdrawal" && changed.includes("network")) {
+          const used = await one<{ n: number }>(
+            conn,
+            `SELECT (SELECT COUNT(*) FROM client_payout_methods WHERE payment_method_id = ? AND deleted_at IS NULL)
+                  + (SELECT COUNT(*) FROM withdrawals WHERE payment_method_id = ? AND status IN ('pending', 'second_approval', 'approved')) AS n`,
+            [methodId, methodId],
+          );
+          if (Number(used?.n ?? 0) > 0) throw conflict("Clients have accounts saved under this payout type. Add a new type for the other network and disable this one.");
+        }
+        // A QR code of the old address would send clients' money there.
+        const qrRemoved = changed.includes("walletAddress") && row.qr_token !== null;
+        await exec(conn, `UPDATE payment_methods SET ${changed.map((k) => `${COLUMNS[k]} = ?`).join(", ")}${qrRemoved ? ", qr_mime = NULL, qr_bytes = NULL, qr_token = NULL" : ""}, updated_by = ? WHERE id = ?`, [
           ...changed.map((k) => (typeof method[k] === "boolean" ? (method[k] ? 1 : 0) : method[k])), staff.id, methodId,
         ]);
         await writeAudit(conn, ctx(req), {
           action: "payment_method.updated", entityType: "payment_method", entityId: methodId,
           before: Object.fromEntries(changed.map((k) => [k, current[k]])),
           after: Object.fromEntries(changed.map((k) => [k, method[k]])),
-          meta: { direction: row.direction, kind: row.kind, name: method.name, accountChanged: changed.some((k) => (ACCOUNT_FIELDS as readonly string[]).includes(k)) },
+          meta: { direction: row.direction, kind: row.kind, name: method.name, accountChanged: changed.some((k) => (ACCOUNT_FIELDS as readonly string[]).includes(k)), ...(qrRemoved ? { qrRemoved } : {}) },
         });
         return loadMethod(conn, methodId);
       });
@@ -458,17 +471,23 @@ export function staffMoneyRouter(deps: AppDeps): Router {
       } catch {
         throw badRequest("This image could not be opened.");
       }
+      // Clients scan the picture, so it must hold the address reviewers check deposits against.
+      const text = await readQrText(png);
+      if (!text) throw badRequest("No QR code could be read in this picture. Upload a clear picture of the QR code alone.");
       const token = randomBytes(16).toString("hex");
       const staff = staffOf(req);
       const updated = await transaction(db, async (conn) => {
         const row = await loadMethod(conn, methodId, true);
         if (row.direction !== "deposit" || row.kind !== "crypto") throw badRequest("Only crypto deposit methods have a QR code.");
+        if (!row.wallet_address || !qrNamesAddress(text, row.wallet_address, row.network === "bep20")) {
+          throw badRequest(`This QR code does not hold the method's wallet address (${row.wallet_address || "none saved"}). Upload the QR code of that address.`);
+        }
         const before = await one<{ qr_bytes: Buffer | null }>(conn, "SELECT qr_bytes FROM payment_methods WHERE id = ?", [methodId]);
         await exec(conn, "UPDATE payment_methods SET qr_mime = 'image/png', qr_bytes = ?, qr_token = ?, updated_by = ? WHERE id = ?", [png, token, staff.id, methodId]);
         await writeAudit(conn, ctx(req), {
           action: "payment_method.qr_changed", entityType: "payment_method", entityId: methodId,
           before: before?.qr_bytes ? { sha256: sha256(before.qr_bytes) } : null,
-          after: { sha256: sha256(png), bytes: png.length, width: info.width, height: info.height },
+          after: { sha256: sha256(png), bytes: png.length, width: info.width, height: info.height, text: text.slice(0, 300) },
           meta: { name: row.name, sent: { type: info.type, bytes: bytes.length, sha256: sha256(bytes) } },
         });
         return loadMethod(conn, methodId);
