@@ -669,6 +669,10 @@ describe.skipIf(!hasDb)("staff withdrawals", () => {
     const cryptoView = await agentA.agent.get(W(w2.id));
     expect(cryptoView.body.network).toBe("TRC20");
     expect(cryptoView.body.warnings).toContainEqual({ tone: "info", text: "Crypto wallets carry no name; check the wallet belongs to the client." });
+    // Saved before the type asked for a QR code.
+    expect(cryptoView.body.warnings).toContainEqual({
+      tone: "warn", text: "USDT TRC20 asks for the wallet's QR code, but this account had none when the client asked. Confirm the address with the client before paying.",
+    });
     expect(cryptoView.body.warnings.some((x: { text: string }) => x.text.startsWith("This client deposited by"))).toBe(false);
     const near = await payoutMethod(clientId, { accountName: "Sara Begum Ahmed", accountNumber: "1111 2222 3333" });
     const w3 = await withdraw(near, 10_000);
@@ -684,6 +688,17 @@ describe.skipIf(!hasDb)("staff withdrawals", () => {
     for (const x of [w, w2, w3]) expect((await reject(agentA, x.id)).status).toBe(200);
   });
 
+  it("keeps review details in the client's activity for withdrawal reviewers only", async () => {
+    const { clientId, payout } = await regular();
+    const w = await withdraw(payout, 10_000);
+    expect((await approve(agentA, w.id, { note: "Called the client" })).body.status).toBe("approved");
+    const entry = async (s: SignedIn) =>
+      ((await s.agent.get(`/api/staff/clients/${clientId}/activity`)).body.items as { action: string; meta: Record<string, unknown> }[]).find((a) => a.action === "withdrawal.approved")!.meta;
+    expect(await entry(agentA)).toMatchObject({ withdrawalId: w.id, reference: w.reference, amountCents: 10_000, stage: "single", internalNote: "Called the client" });
+    expect(await entry(support)).toEqual({ withdrawalId: w.id, reference: w.reference, stage: "single" });
+    expect((await reject(agentA, w.id)).status).toBe(200);
+  });
+
   it("shows the client's QR code only to payout staff, from the review screen, while it is the one they asked with", async () => {
     const clientId = await makeClient();
     await fund(clientId, 100_000, { method: cryptoDeposit });
@@ -694,6 +709,7 @@ describe.skipIf(!hasDb)("staff withdrawals", () => {
     const view = await agentA.agent.get(W(w.id));
     expect(view.body.destination).toMatchObject({ kind: "crypto", network: "TRC20", accountNumber: "TQ7exampleWalletAddress9X3k", hasQr: true, qrUrl: `/api/staff/withdrawals/${w.id}/qr`, full: true });
     expect((await support.agent.get(W(w.id))).body.destination).toMatchObject({ hasQr: true, qrUrl: null, accountNumber: "••••9X3k" });
+    expect(JSON.stringify(view.body.warnings)).not.toContain("QR code");
 
     expect((await agentA.agent.get(`${W(w.id)}/qr`)).status).toBe(403);
     const image = await agentA.agent.get(`${W(w.id)}/qr`).set("X-CRM-Viewer", "1").buffer(true);

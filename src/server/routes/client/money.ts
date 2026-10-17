@@ -41,6 +41,7 @@ const NO_DESTINATION = "Choose where to send the money.";
 const WRONG_CODE = "The code is wrong or has expired. Request a new code.";
 const QR_RULES = "Upload a picture of the QR code: JPG, PNG, WebP, HEIC or GIF, up to 10 MB.";
 const QR_MISSING = "Upload a picture of your wallet's QR code.";
+const QR_KEPT = "This account type needs your wallet's QR code. To change the details, remove this account and add it again with its QR code.";
 const NO_TYPE = "Choose an account type.";
 const IN_USE = "This account is used by a withdrawal in progress. You can change it once that withdrawal is finished.";
 const IN_USE_REMOVE = "This account is used by a withdrawal in progress. You can remove it once that withdrawal is finished.";
@@ -688,6 +689,11 @@ export function clientMoneyRouter(deps: AppDeps): Router {
         const dropQr = !qr && Boolean(before.qr_token) && !keepQr;
         if (qr || dropQr) changed.push("qr");
         if (type.ask_qr && changed.includes("payment_method_id") && !qr) throw fieldError("file_name", QR_MISSING);
+        // A type that asks for the QR code never ends up with changed details and no QR code on file.
+        const hasQr = Boolean(qr) || (Boolean(before.qr_token) && !dropQr);
+        if (type.ask_qr && !hasQr && changed.some((f) => f !== "method_name")) {
+          throw fieldError(changed.includes("account_number") ? "account_number" : "file_name", QR_KEPT);
+        }
         const detailsChanged = changed.some((f) => f !== "method_name");
         // The withdrawal keeps a copy of the account details, but staff see the QR picture from here.
         if (detailsChanged && (await inUse(conn, id))) throw fieldError("method", IN_USE);

@@ -215,6 +215,22 @@ describe.skipIf(!hasDb)("staff deposits", () => {
     expect((await approve(agent2, d.id)).body.status).toBe("approved");
   });
 
+  it("keeps review details in the client's activity for deposit reviewers only", async () => {
+    const clientId = await makeClient();
+    const d = await makeDeposit(clientId, usdBank);
+    await openProof(agent, d.id);
+    expect((await approve(agent, d.id, { note: "Sender confirmed by phone" })).body.status).toBe("approved");
+    const entry = async (s: SignedIn) =>
+      ((await s.agent.get(`/api/staff/clients/${clientId}/activity`)).body.items as { action: string; meta: Record<string, unknown> }[]).find((a) => a.action === "deposit.approved")!.meta;
+    const full = await entry(agent);
+    expect(full).toMatchObject({ depositId: d.id, reference: d.reference, stage: "single", internalNote: "Sender confirmed by phone", checklist: FIRST });
+    // Warnings can name other clients; the review screen shows them only within the reviewer's reach.
+    expect(full).not.toHaveProperty("warnings");
+    expect((await one<{ meta_json: Record<string, unknown> }>(env.db, "SELECT meta_json FROM audit_log WHERE action = 'deposit.approved' AND entity_id = ? ORDER BY id DESC LIMIT 1", [String(clientId)]))!.meta_json).toHaveProperty("warnings");
+    // Support may see the client and its deposits, but not how they were checked.
+    expect(await entry(support)).toEqual({ depositId: d.id, reference: d.reference, stage: "single" });
+  });
+
   it("approves a deposit up to the limit in one step and credits the wallet exactly once", async () => {
     const clientId = await makeClient();
     const d = await makeDeposit(clientId, usdBank, { amountMinor: 125_000 });

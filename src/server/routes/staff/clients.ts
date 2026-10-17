@@ -537,12 +537,29 @@ export function staffClientsRouter(deps: AppDeps): Router {
       );
       // KYC entries can hold internal notes and audit-only reasons. Without kyc.documents only the
       // reason the client was shown is kept.
-      const fullKyc = staffOf(req).permissions.has("kyc.documents");
+      const permissions = staffOf(req).permissions;
+      const fullKyc = permissions.has("kyc.documents");
+      // Money entries hold review details (internal notes, sender details, payout references). They are
+      // kept for the staff who review that kind of request; everyone else sees which request it was.
+      const fullMoney = {
+        deposit: permissions.has("deposit.proof"),
+        withdrawal: permissions.has("withdrawal.view") && (["withdrawal.process", "withdrawal.approve", "withdrawal.reject", "withdrawal.pay"] as const).some((p) => permissions.has(p)),
+      };
       const meta = (a: (typeof list)[number]) => {
-        if (!a.action.startsWith("kyc.") || fullKyc || !a.meta_json || typeof a.meta_json !== "object") return a.meta_json ?? null;
+        if (!a.meta_json || typeof a.meta_json !== "object") return a.meta_json ?? null;
         const m = a.meta_json as Record<string, unknown>;
-        const shown = a.action === "kyc.rejected" || a.action === "kyc.new_document_requested";
-        return { submissionId: m.submissionId, category: m.category, ...(shown ? { reason: m.reason } : {}) };
+        const area = a.action.split(".")[0];
+        if (area === "kyc" && !fullKyc) {
+          const shown = a.action === "kyc.rejected" || a.action === "kyc.new_document_requested";
+          return { submissionId: m.submissionId, category: m.category, ...(shown ? { reason: m.reason } : {}) };
+        }
+        if (area === "deposit" || area === "withdrawal") {
+          // Review warnings can name other clients, which the review screen names only to staff who may see them.
+          const { warnings: _warnings, payoutReferenceAlsoOn: _alsoOn, ...rest } = m;
+          if (fullMoney[area]) return rest;
+          return Object.fromEntries(["depositId", "withdrawalId", "reference", "stage", "reason"].filter((k) => k in m).map((k) => [k, m[k]]));
+        }
+        return m;
       };
       res.json({
         items: list.map((a) => ({ id: a.id, at: a.occurred_at.toISOString(), actorType: a.actor_type, actor: a.actor_label, action: a.action, ip: a.ip, meta: meta(a) })),

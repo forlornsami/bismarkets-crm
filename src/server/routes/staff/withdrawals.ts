@@ -132,6 +132,7 @@ interface Row {
   type_name: string;
   kind: "bank" | "crypto";
   type_network: string;
+  type_ask_qr: number;
   /** Whether the client has another withdrawal that was paid (so this is not their first). */
   paid_before: number;
 }
@@ -142,7 +143,7 @@ const SELECT = `SELECT w.id, w.reference, w.client_id, w.wallet_id, w.payout_met
   w.paid_by, w.paid_at, pb.name AS payer_name, w.payout_reference, DATE_FORMAT(w.paid_on, '%Y-%m-%d') AS paid_on,
   w.decided_by, w.decided_at, dc.name AS decider_name, w.claimed_by, w.claimed_until, cl.name AS claimer_name, w.created_at,
   c.first_name, c.last_name, c.email, c.status AS client_status, c.kyc_status, c.country, c.assigned_staff_id, c.created_at AS client_created_at,
-  pm.name AS type_name, pm.kind, pm.network AS type_network,
+  pm.name AS type_name, pm.kind, pm.network AS type_network, pm.ask_qr AS type_ask_qr,
   EXISTS (SELECT 1 FROM withdrawals p WHERE p.client_id = w.client_id AND p.status = 'paid' AND p.id <> w.id) AS paid_before
   FROM withdrawals w JOIN clients c ON c.id = w.client_id JOIN payment_methods pm ON pm.id = w.payment_method_id
   LEFT JOIN staff_users fr ON fr.id = w.first_reviewed_by LEFT JOIN staff_users ap ON ap.id = w.approved_by LEFT JOIN staff_users pb ON pb.id = w.paid_by
@@ -431,6 +432,9 @@ export function staffWithdrawalsRouter(deps: AppDeps): Router {
     }
     if (d?.qrToken && !qrStillSame(r, d, payout)) {
       warnings.push({ tone: "warn", text: "The client replaced the QR code after asking for this withdrawal, so it is not shown. Pay to the address shown." });
+    } else if (d?.kind === "crypto" && !d.qrToken && r.type_ask_qr) {
+      // An account saved before the type started asking for a QR code.
+      warnings.push({ tone: "warn", text: `${r.type_name} asks for the wallet's QR code, but this account had none when the client asked. Confirm the address with the client before paying.` });
     }
 
     // Staff edits are logged as client.updated (or client.verified_details_changed) with the fields they changed.

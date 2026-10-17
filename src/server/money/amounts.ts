@@ -24,11 +24,15 @@ export function parseAmount(value: unknown): { minor: number } | { problem: Amou
   } else {
     return { problem: "invalid" };
   }
-  const match = /^(\d{1,12})(?:\.(\d+))?$/.exec(text);
+  // Long text is refused before any pattern runs on it, so checking an amount always takes a moment.
+  if (text.length > 32) return { problem: "invalid" };
+  const match = /^(\d{1,12})(?:\.(\d{1,19}))?$/.exec(text);
   if (!match) return { problem: "invalid" };
   const fraction = match[2] ?? "";
   // "12.50" and "12.500" are fine; only digits that carry a value are counted.
-  if (fraction.replace(/0+$/, "").length > 2) return { problem: "decimals" };
+  let significant = fraction.length;
+  while (significant > 0 && fraction[significant - 1] === "0") significant--;
+  if (significant > 2) return { problem: "decimals" };
   const minor = Number(match[1]) * 100 + Number((fraction + "00").slice(0, 2));
   if (minor === 0) return { problem: "zero" };
   if (minor > MAX_AMOUNT_MINOR) return { problem: "too_large" };

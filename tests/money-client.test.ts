@@ -668,10 +668,24 @@ describe.skipIf(!hasDb)("client money API", () => {
     expect((await audits("payout_method.updated", ann.id)).at(-1)).toMatchObject({ id: annTrc, fields: ["qr"] });
     expect(await lastBell(ann.id)).toMatchObject({ title: "A payout account was changed" });
 
-    const moved = await savePayout(ann, { account_number: "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj" }, undefined, annTrc);
-    expect(moved.body.data).toMatchObject({ account_number: "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj", qr_code_url: null });
+    // The type asks for a QR code, so a new address without one is refused (the app's edit form sends none) and nothing changes.
+    expect(errorOf(await savePayout(ann, { account_number: "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj" }, undefined, annTrc), "account_number")).toBe(
+      "This account type needs your wallet's QR code. To change the details, remove this account and add it again with its QR code.",
+    );
+    expect((await api().get(`/api/payout-qr/${token}`)).status).toBe(200);
+    const moved = await savePayout(ann, { account_number: "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj" }, await png("#303030", 300, 300), annTrc);
+    expect(moved.body.data).toMatchObject({ account_number: "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj", qr_code_url: expect.any(String) });
     expect((await audits("payout_method.updated", ann.id)).at(-1)).toMatchObject({ fields: ["account_number", "qr"] });
     expect((await api().get(`/api/payout-qr/${token}`)).status).toBe(404);
+
+    // Under a type that does not ask for one, the old picture goes with the old address.
+    const spare = await savePayout(ann, { payment_method_id: String(m.wBep), method_name: "Spare", account_number: "0x1111111111111111111111111111111111111111", is_default: "0" }, await png("#404040", 300, 300));
+    const spareQr = spare.body.data.qr_code_url.split("/").pop();
+    const spareMoved = await savePayout(ann, { account_number: "0x2222222222222222222222222222222222222222" }, undefined, spare.body.id);
+    expect(spareMoved.body.data).toMatchObject({ account_number: "0x2222222222222222222222222222222222222222", qr_code_url: null });
+    expect((await audits("payout_method.updated", ann.id)).at(-1)).toMatchObject({ fields: ["account_number", "qr"] });
+    expect((await api().get(`/api/payout-qr/${spareQr}`)).status).toBe(404);
+    expect((await api().delete(`/api/user-payment-methods/${spare.body.id}`).set(bearer(ann.token))).status).toBe(200);
   });
 
   it("answers another client's payout account as not found", async () => {

@@ -29,6 +29,15 @@ describe("amounts", () => {
     expect(parseAmount("0.00")).toEqual({ problem: "zero" });
     expect(parseAmount("10000000.01")).toEqual({ problem: "too_large" });
     expect(parseAmount({})).toEqual({ problem: "invalid" });
+    expect(parseAmount("12.5000000000000000000")).toEqual({ minor: 1250 });
+    expect(parseAmount("12.50000000000000000000")).toEqual({ problem: "invalid" });
+  });
+
+  it("answers at once however long the amount text is", () => {
+    const started = performance.now();
+    expect(parseAmount(`1.${"0".repeat(200_000)}1`)).toEqual({ problem: "invalid" });
+    expect(parseAmount(`${"1".repeat(200_000)}`)).toEqual({ problem: "invalid" });
+    expect(performance.now() - started).toBeLessThan(50);
   });
 
   it("converts rupees to US cents rounding down, and back rounding up", () => {
