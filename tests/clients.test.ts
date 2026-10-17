@@ -124,6 +124,13 @@ describe.skipIf(!hasDb)("client portal API", () => {
     expect(pic.status).toBe(200);
     expect(pic.headers["cross-origin-resource-policy"]).toBe("cross-origin");
     expect((await api().get(path.replace(/v=.*/, "v=0000000000000000"))).status).toBe(404);
+    // Staff see the same picture in the CRM.
+    const listed = (await boss.agent.get("/api/staff/clients?q=ali@client.test")).body.items[0];
+    expect(listed.pictureUrl).toBe(path);
+    const forStaff = await boss.agent.get(listed.pictureUrl);
+    expect(forStaff.status).toBe(200);
+    expect(forStaff.headers["content-type"]).toBe("image/png");
+    expect((await boss.agent.get(`/api/staff/clients/${listed.id}`)).body.pictureUrl).toBe(path);
     const svg = await api().post("/api/user/profile-picture").set(auth).attach("image", Buffer.from("<svg/>"), { filename: "x.svg", contentType: "image/svg+xml" });
     expect(svg.status).toBe(422);
   });

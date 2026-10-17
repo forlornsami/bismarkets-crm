@@ -4,14 +4,14 @@ import { useEffect, useRef, useState } from "react";
 import { Link, useLocation } from "wouter";
 import { DataGrid, gridQuery, type Column, type GridState } from "../components/DataGrid";
 import { DocumentViewer, ReviewDecision, ReviewLayout, Waiting, Warnings, type ReviewWarning } from "../components/ReviewWorkbench";
-import { Badge, Dialog, ErrorText, Field, PageHeader, Spinner, useFeedback } from "../components/ui";
+import { Avatar, Badge, Dialog, ErrorText, Field, PageHeader, Spinner, useFeedback } from "../components/ui";
 import { ApiError, api, formatDate, qs, type Page } from "../lib/api";
 import { KYC_TYPES } from "../../shared/kyc-types";
 import { useCan, useSession } from "../lib/session";
 
 export interface KycSubmission {
   id: number;
-  client: { id: number; name: string; email: string; country: string | null };
+  client: { id: number; name: string; email: string; country: string | null; pictureUrl: string | null };
   category: "identity" | "address";
   categoryLabel: string;
   documentType: string;
@@ -97,6 +97,7 @@ const columns: Column<KycSubmission>[] = [
     header: "Client",
     render: (s) => (
       <span className="cell-person">
+        <Avatar name={s.client.name} src={s.client.pictureUrl} />
         <span>
           <strong>{s.client.name}</strong>
           <small>
@@ -392,6 +393,10 @@ export function KycWorkbench({ id }: { id: string }) {
       side={
         <>
           <h3 className="flush">Compare with what the client entered</h3>
+          <div className="review-person">
+            <Avatar name={d.client.name} src={d.client.pictureUrl} xl />
+            <small className="muted">{d.client.pictureUrl ? "Profile picture the client uploaded" : "No profile picture"}</small>
+          </div>
           <dl className="details details-tight">
             <dt>Name</dt>
             <dd>

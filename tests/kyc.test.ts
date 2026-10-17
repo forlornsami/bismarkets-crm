@@ -106,6 +106,7 @@ describe.skipIf(!hasDb)("KYC", () => {
     const detail = await reviewer.agent.get(`/api/staff/kyc/${identity.id}`);
     expect(detail.body.files).toHaveLength(2);
     expect(detail.body.profile).toMatchObject({ name: "Kay Doe", dob: "1990-04-02" });
+    expect(detail.body.client).toHaveProperty("pictureUrl", null);
     const file = await reviewer.agent.get(detail.body.files[0].url);
     expect(file.headers["content-type"]).toBe("image/png");
     expect(file.headers["content-security-policy"]).toContain("sandbox");

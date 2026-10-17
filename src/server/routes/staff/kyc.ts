@@ -2,7 +2,7 @@ import express, { Router, type Request } from "express";
 import { z } from "zod";
 import type { AppDeps } from "../../app";
 import { KYC_CHECKLIST, KYC_MAX_BYTES, KYC_REJECT_REASONS, KYC_TYPES, kycDocumentContext, latestSubmissions, overallStatus, parseKycUpload, storeSubmission, subTypeOf, type KycCategory } from "../../clients/kyc";
-import { clientName } from "../../clients/model";
+import { clientName, clientPictureUrl } from "../../clients/model";
 import { auditContext, writeAudit } from "../../lib/audit";
 import { decryptBytes, sha256 } from "../../lib/crypto";
 import { exec, one, rows, transaction } from "../../lib/db";
@@ -41,18 +41,20 @@ interface Row {
   last_name: string;
   email: string;
   country: string | null;
+  picture_sha: string | null;
   documents: number;
 }
 
 const SELECT = `SELECT s.id, s.client_id, s.category, s.sub_type, s.source, s.uploaded_by, up.name AS uploader_name, s.staff_note, s.status, s.reject_reason, s.submitted_at, s.decided_at,
-  u.name AS decider_name, s.claimed_by, s.claimed_until, cl.name AS claimer_name, c.first_name, c.last_name, c.email, c.country,
+  u.name AS decider_name, s.claimed_by, s.claimed_until, cl.name AS claimer_name, c.first_name, c.last_name, c.email, c.country, pp.sha256 AS picture_sha,
   (SELECT COUNT(*) FROM kyc_documents d WHERE d.submission_id = s.id) AS documents
   FROM kyc_submissions s JOIN clients c ON c.id = s.client_id LEFT JOIN staff_users u ON u.id = s.decided_by LEFT JOIN staff_users cl ON cl.id = s.claimed_by
-  LEFT JOIN staff_users up ON up.id = s.uploaded_by`;
+  LEFT JOIN staff_users up ON up.id = s.uploaded_by
+  LEFT JOIN profile_pictures pp ON pp.owner_type = 'client' AND pp.owner_id = s.client_id`;
 
 const present = (r: Row) => ({
   id: r.id,
-  client: { id: r.client_id, name: clientName(r), email: r.email, country: r.country },
+  client: { id: r.client_id, name: clientName(r), email: r.email, country: r.country, pictureUrl: clientPictureUrl("", r.client_id, r.picture_sha) },
   category: r.category,
   categoryLabel: KYC_TYPES[r.category].label,
   documentType: subTypeOf(r.category, r.sub_type)?.name ?? `Type ${r.sub_type}`,
