@@ -35,8 +35,8 @@ const columns: Column<StaffMember>[] = [
   { key: "role", header: "Role", render: (s) => s.role.name },
   { key: "status", header: "Status", render: (s) => <StatusBadge s={s} /> },
   { key: "2fa", header: "2FA", render: (s) => (s.twoFactorEnabled ? <Badge tone="good">On</Badge> : <Badge tone="warn">Not set up</Badge>) },
-  { key: "last_login_at", header: "Last sign-in", sortable: true, render: (s) => formatDate(s.lastLoginAt) },
-  { key: "created_at", header: "Created", sortable: true, render: (s) => formatDate(s.createdAt) },
+  { key: "last_login_at", header: "Last sign-in", sortable: true, optional: true, render: (s) => formatDate(s.lastLoginAt) },
+  { key: "created_at", header: "Created", sortable: true, optional: true, render: (s) => formatDate(s.createdAt) },
 ];
 
 export function StaffList() {

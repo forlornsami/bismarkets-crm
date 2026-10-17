@@ -192,7 +192,7 @@ export function ReviewDecision(props: ReviewDecisionProps) {
     <div className="review-decision">
       <div className="card-head">
         <h3 className="flush">Before you decide</h3>
-        <button type="button" className="button button-ghost button-small" onClick={() => setHelp(true)} title="Keyboard shortcuts (?)">
+        <button type="button" className="button button-ghost button-small shortcut-hint" onClick={() => setHelp(true)} title="Keyboard shortcuts (?)">
           <Keyboard size={15} /> Shortcuts
         </button>
       </div>
@@ -259,7 +259,9 @@ export function ReviewDecision(props: ReviewDecisionProps) {
               </button>
             )}
           </div>
-          {!allTicked && canDecide && <p className="muted tight">Tick every check to approve, or press C to tick them all after checking.</p>}
+          {!allTicked && canDecide && <p className="muted tight">
+              Tick every check to approve<span className="shortcut-hint">, or press C to tick them all after checking</span>.
+            </p>}
         </div>
       )}
       <Dialog open={help} title="Keyboard shortcuts" onClose={() => setHelp(false)}>

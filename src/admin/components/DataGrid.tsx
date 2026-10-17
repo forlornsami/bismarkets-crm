@@ -1,5 +1,5 @@
-import { ArrowDown, ArrowUp, ArrowUpDown, ChevronLeft, ChevronRight, Inbox, Search, X } from "lucide-react";
-import type { ReactNode } from "react";
+import { ArrowDown, ArrowUp, ArrowUpDown, ChevronLeft, ChevronRight, Inbox, Search, SlidersHorizontal, X } from "lucide-react";
+import { useState, type ReactNode } from "react";
 import { EmptyState } from "./ui";
 
 export interface Column<T> {
@@ -8,6 +8,8 @@ export interface Column<T> {
   render: (row: T) => ReactNode;
   sortable?: boolean;
   width?: string;
+  /** Left out on tablets and small laptops, where every column would not fit. Phones show it on the card. */
+  optional?: boolean;
 }
 
 export interface FilterOption {
@@ -48,6 +50,9 @@ interface Props<T> {
   emptyText?: string;
 }
 
+const sortWords = (key: string) =>
+  /_at$/.test(key) ? ["newest first", "oldest first"] : key === "id" ? ["highest first", "lowest first"] : ["Z to A", "A to Z"];
+
 /** Server-side grid: search, dropdown filters, sortable headers and pagination all round-trip to the API. */
 export function DataGrid<T>(props: Props<T>) {
   const { columns, rows, total, pages, state, onChange, rowKey, onRowClick, filters = [], loading, error } = props;
@@ -56,6 +61,9 @@ export function DataGrid<T>(props: Props<T>) {
   const first = total === 0 ? 0 : (state.page - 1) * state.pageSize + 1;
   const last = Math.min(total, state.page * state.pageSize);
   const filtered = Boolean(state.q) || Object.values(state.filters).some(Boolean);
+  // On phones a long row of dropdowns would fill the screen, so they fold behind one button.
+  const [showFilters, setShowFilters] = useState(false);
+  const activeFilters = Object.values(state.filters).filter(Boolean).length;
 
   return (
     <div className="grid">
@@ -80,10 +88,15 @@ export function DataGrid<T>(props: Props<T>) {
             />
           </span>
         )}
+        {filters.length > 2 && (
+          <button type="button" className="button button-small mobile-only filters-toggle" aria-expanded={showFilters} onClick={() => setShowFilters(!showFilters)}>
+            <SlidersHorizontal size={14} /> Filters{activeFilters ? ` (${activeFilters})` : ""}
+          </button>
+        )}
         {filters.map((f) => (
           <select
             key={f.key}
-            className="input input-small filter-chip"
+            className={filters.length > 2 && !showFilters ? "input input-small filter-chip folded" : "input input-small filter-chip"}
             aria-label={f.label}
             value={state.filters[f.key] ?? ""}
             onChange={(e) => set({ filters: { ...state.filters, [f.key]: e.target.value } })}
@@ -101,6 +114,29 @@ export function DataGrid<T>(props: Props<T>) {
             <X size={14} /> Clear
           </button>
         )}
+        {columns.some((c) => c.sortable) && (
+          // Phones show rows as cards without column headers, so sorting moves here.
+          <select
+            className="input input-small filter-chip mobile-only"
+            aria-label="Sort by"
+            value={`${state.sort ?? ""}:${state.dir ?? "desc"}`}
+            onChange={(e) => {
+              const [sort, dir] = e.target.value.split(":");
+              set({ sort, dir: dir as "asc" | "desc" });
+            }}
+          >
+            {columns
+              .filter((c) => c.sortable)
+              .flatMap((c) => [
+                <option key={`${c.key}:desc`} value={`${c.key}:desc`}>
+                  {c.header}: {sortWords(c.key)[0]}
+                </option>,
+                <option key={`${c.key}:asc`} value={`${c.key}:asc`}>
+                  {c.header}: {sortWords(c.key)[1]}
+                </option>,
+              ])}
+          </select>
+        )}
         <div className="grid-toolbar-end">{props.toolbar}</div>
       </div>
       {Boolean(error) && (
@@ -113,7 +149,7 @@ export function DataGrid<T>(props: Props<T>) {
           <thead>
             <tr>
               {columns.map((c) => (
-                <th key={c.key} style={c.width ? { width: c.width } : undefined} aria-sort={c.sortable && state.sort === c.key ? (state.dir === "asc" ? "ascending" : "descending") : undefined}>
+                <th key={c.key} className={c.optional ? "col-optional" : undefined} style={c.width ? { width: c.width } : undefined} aria-sort={c.sortable && state.sort === c.key ? (state.dir === "asc" ? "ascending" : "descending") : undefined}>
                   {c.sortable ? (
                     <button type="button" className="sort-button" onClick={() => sortBy(c.key)}>
                       {c.header}
@@ -139,7 +175,9 @@ export function DataGrid<T>(props: Props<T>) {
                   aria-expanded={props.expanded ? Boolean(extra) : undefined}
                 >
                   {columns.map((c) => (
-                    <td key={c.key}>{c.render(row)}</td>
+                    <td key={c.key} data-label={c.header} className={c.optional ? "col-optional" : undefined}>
+                      {c.render(row)}
+                    </td>
                   ))}
                 </tr>,
                 extra ? (
@@ -163,7 +201,7 @@ export function DataGrid<T>(props: Props<T>) {
               Array.from({ length: 6 }, (_, i) => (
                 <tr key={`sk-${i}`}>
                   {columns.map((c) => (
-                    <td key={c.key}>
+                    <td key={c.key} className={c.optional ? "col-optional" : undefined}>
                       <span className="skeleton" style={{ width: `${50 + ((i * 17 + c.key.length * 7) % 40)}%` }} />
                     </td>
                   ))}

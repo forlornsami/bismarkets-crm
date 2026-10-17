@@ -20,6 +20,7 @@ import {
   AtSign,
   Send,
   Wallet,
+  X,
   type LucideIcon,
 } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
@@ -102,6 +103,17 @@ export function Layout({ children, onSignedOut }: { children: ReactNode; onSigne
   const [collapsed, setCollapsed] = useState(readCollapsed);
   const [navOpen, setNavOpen] = useState(false);
   useEffect(() => setNavOpen(false), [location]);
+  // On phones the open menu covers the page: Escape closes it and the page behind does not scroll.
+  useEffect(() => {
+    if (!navOpen) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setNavOpen(false);
+    document.addEventListener("keydown", onKey);
+    document.body.classList.add("no-scroll");
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.body.classList.remove("no-scroll");
+    };
+  }, [navOpen]);
 
   const toggleCollapsed = () => {
     setCollapsed(!collapsed);
@@ -124,6 +136,9 @@ export function Layout({ children, onSignedOut }: { children: ReactNode; onSigne
             <img className="sidebar-logo" src={logo} alt="BIS CRM" />
             <img className="sidebar-mark" src="/brand/mark.png" alt="BIS CRM" />
           </Link>
+          <button type="button" className="icon-button menu-close" aria-label="Close menu" onClick={() => setNavOpen(false)}>
+            <X size={20} />
+          </button>
         </div>
         <nav className="sidebar-nav">
           {NAV.map((s) => {
@@ -174,7 +189,9 @@ export function Layout({ children, onSignedOut }: { children: ReactNode; onSigne
             <span>{current?.label ?? ""}</span>
           </div>
           <div className="topbar-spacer" />
-          <ThemeSwitch />
+          <span className="topbar-theme">
+            <ThemeSwitch />
+          </span>
           <UserMenu onSignedOut={onSignedOut} />
         </header>
         <main className="content">{children}</main>
@@ -220,6 +237,10 @@ function UserMenu({ onSignedOut }: { onSignedOut: () => void }) {
           <Link href="/account" className="menu-item" role="menuitem">
             <UserRound size={16} /> My account
           </Link>
+          <div className="menu-theme">
+            <span>Theme</span>
+            <ThemeSwitch />
+          </div>
           <div className="menu-sep" />
           <button
             type="button"

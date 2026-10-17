@@ -4,12 +4,22 @@ import { useState } from "react";
 import { DataGrid, gridQuery, type Column, type GridState } from "../components/DataGrid";
 import { Badge, ErrorText, PageHeader, Spinner, useFeedback } from "../components/ui";
 import { api, formatDate, qs, requestStepUp, type AuditItem, type Page } from "../lib/api";
+import { actionLabel } from "../lib/audit-labels";
 import { useCan } from "../lib/session";
 
 const columns: Column<AuditItem>[] = [
   { key: "time", header: "When", render: (a) => formatDate(a.occurredAt), width: "170px" },
   { key: "actor", header: "Who", render: (a) => (a.actor.type === "staff" ? <strong>{a.actor.label}</strong> : <Badge tone="neutral">{`${a.actor.type}${a.actor.label ? `: ${a.actor.label}` : ""}`}</Badge>) },
-  { key: "action", header: "Action", render: (a) => <code className="audit-action">{a.action}</code> },
+  {
+    key: "action",
+    header: "Action",
+    render: (a) => (
+      <span className="stack-tight">
+        <span>{actionLabel(a.action)}</span>
+        <code className="audit-action">{a.action}</code>
+      </span>
+    ),
+  },
   { key: "entity", header: "Record", render: (a) => (a.entity.type ? `${a.entity.type} #${a.entity.id}` : "") },
   { key: "ip", header: "IP", render: (a) => <span className="muted">{a.ip}</span> },
 ];
@@ -140,7 +150,7 @@ export function AuditLog() {
             label: "Action",
             options: [
               ...actionPrefixes.map((p) => ({ value: p, label: `All ${p.slice(0, -1)} actions` })),
-              ...(actions.data?.items ?? []).map((a) => ({ value: a, label: a })),
+              ...(actions.data?.items ?? []).map((a) => ({ value: a, label: actionLabel(a) })),
             ],
           },
           { key: "actorType", label: "Actor", options: [{ value: "staff", label: "Staff" }, { value: "client", label: "Client" }, { value: "system", label: "System" }] },

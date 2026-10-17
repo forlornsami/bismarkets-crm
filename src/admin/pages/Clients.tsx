@@ -26,6 +26,7 @@ import { Avatar, Badge, Dialog, EmptyState, ErrorText, Field, PageHeader, Spinne
 import { api, formatDate, qs, type Page } from "../lib/api";
 import { useCan, useSession } from "../lib/session";
 import { COUNTRIES } from "../../shared/countries";
+import { actionLabel } from "../lib/audit-labels";
 import { OutboxGrid } from "./Emails";
 import { ClientKyc, KycStatusBadge } from "./Kyc";
 
@@ -107,13 +108,13 @@ const columns: Column<Client>[] = [
       </span>
     ),
   },
-  { key: "id", header: "Client ID", sortable: true, render: (c) => <span className="mono">{c.id}</span> },
+  { key: "id", header: "Client ID", sortable: true, optional: true, render: (c) => <span className="mono">{c.id}</span> },
   { key: "country", header: "Country", render: (c) => c.country ?? <span className="muted">Not given</span> },
   { key: "status", header: "Status", render: (c) => <ClientStatus c={c} /> },
   { key: "kyc", header: "KYC", render: (c) => <KycStatusBadge status={c.kycStatus} /> },
   { key: "assigned", header: "Assigned to", render: (c) => c.assigned?.name ?? <span className="muted">Nobody</span> },
   { key: "created_at", header: "Joined", sortable: true, render: (c) => formatDate(c.createdAt) },
-  { key: "last_login_at", header: "Last sign-in", sortable: true, render: (c) => formatDate(c.lastLoginAt) },
+  { key: "last_login_at", header: "Last sign-in", sortable: true, optional: true, render: (c) => formatDate(c.lastLoginAt) },
 ];
 
 const useSummary = () => useQuery({ queryKey: ["clients-summary"], queryFn: () => api.get<Summary>("/api/staff/clients/summary") });
@@ -124,7 +125,8 @@ export function ClientsList() {
   const [, navigate] = useLocation();
   const summary = useSummary();
   const [state, setState] = useState<GridState>({ page: 1, pageSize: 25, sort: "created_at", dir: "desc", filters: {} });
-  const [creating, setCreating] = useState(false);
+  // The dashboard's "Add a client" shortcut opens the form straight away.
+  const [creating, setCreating] = useState(() => new URLSearchParams(window.location.search).get("new") === "1");
   const list = useQuery({
     queryKey: ["clients", state],
     queryFn: () => api.get<Page<Client>>(`/api/staff/clients${qs(gridQuery(state))}`),
@@ -318,45 +320,6 @@ interface Revealed {
   dob: string | null;
 }
 
-const ACTION_LABEL: Record<string, string> = {
-  "client.registered": "Signed up in the client portal",
-  "client.created": "Added by staff",
-  "client.login": "Signed in",
-  "client.login_failed": "Wrong password",
-  "client.locked": "Locked after failed sign-ins",
-  "client.logout": "Signed out",
-  "client.profile_updated": "Updated their profile",
-  "client.picture_updated": "Changed their picture",
-  "client.picture_removed": "Picture removed by staff",
-  "client.email_changed": "Changed their email",
-  "client.password_reset_requested": "Asked for a password reset",
-  "client.password_reset": "Reset their password",
-  "client.password_reset_sent": "Password reset link sent by staff",
-  "client.updated": "Profile edited by staff",
-  "client.assigned": "Account manager changed",
-  "client.frozen": "Account frozen",
-  "client.closed": "Account closed",
-  "client.reactivated": "Account reactivated",
-  "client.unlocked": "Unlocked by staff",
-  "client.sessions_revoked": "Signed out everywhere by staff",
-  "client.note_added": "Note added",
-  "client.pii_revealed": "Personal details viewed by staff",
-  "client.impersonation_started": "Staff opened the portal as this client",
-  "client.impersonation_ended": "Staff view of the portal ended",
-  "client.picture_removed_by_client": "Removed their picture",
-  "kyc.submitted": "Sent documents for verification",
-  "kyc.viewed": "KYC submission opened by staff",
-  "kyc.document_viewed": "KYC document viewed by staff",
-  "kyc.approved": "KYC document approved",
-  "kyc.rejected": "KYC document rejected",
-  "kyc.new_document_requested": "Approval withdrawn, new document requested",
-  "kyc.decision_changed": "KYC decision changed",
-  "kyc.uploaded_by_staff": "KYC document uploaded by staff for the client",
-  "kyc.approved_without_documents": "KYC approved without documents",
-  "kyc.review_taken_over": "KYC review taken over by another reviewer",
-  "client.device_signed_out": "Signed a device out",
-  "client.other_devices_signed_out": "Signed out all other devices",
-};
 
 function CountrySelect({ value, onChange }: { value: string; onChange: (country: string, dial: string) => void }) {
   const known = COUNTRIES.some((c) => c.name === value);
@@ -750,7 +713,7 @@ function ActivityPanel({ id }: { id: string }) {
       <ol className="timeline">
         {activity.data?.items.map((a) => (
           <li key={a.id} className={a.actorType === "staff" ? "by-staff" : ""}>
-            <strong>{ACTION_LABEL[a.action] ?? a.action}</strong>
+            <strong>{actionLabel(a.action)}</strong>
             <small className="muted">
               {formatDate(a.at)} · {a.actorType === "staff" ? `by ${a.actor}` : a.actorType === "client" ? "by the client" : "system"}
               {a.ip ? ` · ${a.ip}` : ""}

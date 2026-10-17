@@ -1,7 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
-import { ArrowDownToLine, ArrowRight, ArrowUpFromLine, BadgeCheck, Check, Clock, KeyRound, Network, ShieldCheck, Users, UserCog, Wallet } from "lucide-react";
+import { ArrowDownToLine, ArrowRight, ArrowUpFromLine, BadgeCheck, Check, Clock, KeyRound, Mail, Network, ShieldCheck, UserPlus, Users, UserCog, Wallet } from "lucide-react";
 import { Link } from "wouter";
 import { PageHeader } from "../components/ui";
+import { useKycSummary } from "./Kyc";
 import { api, type Page, type StaffMember } from "../lib/api";
 import { useCan, useSession } from "../lib/session";
 
@@ -11,7 +12,6 @@ const greeting = () => {
 };
 
 const UPCOMING = [
-  { icon: BadgeCheck, label: "KYC review", phase: "Phase 2" },
   { icon: ArrowDownToLine, label: "Deposits", phase: "Phase 3" },
   { icon: ArrowUpFromLine, label: "Withdrawals", phase: "Phase 3" },
   { icon: Wallet, label: "MT5 accounts", phase: "Phase 3" },
@@ -41,13 +41,28 @@ export function Dashboard() {
     queryFn: () => api.get<{ total: number; newThisWeek: number; newToday: number }>("/api/staff/clients/summary"),
     enabled: can("client.view"),
   });
+  const kyc = useKycSummary(can("kyc.view"));
+  const kycWaiting = kyc.data?.pending;
   const show = (n: number | undefined) => (n === undefined ? "–" : n.toLocaleString());
 
   return (
     <>
-      <PageHeader title={`${greeting()}, ${session.staff.name.split(" ")[0]}`} description="Here is how the CRM looks today. Client, money, MT5 and IB modules switch on as each build phase ships." />
-      {(can("staff.view") || can("client.view")) && (
+      <PageHeader title={`${greeting()}, ${session.staff.name.split(" ")[0]}`} description="What needs attention today, and shortcuts to the work you do most." />
+      <QuickActions />
+      {(can("staff.view") || can("client.view") || can("kyc.view")) && (
         <div className="tiles">
+          {can("kyc.view") && (
+            <Link href="/kyc" className="tile tile-button">
+              <span className={kycWaiting ? "tile-icon warn" : "tile-icon good"}>
+                <BadgeCheck size={20} />
+              </span>
+              <div>
+                <div className="tile-label">KYC waiting for review</div>
+                <div className="tile-value">{show(kycWaiting)}</div>
+                <div className="tile-foot">{kycWaiting ? "Open the queue to review" : "Nothing waiting"}</div>
+              </div>
+            </Link>
+          )}
           {can("client.view") && (
             <Link href="/clients" className="tile tile-button">
               <span className="tile-icon">
@@ -156,5 +171,27 @@ export function Dashboard() {
         </section>
       </div>
     </>
+  );
+}
+
+/** The everyday jobs, one tap away (big buttons, so they work on a phone too). */
+function QuickActions() {
+  const can = useCan();
+  const items = [
+    can("kyc.view") && { href: "/kyc", icon: BadgeCheck, label: "Review KYC" },
+    can("client.view") && { href: "/clients", icon: Users, label: "Find a client" },
+    can("client.create") && { href: "/clients?new=1", icon: UserPlus, label: "Add a client" },
+    can("comms.send") && { href: "/messages/new", icon: Mail, label: "Send an email" },
+  ].filter(Boolean) as { href: string; icon: typeof Users; label: string }[];
+  if (!items.length) return null;
+  return (
+    <nav className="quick-actions" aria-label="Quick actions">
+      {items.map(({ href, icon: Icon, label }) => (
+        <Link key={href} href={href} className="quick-action">
+          <Icon size={18} />
+          <span>{label}</span>
+        </Link>
+      ))}
+    </nav>
   );
 }
