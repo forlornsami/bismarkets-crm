@@ -391,6 +391,10 @@ describe.skipIf(!hasDb)("staff deposits", () => {
     const waiting = await makeDeposit(clientId, pkrBank, { currency: "PKR", amountMinor: 2_800_000 });
     expect((await reject(agent, waiting.id, "See https://example.com")).status).toBe(400);
     expect((await reject(agent, waiting.id, "No")).status).toBe(400);
+    // The app shows a reason as written only up to 240 characters and without words it takes for error text.
+    const reasonError = async (reason: string) => (await reject(agent, waiting.id, reason)).body.error.details[0].message;
+    expect(await reasonError(`${DEPOSIT_REJECT_REASONS[0]} ${"Please send the full statement page. ".repeat(4)}`)).toBe("Keep the reason to 240 characters; the app shows no more.");
+    expect(await reasonError("We cannot make an exception for third-party payments.")).toBe('Reword the reason: the app hides reasons with words like "exception" or text like "at Bank(".');
     const rejected = await reject(agent, waiting.id, DEPOSIT_REJECT_REASONS[0]);
     expect(rejected.body).toMatchObject({ status: "rejected", rejectReason: DEPOSIT_REJECT_REASONS[0], decidedBy: { id: agent.staffId }, stage: null });
     expect((await reject(agent, waiting.id)).body.error.message).toBe("This deposit was already rejected by agent.");

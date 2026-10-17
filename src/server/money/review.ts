@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { NOT_PLAIN, type ChecklistItem } from "@shared/money";
+import { moneyReasonProblem, NOT_PLAIN, type ChecklistItem } from "@shared/money";
 import { exec, one, type Conn } from "../lib/db";
 import { badRequest } from "../lib/http";
 import type { StaffContext } from "../staff/session";
@@ -9,13 +9,16 @@ import type { StaffContext } from "../staff/session";
 export const moneyId = z.coerce.number().int().positive();
 
 const PLAIN_MESSAGE = "Write the reason as plain text, without links or symbols like < > { }";
-/** A reason the client reads exactly as written. */
+/** A reason the client reads exactly as written, in the portal and the app. */
 export const reasonText = z
   .string({ required_error: "Write a short reason for the client" })
   .trim()
   .min(5, "Write a short reason (at least 5 characters)")
-  .max(500)
-  .refine((v) => !NOT_PLAIN.test(v), PLAIN_MESSAGE);
+  .refine((v) => !NOT_PLAIN.test(v), PLAIN_MESSAGE)
+  .superRefine((v, ctx) => {
+    const problem = moneyReasonProblem(v);
+    if (problem) ctx.addIssue({ code: z.ZodIssueCode.custom, message: problem });
+  });
 
 /** A note for colleagues, kept on the item and in the audit log. The client never sees it. */
 export const internalNote = z

@@ -665,6 +665,8 @@ export interface ReviewDecisionProps {
   approveLabel?: string;
   /** Opens the rejection with this reason filled in; each new `key` opens it again. */
   rejectWith?: { reason: string; key: number } | null;
+  /** Extra rules for the reason, such as what the app can show. */
+  reasonRule?: (reason: string) => string | null;
   onApprove: (ticked: string[], internalNote?: string) => void;
   onReject: (reason: string, ticked: string[], internalNote?: string) => void;
   onSkip?: () => void;
@@ -711,7 +713,7 @@ export function ReviewDecision(props: ReviewDecisionProps) {
   const mayApprove = canDecide && !props.approveBlocked && unopened.length === 0 && !props.approveHint && !noteMissing;
   const mayReject = canDecide && !props.rejectBlocked;
   const noteProblem = plainProblem(note, "note");
-  const reasonProblem = plainProblem(reason, "reason");
+  const reasonProblem = plainProblem(reason, "reason") ?? props.reasonRule?.(reason) ?? null;
   const toggle = (key: string) => setTicked((t) => (t.includes(key) ? t.filter((k) => k !== key) : [...t, key]));
   const approve = () => allTicked && !busy && mayApprove && !noteProblem && props.onApprove(ticked, internalNote);
   const reject = () => reason.trim().length >= 5 && !reasonProblem && !noteProblem && !busy && mayReject && props.onReject(reason.trim(), ticked, internalNote);

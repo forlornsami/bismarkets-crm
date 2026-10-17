@@ -40,7 +40,7 @@ import { DocumentViewer, ReviewDecision, ReviewLayout, Waiting, Warnings, type R
 import { Badge, ErrorText, Field, PageHeader, Spinner, useFeedback } from "../components/ui";
 import { ApiError, api, formatDate, qs, type Page } from "../lib/api";
 import { useCan, useSession } from "../lib/session";
-import { DEPOSIT_CHECKLIST, DEPOSIT_REJECT_REASONS, type ChecklistItem, type DepositStatus } from "../../shared/money";
+import { DEPOSIT_CHECKLIST, DEPOSIT_REJECT_REASONS, moneyReasonProblem, type ChecklistItem, type DepositStatus } from "../../shared/money";
 import { ClientStatus } from "./Clients";
 import { KycStatusBadge } from "./Kyc";
 
@@ -700,6 +700,7 @@ export function DepositWorkbench({ id }: { id: string }) {
                 </>
               )}
               <ReviewDecision
+                reasonRule={moneyReasonProblem}
                 resetKey={sid}
                 checklist={stage === "second" ? lists.second : lists.first}
                 reasons={reasons}

@@ -80,3 +80,18 @@ export const WITHDRAWAL_REJECT_REASONS = [
 
 /** A reason or note written by staff: plain text only, as the portal shows reasons as written. */
 export const NOT_PLAIN = /[<>{}`\\]|https?:|\bwww\./i;
+
+/**
+ * The app shows a deposit or withdrawal reason only up to this length, and replaces one that
+ * looks like error text with a generic line, so reasons are kept within both.
+ */
+export const MONEY_REASON_MAX = 240;
+const APP_HIDES = /stack trace|sqlstate|exception|\bat \S+\(/i;
+
+/** Why the client would not see this reason as written, or null. */
+export function moneyReasonProblem(reason: string): string | null {
+  const text = reason.trim();
+  if (text.length > MONEY_REASON_MAX) return `Keep the reason to ${MONEY_REASON_MAX} characters; the app shows no more.`;
+  if (APP_HIDES.test(text)) return 'Reword the reason: the app hides reasons with words like "exception" or text like "at Bank(".';
+  return null;
+}

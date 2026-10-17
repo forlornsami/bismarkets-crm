@@ -34,7 +34,7 @@ import { DocumentViewer, ReviewDecision, ReviewLayout, Waiting, Warnings, type R
 import { Badge, ErrorText, Field, PageHeader, Spinner, useFeedback } from "../components/ui";
 import { ApiError, api, formatDate, qs, type Page } from "../lib/api";
 import { useCan, useSession } from "../lib/session";
-import { WITHDRAWAL_CHECKLIST, WITHDRAWAL_REJECT_REASONS, type ChecklistItem, type WithdrawalStatus } from "../../shared/money";
+import { moneyReasonProblem, WITHDRAWAL_CHECKLIST, WITHDRAWAL_REJECT_REASONS, type ChecklistItem, type WithdrawalStatus } from "../../shared/money";
 import { ClientStatus } from "./Clients";
 import { KycStatusBadge } from "./Kyc";
 
@@ -657,6 +657,7 @@ export function WithdrawalWorkbench({ id }: { id: string }) {
                 </fieldset>
               )}
               <ReviewDecision
+                reasonRule={moneyReasonProblem}
                 resetKey={sid}
                 checklist={checklist}
                 reasons={reasons}
