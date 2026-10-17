@@ -279,13 +279,21 @@ export function staffWithdrawalsRouter(deps: AppDeps): Router {
 
   /**
    * Lock order for every change: the client row, then the wallet, then the
-   * withdrawal. The client id is read first, outside the transaction: it never changes.
+   * withdrawal. The client id is read first, before the transaction starts (it
+   * never changes): read inside it, the read would fix the snapshot before the
+   * locks are taken, and read through the pool, a transaction would wait for a
+   * second connection while holding one, which hangs the server once every
+   * connection does.
    */
-  async function lockClientOf(conn: Conn, withdrawalId: number) {
+  async function clientOfWithdrawal(withdrawalId: number) {
     const ref = await one<{ client_id: number }>(db, "SELECT client_id FROM withdrawals WHERE id = ?", [withdrawalId]);
     if (!ref) throw notFound(NOT_FOUND);
-    await lockClient(conn, ref.client_id);
-    await lockWallet(conn, ref.client_id);
+    return ref.client_id;
+  }
+
+  async function lockClientOf(conn: Conn, clientId: number) {
+    await lockClient(conn, clientId);
+    await lockWallet(conn, clientId);
   }
 
   /** The destination snapshot, or null when it cannot be decrypted (then nothing may be approved or paid). */
@@ -745,8 +753,9 @@ export function staffWithdrawalsRouter(deps: AppDeps): Router {
   async function decide(req: Request, action: Action, work: (conn: Conn, r: Row, d: Destination | null) => Promise<void>) {
     const staff = staffOf(req);
     const withdrawalId = parse(moneyId, req.params.id);
+    const clientId = await clientOfWithdrawal(withdrawalId);
     await transaction(db, async (conn) => {
-      await lockClientOf(conn, withdrawalId);
+      await lockClientOf(conn, clientId);
       const r = await loadVisible(staff, withdrawalId, conn, true);
       const d = readDestination(r);
       const block = blockFor(action, staff, r, d);

@@ -193,11 +193,16 @@ export function staffKycRouter(deps: AppDeps): Router {
   /**
    * Every change locks the client row before reading submissions, so two
    * decisions for one client run one after the other and the second sees the
-   * first. The client id is read first, outside the transaction: it never changes.
+   * first. The client id is read first, before the transaction starts (it never
+   * changes): read through the pool inside it, a transaction would wait for a
+   * second connection while holding one, which hangs the server once every
+   * connection does.
    */
-  async function lockClientOf(conn: Conn, submissionId: number) {
-    const ref = await one<{ client_id: number }>(db, "SELECT client_id FROM kyc_submissions WHERE id = ?", [submissionId]);
-    if (ref) await lockClient(conn, ref.client_id);
+  const clientOfSubmission = async (submissionId: number) =>
+    (await one<{ client_id: number }>(db, "SELECT client_id FROM kyc_submissions WHERE id = ?", [submissionId]))?.client_id ?? null;
+
+  async function lockClientOf(conn: Conn, clientId: number | null) {
+    if (clientId !== null) await lockClient(conn, clientId);
   }
 
   const documentsOf = (submissionId: number) =>
@@ -713,8 +718,9 @@ export function staffKycRouter(deps: AppDeps): Router {
       );
       const staff = staffOf(req);
       const submissionId = parse(id, req.params.id);
+      const clientId = await clientOfSubmission(submissionId);
       const updated = await transaction(db, async (conn) => {
-        await lockClientOf(conn, submissionId);
+        await lockClientOf(conn, clientId);
         const row = await loadVisible(req, submissionId, conn, true);
         if (row.status === "withdrawn") throw badRequest(WITHDRAWN);
         if (row.status !== "pending") throw badRequest(`This submission was already ${row.status}${row.decider_name ? ` by ${row.decider_name}` : ""}.`);
@@ -752,8 +758,9 @@ export function staffKycRouter(deps: AppDeps): Router {
       );
       const staff = staffOf(req);
       const submissionId = parse(id, req.params.id);
+      const clientId = await clientOfSubmission(submissionId);
       const updated = await transaction(db, async (conn) => {
-        await lockClientOf(conn, submissionId);
+        await lockClientOf(conn, clientId);
         const row = await loadVisible(req, submissionId, conn, true);
         if (row.status === "pending") throw badRequest("This submission has not been decided yet. Approve or reject it from the review screen.");
         await assertMayApprove(conn, req, row, await latestSubmissions(conn, row.client_id, true));
@@ -853,8 +860,9 @@ export function staffKycRouter(deps: AppDeps): Router {
         req.body,
       );
       const submissionId = parse(id, req.params.id);
+      const clientId = await clientOfSubmission(submissionId);
       const updated = await transaction(db, async (conn) => {
-        await lockClientOf(conn, submissionId);
+        await lockClientOf(conn, clientId);
         const row = await loadVisible(req, submissionId, conn, true);
         if (row.status !== "approved") throw badRequest("Only an approved document can be requested again. Reject a pending one instead.");
         if (row.client_status === "closed") throw badRequest(CLOSED);

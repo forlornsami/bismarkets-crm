@@ -761,6 +761,16 @@ describe.skipIf(!hasDb)("staff deposits", () => {
     });
   });
 
+  it("keeps working when more decisions arrive at once than there are database connections", async () => {
+    // Each decision holds one connection for its transaction and must never need a second one.
+    const ids: number[] = [];
+    for (let i = 0; i < 25; i++) ids.push((await makeDeposit(await makeClient(), usdBank)).id);
+    await stepUp(env, agent);
+    const answers = await Promise.all(ids.map((id) => reject(agent, id)));
+    expect(answers.map((a) => a.status)).toEqual(ids.map(() => 200));
+    for (const id of ids) expect(await status(id)).toBe("rejected");
+  }, 30_000);
+
   it("leaves the ledger consistent", async () => {
     expect(await verifyLedger(env.db)).toEqual([]);
   });

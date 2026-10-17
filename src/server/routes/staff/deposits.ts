@@ -248,15 +248,22 @@ export function staffDepositsRouter(deps: AppDeps): Router {
   /**
    * Every change takes the locks in the same order as everything else that
    * moves money: the client row, then the wallet, then the deposit. The client
-   * id is read first, outside the transaction: it never changes.
+   * id is read first, before the transaction starts (it never changes): read
+   * inside it, the read would fix the snapshot before the locks are taken, and
+   * read through the pool, a transaction would wait for a second connection
+   * while holding one, which hangs the server once every connection does.
    */
-  async function lockDeposit(conn: Conn, req: Request, depositId: number) {
+  async function clientOfDeposit(req: Request, depositId: number) {
     // Scoped first, so nobody takes locks on a client they may not see.
     const s = clientScope(staffOf(req));
     const ref = await one<{ client_id: number }>(db, `SELECT d.client_id FROM deposits d JOIN clients c ON c.id = d.client_id WHERE d.id = ?${s.sql}`, [depositId, ...s.params]);
     if (!ref) throw notFound(NOT_FOUND);
-    await lockClient(conn, ref.client_id);
-    await lockWallet(conn, ref.client_id);
+    return ref.client_id;
+  }
+
+  async function lockDeposit(conn: Conn, req: Request, depositId: number, clientId: number) {
+    await lockClient(conn, clientId);
+    await lockWallet(conn, clientId);
     return loadVisible(req, depositId, conn, true);
   }
 
@@ -647,8 +654,9 @@ export function staffDepositsRouter(deps: AppDeps): Router {
       const body = parse(approveBody, req.body ?? {});
       const staff = staffOf(req);
       const depositId = parse(moneyId, req.params.id);
+      const clientId = await clientOfDeposit(req, depositId);
       await transaction(db, async (conn) => {
-        const r = await lockDeposit(conn, req, depositId);
+        const r = await lockDeposit(conn, req, depositId, clientId);
         const block = blockOf(staff, r, "approve", false);
         if (block) throw block;
         if (!(await proofOpenedBy(conn, staff.id, r))) throw badRequest("Open the payment proof before approving.");
@@ -707,8 +715,9 @@ export function staffDepositsRouter(deps: AppDeps): Router {
       const body = parse(secondApproveBody, req.body ?? {});
       const staff = staffOf(req);
       const depositId = parse(moneyId, req.params.id);
+      const clientId = await clientOfDeposit(req, depositId);
       await transaction(db, async (conn) => {
-        const r = await lockDeposit(conn, req, depositId);
+        const r = await lockDeposit(conn, req, depositId, clientId);
         const block = blockOf(staff, r, "secondApprove", false);
         if (block) throw block;
         if (!(await proofOpenedBy(conn, staff.id, r))) throw badRequest("Open the payment proof before approving.");
@@ -733,8 +742,9 @@ export function staffDepositsRouter(deps: AppDeps): Router {
       const body = parse(returnBody, req.body ?? {});
       const staff = staffOf(req);
       const depositId = parse(moneyId, req.params.id);
+      const clientId = await clientOfDeposit(req, depositId);
       await transaction(db, async (conn) => {
-        const r = await lockDeposit(conn, req, depositId);
+        const r = await lockDeposit(conn, req, depositId, clientId);
         const block = blockOf(staff, r, "returnToFirst");
         if (block) throw block;
         await exec(
@@ -764,8 +774,9 @@ export function staffDepositsRouter(deps: AppDeps): Router {
       const body = parse(rejectBody, req.body ?? {});
       const staff = staffOf(req);
       const depositId = parse(moneyId, req.params.id);
+      const clientId = await clientOfDeposit(req, depositId);
       await transaction(db, async (conn) => {
-        const r = await lockDeposit(conn, req, depositId);
+        const r = await lockDeposit(conn, req, depositId, clientId);
         const block = blockOf(staff, r, "reject");
         if (block) throw block;
         // The bank reference is freed: this payment was never credited.
