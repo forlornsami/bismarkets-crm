@@ -98,8 +98,10 @@ Point `staff.crmbismarkets.com` (staff panel) and `crmbismarkets.com` (the API
 the client portal and app call) at the server, get certificates
 (`apt install certbot python3-certbot-nginx && certbot --nginx`), and proxy.
 Bodies stay small everywhere except the uploads that need more: KYC uploads
-carry up to two 10 MB files, and a client's profile picture is a 1 MB image
-sent as a form.
+carry up to two 10 MB files, a deposit carries a 10 MB payment screenshot, a
+saved payout account may carry a 10 MB QR image, a client's profile picture is
+a 1 MB image sent as a form, and staff upload deposit-method QR images of up
+to 2 MB.
 
 ```nginx
 # At http level (outside the server blocks): the origins that may call the
@@ -124,6 +126,11 @@ server {
   location = /api/staff/kyc/upload {
     client_max_body_size 21m;
     proxy_read_timeout 150s;
+    proxy_pass http://127.0.0.1:3000;
+  }
+  # QR images of the broker's crypto deposit addresses.
+  location ~ ^/api/staff/money/methods/[0-9]+/qr$ {
+    client_max_body_size 3m;
     proxy_pass http://127.0.0.1:3000;
   }
 }
@@ -156,6 +163,18 @@ server {
   }
   location = /api/user/profile-picture {
     client_max_body_size 3m;
+    proxy_pass http://127.0.0.1:3000;
+  }
+  # Deposit requests carry the payment screenshot (HEIC photos are converted).
+  location = /api/deposits {
+    client_max_body_size 11m;
+    proxy_read_timeout 90s;
+    proxy_pass http://127.0.0.1:3000;
+  }
+  # Saved payout accounts may carry the client's wallet QR image.
+  location ~ ^/api/user-payment-methods(/[0-9]+)?$ {
+    client_max_body_size 11m;
+    proxy_read_timeout 90s;
     proxy_pass http://127.0.0.1:3000;
   }
 }

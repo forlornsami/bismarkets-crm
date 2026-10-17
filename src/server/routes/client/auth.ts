@@ -5,6 +5,7 @@ import {
   checkEmailCode,
   clientName,
   clientPasswordProblem,
+  CODE_MAX_ATTEMPTS,
   CODE_TTL_MS,
   codeHash,
   emailField,
@@ -167,9 +168,25 @@ export function clientAuthRouter(deps: AppDeps): Router {
         req.body,
       );
       const signedIn = await optionalClient(req);
-      const purpose = purposeFor(body.email, signedIn, body.purpose ?? body.type);
+      const requested = body.purpose ?? body.type;
       // Checking does not use the code up: the portal sends it again with the real request.
-      const ok = await transaction(db, (conn) => checkEmailCode(conn, config, body.email, purpose, body.verification_code, false));
+      const ok = await transaction(db, async (conn) => {
+        let purpose: CodePurpose;
+        if (signedIn) purpose = purposeFor(body.email, signedIn, requested);
+        else if (requested) purpose = requested === "withdrawal" ? "withdrawal" : "register";
+        else {
+          // The portal checks a withdrawal code here without its token. Only the
+          // newest live code is checked, so one wrong guess counts once.
+          const live = await one<{ purpose: CodePurpose }>(
+            conn,
+            `SELECT purpose FROM email_codes WHERE email = ? AND purpose IN ('register', 'withdrawal') AND consumed_at IS NULL
+               AND expires_at > CURRENT_TIMESTAMP(3) AND attempts < ? ORDER BY id DESC LIMIT 1`,
+            [body.email, CODE_MAX_ATTEMPTS],
+          );
+          purpose = live?.purpose ?? "register";
+        }
+        return checkEmailCode(conn, config, body.email, purpose, body.verification_code, false);
+      });
       if (!ok) throw fieldError("verification_code", "The verification code is invalid or has expired.");
       res.json({ success: true, message: "Code verified." });
     }),

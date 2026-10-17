@@ -5,6 +5,7 @@ import { auditStandalone, verifyAuditChain } from "../server/lib/audit";
 import { createDb, exec, one } from "../server/lib/db";
 import { hashPassword } from "../server/lib/passwords";
 import { migrate } from "../server/migrate";
+import { verifyLedger } from "../server/money/ledger";
 import { seedRoles } from "../server/seed";
 import { temporaryPassword } from "../server/staff/guards";
 
@@ -16,6 +17,7 @@ const HELP = `BIS Markets CRM command line
   create-super-admin --email E --name N
                                      Create a Super Admin and print a one-time temporary password
   verify-audit                       Check the audit log hash chain
+  verify-ledger                      Check that the ledger balances and matches wallets, deposits and withdrawals
 
 Commands other than generate-key read CRM_DATABASE_URL from the environment.`;
 
@@ -72,6 +74,13 @@ async function main() {
         const report = await verifyAuditChain(db);
         console.log(report.ok ? `Audit log intact: ${report.checked} entries checked.` : `AUDIT LOG BROKEN at entry ${report.brokenAtId}: ${report.reason}`);
         if (!report.ok) process.exitCode = 2;
+        break;
+      }
+      case "verify-ledger": {
+        const problems = await verifyLedger(db);
+        if (!problems.length) console.log("Ledger checks passed.");
+        for (const problem of problems) console.log(problem);
+        if (problems.length) process.exitCode = 1;
         break;
       }
       default:
