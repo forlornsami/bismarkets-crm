@@ -184,6 +184,16 @@ const viewOnly = ALL_PERMISSIONS.filter(
   (p) => p.endsWith(".view") || p === "audit.verify" || p === "client.view_all" || p === "kyc.documents" || p === "deposit.proof",
 );
 
+/**
+ * Whoever manages staff accounts must not also approve money: an Admin could otherwise create a
+ * finance account, learn its temporary password and give both approvals of a four-eyes decision.
+ * Staff guards only let someone grant or reset a role whose permissions they hold, so without
+ * these an Admin cannot create or take over a finance account either. Rejecting stays allowed.
+ */
+export const ADMIN_KEEPS_OUT_OF: readonly Permission[] = [
+  "deposit.process", "deposit.approve_large", "withdrawal.process", "withdrawal.approve", "withdrawal.pay", "wallet.adjust", "ib.payout",
+];
+
 // System roles are seeded by `cli seed-roles`. Super Admin always holds every
 // permission and cannot be edited; the others can be adjusted by a Super Admin.
 // KYC documents are reviewed inside the CRM, so only a Super Admin downloads
@@ -198,8 +208,8 @@ export const DEFAULT_ROLES: readonly DefaultRole[] = [
   {
     slug: "admin",
     name: "Admin",
-    description: "Runs the brokerage day to day; cannot change roles or MT5 server credentials.",
-    permissions: ALL_PERMISSIONS.filter((p) => !["role.manage", "mt5.servers", "settings.manage", "audit.export", "kyc.download"].includes(p)),
+    description: "Runs the brokerage day to day; cannot change roles or MT5 server credentials, or approve and pay out money.",
+    permissions: ALL_PERMISSIONS.filter((p) => !["role.manage", "mt5.servers", "settings.manage", "audit.export", "kyc.download", ...ADMIN_KEEPS_OUT_OF].includes(p)),
   },
   {
     slug: "compliance",

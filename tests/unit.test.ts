@@ -122,6 +122,16 @@ describe("passwords", () => {
 });
 
 describe("permission catalog", () => {
+  it("keeps staff account management and money approvals in different default roles", () => {
+    const manageStaff = ["staff.create", "staff.edit", "staff.security"];
+    const moveMoney = ["deposit.process", "deposit.approve_large", "withdrawal.process", "withdrawal.approve", "withdrawal.pay", "wallet.adjust", "ib.payout"];
+    for (const role of DEFAULT_ROLES) {
+      if (role.permissions === "all") continue;
+      const held = role.permissions as string[];
+      if (held.some((p) => manageStaff.includes(p))) expect([role.slug, held.filter((p) => moveMoney.includes(p))]).toEqual([role.slug, []]);
+    }
+  });
+
   it("only seeds known permissions", () => {
     for (const role of DEFAULT_ROLES) {
       if (role.permissions === "all") continue;

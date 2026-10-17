@@ -67,6 +67,23 @@ describe.skipIf(!hasDb)("staff, roles and audit", () => {
     expect(editBoss.status).toBe(403);
   });
 
+  it("keeps Admins out of money approvals, so they cannot make a second account to approve their own", async () => {
+    for (const slug of ["finance_manager", "finance_agent"]) {
+      const res = await post(admin, "/api/staff/users", { email: `sock.${slug}@bis.test`, name: "Sock", roleId: await roleId(slug) });
+      expect(res.status).toBe(403);
+      expect(res.body.error.message).toMatch(/^You cannot grant permissions you do not hold yourself: .*(deposit|withdrawal)\.(process|approve)/);
+    }
+    // Nor take over an existing finance account by resetting its password.
+    await createStaff(env.db, "finance@bis.test", "finance_manager");
+    const finance = (await one<{ id: number }>(env.db, "SELECT id FROM staff_users WHERE email = 'finance@bis.test'"))!.id;
+    await stepUp(env, admin);
+    const reset = await post(admin, `/api/staff/users/${finance}/reset-password`, {});
+    expect(reset.status).toBe(403);
+    expect(reset.body).not.toHaveProperty("temporaryPassword");
+    // A Super Admin still can.
+    expect((await post(boss, "/api/staff/users", { email: "real.finance@bis.test", name: "Real Finance", roleId: await roleId("finance_agent") })).status).toBe(201);
+  });
+
   it("stops anyone taking over an account with more power than their own", async () => {
     // A Super Admin gave a desk role kyc.download, which Admin does not hold.
     await exec(env.db, "INSERT INTO roles (slug, name) VALUES ('document_desk', 'Document desk')");
