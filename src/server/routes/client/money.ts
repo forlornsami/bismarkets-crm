@@ -467,7 +467,7 @@ export function clientMoneyRouter(deps: AppDeps): Router {
       if (!code) throw fieldError("verification_code", "Enter the code we emailed you.");
       if (code.length > 12) throw fieldError("verification_code", WRONG_CODE);
       // In its own transaction, so a wrong guess is counted even though this request then fails.
-      if (!(await transaction(db, (conn) => checkEmailCode(conn, config, client.email, "withdrawal", code, false)))) throw fieldError("verification_code", WRONG_CODE);
+      if (!(await transaction(db, (conn) => checkEmailCode(conn, config, client.email, "withdrawal", code, false, client.id)))) throw fieldError("verification_code", WRONG_CODE);
 
       const row = await transaction(db, async (conn) => {
         await lockClient(conn, client.id);
@@ -485,7 +485,7 @@ export function clientMoneyRouter(deps: AppDeps): Router {
           throw fieldError("amount", `You already have ${MAX_OPEN_WITHDRAWALS} withdrawals in progress. Please wait for them to finish.`);
         }
         // Used up together with the hold: both happen, or neither does.
-        if (!(await checkEmailCode(conn, config, client.email, "withdrawal", code, true))) throw fieldError("verification_code", WRONG_CODE);
+        if (!(await checkEmailCode(conn, config, client.email, "withdrawal", code, true, client.id))) throw fieldError("verification_code", WRONG_CODE);
         const paidBefore = await one(conn, "SELECT id FROM withdrawals WHERE client_id = ? AND status = 'paid' LIMIT 1", [client.id]);
         const needsSecond = cents > settings.withdrawal_second_approval_cents || (settings.first_withdrawal_second_approval && !paidBefore);
         const { accountNumber, iban } = openPayoutMethod(config, payout);
@@ -602,7 +602,7 @@ export function clientMoneyRouter(deps: AppDeps): Router {
       const client = clientOf(req);
       const form = await readMoneyForm(req, "payment_method_id", NO_TYPE);
       const type = await payoutType(db, formId(form.values.payment_method_id));
-      const fields = validate(payoutFields(type.kind), form.values);
+      const fields = validate(payoutFields(type), form.values);
       if ((await countSaved(db, client.id)) >= MAX_PAYOUT_METHODS) throw tooMany();
       // A QR picture only means something for a crypto wallet.
       const qr = type.kind === "crypto" ? await readQr(form) : null;
@@ -647,7 +647,7 @@ export function clientMoneyRouter(deps: AppDeps): Router {
     const opened = openPayoutMethod(config, before);
     const current: Record<string, unknown> = { method_name: before.method_name, account_name: before.account_name, account_number: opened.accountNumber, iban: opened.iban, swift: before.swift };
     for (const key of ["method_name", "account_name", "account_number", "iban", "swift"]) if (form.values[key] !== undefined) current[key] = form.values[key];
-    const fields = validate(payoutFields(type.kind), current);
+    const fields = validate(payoutFields(type), current);
     const changed = [
       fields.method_name !== before.method_name && "method_name",
       fields.account_name !== before.account_name && "account_name",

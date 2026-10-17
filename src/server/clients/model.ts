@@ -215,13 +215,18 @@ interface CodeRow {
  * Checks the latest live code for this email and purpose. Wrong guesses count
  * against it; after five the code is dead. `consume` marks it used.
  */
-export async function checkEmailCode(conn: Conn, config: Config, email: string, purpose: CodePurpose, code: string, consume: boolean) {
+/**
+ * Checks the newest live code for this email and purpose. Codes a signed-in
+ * client asked for (withdrawal, new email) pass `clientId`: only that client's
+ * own code is checked, so nobody else's guesses or requests can touch it.
+ */
+export async function checkEmailCode(conn: Conn, config: Config, email: string, purpose: CodePurpose, code: string, consume: boolean, clientId?: number) {
   const row = await one<CodeRow>(
     conn,
     `SELECT id, code_hash, attempts FROM email_codes
-     WHERE email = ? AND purpose = ? AND consumed_at IS NULL AND expires_at > CURRENT_TIMESTAMP(3)
+     WHERE email = ? AND purpose = ?${clientId === undefined ? "" : " AND client_id = ?"} AND consumed_at IS NULL AND expires_at > CURRENT_TIMESTAMP(3)
      ORDER BY id DESC LIMIT 1 FOR UPDATE`,
-    [email, purpose],
+    clientId === undefined ? [email, purpose] : [email, purpose, clientId],
   );
   if (!row || row.attempts >= CODE_MAX_ATTEMPTS) return false;
   if (row.code_hash !== codeHash(config, email, purpose, code)) {

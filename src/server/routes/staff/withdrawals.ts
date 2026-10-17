@@ -178,6 +178,8 @@ const TONE_ORDER = { bad: 0, warn: 1, info: 2 } as const;
 const SECURITY_ACTIONS: Record<string, string> = {
   "client.password_reset": "password reset",
   "client.email_changed": "email address changed",
+  "staff.email_changed": "email address changed by staff",
+  "staff.verified_changed": "verified details changed by staff",
   "payout_method.added": "payout account added",
   "payout_method.updated": "payout account changed",
 };
@@ -431,11 +433,18 @@ export function staffWithdrawalsRouter(deps: AppDeps): Router {
       warnings.push({ tone: "warn", text: "The client replaced the QR code after asking for this withdrawal, so it is not shown. Pay to the address shown." });
     }
 
+    // Staff edits are logged as client.updated (or client.verified_details_changed) with the fields they changed.
     const changes = await rows<{ action: string; at: Date }>(
       db,
-      `SELECT action, MAX(occurred_at) AS at FROM audit_log WHERE entity_type = 'client' AND entity_id = ? AND action IN (${Object.keys(SECURITY_ACTIONS).map(() => "?").join(",")})
-         AND occurred_at >= ? GROUP BY action ORDER BY at`,
-      [String(r.client_id), ...Object.keys(SECURITY_ACTIONS), new Date(asked - 7 * DAY)],
+      `SELECT action, MAX(occurred_at) AS at FROM (
+         SELECT CASE WHEN action IN ('client.updated', 'client.verified_details_changed') AND JSON_CONTAINS(JSON_EXTRACT(meta_json, '$.fields'), '"email"')
+                     THEN 'staff.email_changed' WHEN action = 'client.verified_details_changed' THEN 'staff.verified_changed' ELSE action END AS action,
+                occurred_at
+         FROM audit_log
+         WHERE entity_type = 'client' AND entity_id = ? AND occurred_at >= ?
+           AND action IN (${Object.keys(SECURITY_ACTIONS).map(() => "?").join(",")}, 'client.updated', 'client.verified_details_changed')
+       ) c WHERE action IN (${Object.keys(SECURITY_ACTIONS).map(() => "?").join(",")}) GROUP BY action ORDER BY at`,
+      [String(r.client_id), new Date(asked - 7 * DAY), ...Object.keys(SECURITY_ACTIONS), ...Object.keys(SECURITY_ACTIONS)],
     );
     if (changes.length) {
       warnings.push({ tone: "warn", text: `Recent security changes on this account: ${listWords(changes.map((c) => `${SECURITY_ACTIONS[c.action]} on ${longDate(c.at)}`))}.` });

@@ -113,7 +113,9 @@ describe.skipIf(!hasDb)("client money API", () => {
   async function issueCode(email: string, purpose: "withdrawal" | "register" = "withdrawal") {
     const code = newEmailCode();
     await exec(env.db, "UPDATE email_codes SET consumed_at = CURRENT_TIMESTAMP(3) WHERE email = ? AND purpose = ? AND consumed_at IS NULL", [email, purpose]);
-    await exec(env.db, "INSERT INTO email_codes (email, purpose, code_hash, expires_at) VALUES (?, ?, ?, ?)", [email, purpose, codeHash(env.config, email, purpose, code), new Date(Date.now() + 600_000)]);
+    // A withdrawal code belongs to the signed-in client who asked for it.
+    const owner = purpose === "withdrawal" ? (await one<{ id: number }>(env.db, "SELECT id FROM clients WHERE email = ?", [email]))!.id : null;
+    await exec(env.db, "INSERT INTO email_codes (email, purpose, client_id, code_hash, expires_at) VALUES (?, ?, ?, ?, ?)", [email, purpose, owner, codeHash(env.config, email, purpose, code), new Date(Date.now() + 600_000)]);
     return code;
   }
   const codeRow = (email: string, purpose = "withdrawal") =>
@@ -524,12 +526,20 @@ describe.skipIf(!hasDb)("client money API", () => {
     expect(errorOf(await savePayout(cal, { ...bank, account_number: "12" }), "account_number")).toBe("Enter the full account number.");
     expect(errorOf(await savePayout(cal, { ...bank, account_number: "<script>1234</script>" }), "account_number")).toBe("Use only letters, numbers, spaces and - . / :");
     expect(errorOf(await savePayout(cal, { ...bank, method_name: "" }), "method_name")).toBe("Enter a name for this account.");
-    expect(errorOf(await savePayout(cal, { ...bank, method_name: "<b>Bank</b>" }), "method_name")).toBe("Use plain text, without symbols like < > { }.");
+    // Worded without the symbols, so the portal shows it as written.
+    expect(errorOf(await savePayout(cal, { ...bank, method_name: "<b>Bank</b>" }), "method_name")).toBe("Use plain text only, without angle brackets, curly brackets, backslashes or web links.");
     expect(errorOf(await savePayout(cal, { ...bank, iban: "x".repeat(65) }), "iban")).toBe("The IBAN can be at most 64 characters.");
     const trc = { payment_method_id: String(m.wTrc), method_name: "USDT TRC20", account_number: "TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE" };
     expect(errorOf(await savePayout(cal, trc), "file_name")).toBe("Upload a picture of your wallet's QR code.");
     expect(errorOf(await savePayout(cal, trc, Buffer.from("<svg onload=alert(1)>")), "file_name")).toBe("Upload a picture of the QR code: JPG, PNG, WebP, HEIC or GIF, up to 10 MB.");
     expect(errorOf(await savePayout(cal, trc, Buffer.from("GIF89a not really")), "file_name")).toBe("This picture could not be opened. Upload a picture of the QR code: JPG, PNG, WebP, HEIC or GIF, up to 10 MB.");
+    // An address saved under another network's type would be paid on the wrong chain.
+    expect(errorOf(await savePayout(cal, { ...trc, payment_method_id: String(m.wBep) }), "account_number")).toBe(
+      "This is not a BEP20 address. A BEP20 address starts with 0x followed by 40 letters and digits.",
+    );
+    expect(errorOf(await savePayout(cal, { ...trc, account_number: "0x52908400098527886E0F7030069857D2E4169EE7" }), "account_number")).toBe(
+      "This is not a TRC20 address. A TRC20 address starts with T and has 34 characters.",
+    );
     // A bank account takes no picture: one sent anyway is ignored, not stored.
     const ignored = await savePayout(cal, { payment_method_id: String(m.wBank), method_name: "Spare", account_name: "Cal Moss", account_number: "11112222" }, await png("#444444", 300, 300));
     expect(ignored.status).toBe(201);
@@ -730,16 +740,22 @@ describe.skipIf(!hasDb)("client money API", () => {
     expect(Number((await one<{ n: number }>(env.db, "SELECT COUNT(*) AS n FROM withdrawals WHERE client_id = ?", [cal.id]))!.n)).toBe(0);
   });
 
-  it("checks a withdrawal code on verify-otp without a token and without using it up", async () => {
+  it("checks a withdrawal code on verify-otp with the client's session, without using it up", async () => {
     const sent = await api().post("/api/send-otp").set(bearer(ann.token)).send({ email: ann.email });
     expect(sent.status).toBe(200);
     const out = (await mail(ann.email, "otp_withdrawal")).at(-1)!;
     const code = /code is (\d{6})/.exec(out.text)![1]!;
     expect(out.stored).not.toContain(code);
-    const wrong = await api().post("/api/verify-otp").send({ email: ann.email, verification_code: code === "000000" ? "111111" : "000000" });
+    const other = code === "000000" ? "111111" : "000000";
+    // Without the session, nothing reaches a withdrawal code: guesses are checked against sign-up codes only.
+    for (let i = 0; i < 6; i++) expect((await api().post("/api/verify-otp").send({ email: ann.email, verification_code: other, purpose: "withdrawal" })).status).toBe(422);
+    expect((await api().post("/api/verify-otp").send({ email: ann.email, verification_code: code })).status).toBe(422);
+    expect((await codeRow(ann.email))!.attempts).toBe(0);
+    const verify = (verification_code: string) => api().post("/api/verify-otp").set(bearer(ann.token)).send({ email: ann.email, verification_code, purpose: "withdrawal" });
+    const wrong = await verify(other);
     expect(wrong.status).toBe(422);
     expect((await codeRow(ann.email))!.attempts).toBe(1);
-    const right = await api().post("/api/verify-otp").send({ email: ann.email, verification_code: code });
+    const right = await verify(code);
     expect(right.status).toBe(200);
     expect(right.body).toMatchObject({ success: true });
     expect((await codeRow(ann.email))!.consumed_at).toBeNull();
@@ -760,7 +776,7 @@ describe.skipIf(!hasDb)("client money API", () => {
     // Used up with the request: the same code cannot send another.
     expect((await codeRow(ann.email))!.consumed_at).not.toBeNull();
     expect(errorOf(await withdraw(ann, { method: String(annBank), amount: "50", verification_code: code, wallet_key: ann.key }), "verification_code")).toBe(WRONG_CODE);
-    expect((await api().post("/api/verify-otp").send({ email: ann.email, verification_code: code })).status).toBe(422);
+    expect((await verify(code)).status).toBe(422);
 
     // The money is held at once.
     expect(await wallet(ann.id)).toEqual([40_000, 10_000]);
@@ -797,15 +813,26 @@ describe.skipIf(!hasDb)("client money API", () => {
     expect(await rows(env.db, "SELECT id FROM webhook_outbox WHERE event LIKE 'withdrawal.%'")).toEqual([]);
   });
 
-  it("checks only the newest live code on verify-otp without a token, so one wrong guess counts once", async () => {
-    const register = await issueCode(ann.email, "register");
-    const withdrawal = await issueCode(ann.email);
-    const wrong = await api().post("/api/verify-otp").send({ email: ann.email, verification_code: register === withdrawal ? "999999" : register });
-    expect(wrong.status).toBe(422);
-    expect((await codeRow(ann.email, "withdrawal"))!.attempts).toBe(1);
-    expect((await codeRow(ann.email, "register"))!.attempts).toBe(0);
-    expect((await api().post("/api/verify-otp").send({ email: ann.email, verification_code: withdrawal })).status).toBe(200);
+  it("keeps a client's withdrawal codes out of other clients' reach", async () => {
+    const code = await issueCode(dee.email);
+    // Ben asks for a withdrawal code "for" Dee: it goes to Ben's own address, and Dee's code still works.
+    const asked = await api().post("/api/send-otp").set(bearer(ben.token)).send({ email: dee.email, purpose: "withdrawal" });
+    expect(asked.status).toBe(200);
+    expect(await mail(dee.email, "otp_withdrawal")).toEqual([]);
+    expect(await one(env.db, "SELECT client_id, email FROM email_codes WHERE purpose = 'withdrawal' ORDER BY id DESC LIMIT 1")).toEqual({ client_id: ben.id, email: ben.email });
+    expect((await codeRow(dee.email))!.consumed_at).toBeNull();
+    // Ben's guesses at Dee's address only ever reach Ben's own code.
+    for (let i = 0; i < 5; i++) await api().post("/api/verify-otp").set(bearer(ben.token)).send({ email: dee.email, verification_code: code === "000000" ? "111111" : "000000", purpose: "withdrawal" });
+    expect((await codeRow(dee.email))!).toMatchObject({ attempts: 0, consumed_at: null });
+    expect((await api().post("/api/verify-otp").set(bearer(dee.token)).send({ email: dee.email, verification_code: code, purpose: "withdrawal" })).status).toBe(200);
+    // Nor do Ben's requests count against Dee's limits.
+    expect((await api().post("/api/send-otp").set(bearer(dee.token)).send({ email: dee.email })).status).toBe(200);
+    // A code for Ann's address that another client asked for never sends Ann's money.
+    const stray = newEmailCode();
     await exec(env.db, "UPDATE email_codes SET consumed_at = CURRENT_TIMESTAMP(3) WHERE email = ? AND consumed_at IS NULL", [ann.email]);
+    await exec(env.db, "INSERT INTO email_codes (email, purpose, client_id, code_hash, expires_at) VALUES (?, 'withdrawal', ?, ?, ?)", [ann.email, ben.id, codeHash(env.config, ann.email, "withdrawal", stray), new Date(Date.now() + 600_000)]);
+    expect(errorOf(await withdraw(ann, { method: String(annBank), amount: "50", verification_code: stray, wallet_key: ann.key }), "verification_code")).toBe(WRONG_CODE);
+    await exec(env.db, "UPDATE email_codes SET consumed_at = CURRENT_TIMESTAMP(3) WHERE consumed_at IS NULL");
   });
 
   it("lets only one of two requests with the same code through", async () => {

@@ -668,6 +668,10 @@ describe.skipIf(!hasDb)("staff deposits", () => {
       expect(fields(await post(manager, methods, { direction: "withdrawal", kind: "crypto", name: "USDT", network: "trc20" }))).toEqual(["name"]);
       expect(fields(await post(manager, methods, { direction: "withdrawal", kind: "crypto", name: "USDT BEP20", network: "trc20" }))).toEqual(["name"]);
       expect(fields(await post(manager, methods, { direction: "withdrawal", kind: "crypto", name: "Bank TRC20", network: "trc20" }))).toEqual(["name"]);
+      // The portal matches "usdttrc20" in the name with spaces removed, so "TRC20" alone or "USDT-TRC20" would show the wrong form.
+      expect(fields(await post(manager, methods, { direction: "withdrawal", kind: "crypto", name: "TRC20", network: "trc20" }))).toEqual(["name"]);
+      expect(fields(await post(manager, methods, { direction: "withdrawal", kind: "crypto", name: "USDT-TRC20", network: "trc20" }))).toEqual(["name"]);
+      expect(fields(await post(manager, methods, { direction: "withdrawal", kind: "crypto", name: "BEP20", network: "bep20" }))).toEqual(["name"]);
       expect(fields(await post(manager, methods, { direction: "withdrawal", kind: "crypto", name: "USDT TRC20" }))).toEqual(["network"]);
       expect((await post(manager, methods, { direction: "withdrawal", kind: "crypto", name: "USDT TRC20", network: "trc20", askQr: true })).body).toMatchObject({ askQr: true, network: "trc20" });
       expect((await post(manager, methods, { direction: "withdrawal", kind: "crypto", name: "Binance Pay", network: "binance_pay" })).status).toBe(201);

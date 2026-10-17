@@ -636,6 +636,11 @@ describe.skipIf(!hasDb)("staff withdrawals", () => {
     await transaction(env.db, (conn) =>
       writeAudit(conn, { actor: { type: "client", id: clientId, label: "sara" }, ip: "", userAgent: "" }, { action: "client.password_reset", entityType: "client", entityId: clientId }),
     );
+    // A staff edit of the sign-in email counts; one that only changed the city does not.
+    const staffActor = { actor: { type: "staff" as const, id: agentA.staffId, label: "agent" }, ip: "", userAgent: "" };
+    await transaction(env.db, (conn) => writeAudit(conn, staffActor, { action: "client.updated", entityType: "client", entityId: clientId, meta: { fields: ["city"] } }));
+    await new Promise((r) => setTimeout(r, 5));
+    await transaction(env.db, (conn) => writeAudit(conn, staffActor, { action: "client.updated", entityType: "client", entityId: clientId, meta: { fields: ["email", "city"] } }));
     const w = await withdraw(payout, 50_000);
 
     const view = await agentA.agent.get(W(w.id));
@@ -645,7 +650,7 @@ describe.skipIf(!hasDb)("staff withdrawals", () => {
       { tone: "bad", text: "The name on the account (John Smith) does not match the client's verified name (Sara Ahmed)." },
       { tone: "warn", text: "This is the client's first withdrawal." },
       { tone: "warn", text: expect.stringMatching(/^The client added this payout account on .+, less than 72 hours before asking for this withdrawal\.$/) },
-      { tone: "warn", text: `Recent security changes on this account: password reset on ${day}.` },
+      { tone: "warn", text: `Recent security changes on this account: password reset on ${day} and email address changed by staff on ${day}.` },
       { tone: "warn", text: "More than half of this client's deposits (USD 900.00 of USD 1,000.00) arrived in the 72 hours before this request." },
       { tone: "warn", text: "This client deposited by crypto, but is withdrawing to bank." },
       { tone: "info", text: "Needs a second approval from another person." },

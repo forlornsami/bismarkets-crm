@@ -41,6 +41,13 @@ export type Network = "" | "trc20" | "bep20" | "binance_pay";
 export const NETWORK_LABELS: Record<Network, string> = { "": "", trc20: "TRC20", bep20: "BEP20", binance_pay: "Binance Pay" };
 export const networkLabel = (network: string) => NETWORK_LABELS[network as Network] ?? "";
 
+/** What a wallet address or Pay ID looks like on each network, for staff and client forms alike. */
+export const NETWORK_ADDRESS: Record<Exclude<Network, "">, { pattern: RegExp; message: string }> = {
+  trc20: { pattern: /^T[1-9A-HJ-NP-Za-km-z]{33}$/, message: "A TRC20 address starts with T and has 34 characters." },
+  bep20: { pattern: /^0x[0-9a-fA-F]{40}$/, message: "A BEP20 address starts with 0x followed by 40 letters and digits." },
+  binance_pay: { pattern: /^\d{6,12}$/, message: "Enter the Binance Pay ID (6 to 12 digits)." },
+};
+
 /** Both front ends know pending, approved and rejected; second approval is still pending to the client. */
 export const depositStatusLabel = (status: string) => (status === "approved" ? "approved" : status === "rejected" ? "rejected" : "pending");
 /** A withdrawal stays pending until the money is sent: both front ends show "approved" as completed. */
@@ -353,14 +360,15 @@ export const lastFour = (account: string) => account.replace(/\s+/g, "").slice(-
 /** Letters, digits, spaces and - . / : only: enough for account numbers, IBANs, wallet addresses and Pay IDs. */
 const ACCOUNT_CHARS = /^[A-Za-z0-9 \-./:]*$/;
 const ACCOUNT_CHARS_MESSAGE = "Use only letters, numbers, spaces and - . / :";
-const PLAIN_TEXT_MESSAGE = "Use plain text, without symbols like < > { }.";
+// Worded without the symbols themselves: the portal shows a message as written only when it is plain text.
+const PLAIN_TEXT_MESSAGE = "Use plain text only, without angle brackets, curly brackets, backslashes or web links.";
 
 const text = (required: string) =>
   z.preprocess((v) => formText(v)?.trim(), z.string({ required_error: required, invalid_type_error: required }));
 const optionalText = () => z.preprocess((v) => formText(v)?.trim() ?? "", z.string());
 
-/** The fields of a saved payout account, checked for its account type. */
-export const payoutFields = (kind: "bank" | "crypto") =>
+/** The fields of a saved payout account, checked for its account type (and a wallet address for its network). */
+export const payoutFields = ({ kind, network }: { kind: "bank" | "crypto"; network: Network }) =>
   z.object({
     method_name: text("Enter a name for this account.")
       .pipe(z.string().min(1, "Enter a name for this account.").max(120, "Keep the account name under 120 characters.").refine((v) => !NOT_PLAIN.test(v), PLAIN_TEXT_MESSAGE)),
@@ -376,7 +384,12 @@ export const payoutFields = (kind: "bank" | "crypto") =>
         .string()
         .min(4, kind === "bank" ? "Enter the full account number." : "Enter the full wallet address or Pay ID.")
         .max(kind === "bank" ? 64 : 128, kind === "bank" ? "The account number can be at most 64 characters." : "The wallet address can be at most 128 characters.")
-        .regex(ACCOUNT_CHARS, ACCOUNT_CHARS_MESSAGE),
+        .regex(ACCOUNT_CHARS, ACCOUNT_CHARS_MESSAGE)
+        // Saved under the wrong network, an address would be paid on the wrong chain.
+        .refine(
+          (v) => kind !== "crypto" || !network || NETWORK_ADDRESS[network].pattern.test(v),
+          network ? `This is not a ${NETWORK_LABELS[network]} ${network === "binance_pay" ? "Pay ID" : "address"}. ${NETWORK_ADDRESS[network].message}` : "",
+        ),
     ),
     iban: optionalText().pipe(z.string().max(64, "The IBAN can be at most 64 characters.").regex(ACCOUNT_CHARS, ACCOUNT_CHARS_MESSAGE)),
     swift: optionalText().pipe(z.string().max(32, "The SWIFT code can be at most 32 characters.").regex(ACCOUNT_CHARS, ACCOUNT_CHARS_MESSAGE)),

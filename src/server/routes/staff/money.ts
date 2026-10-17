@@ -5,6 +5,7 @@ import { z } from "zod";
 import { NOT_PLAIN } from "@shared/money";
 import type { Permission } from "@shared/permissions";
 import type { AppDeps } from "../../app";
+import { NETWORK_ADDRESS as ADDRESS } from "../../clients/money";
 import { auditContext, writeAudit } from "../../lib/audit";
 import { sha256 } from "../../lib/crypto";
 import { exec, one, rows, transaction, type Conn } from "../../lib/db";
@@ -250,15 +251,13 @@ const ACCOUNT_FIELDS = ["currency", "network", "bankName", "accountTitle", "acco
 
 // The portal and app decide which form to show for a payout type by its name
 // (bank: "bank", "wire" or "iban"; otherwise crypto), so names must agree with the kind.
+// The portal also files a new wallet under the type whose name, without spaces,
+// contains "USDTTRC20", "USDTBEP20" or "Binance": a name like "TRC20" or
+// "USDT-TRC20" would send a Tron wallet to another type.
 const NETWORK_WORD: Record<Exclude<Network, "">, { word: RegExp; example: string }> = {
-  trc20: { word: /trc/i, example: "USDT TRC20" },
-  bep20: { word: /bep/i, example: "USDT BEP20" },
+  trc20: { word: /usdttrc20/i, example: "USDT TRC20" },
+  bep20: { word: /usdtbep20/i, example: "USDT BEP20" },
   binance_pay: { word: /binance/i, example: "Binance Pay" },
-};
-const ADDRESS: Record<Exclude<Network, "">, { pattern: RegExp; message: string }> = {
-  trc20: { pattern: /^T[1-9A-HJ-NP-Za-km-z]{33}$/, message: "A TRC20 address starts with T and has 34 characters." },
-  bep20: { pattern: /^0x[0-9a-fA-F]{40}$/, message: "A BEP20 address starts with 0x followed by 40 letters and digits." },
-  binance_pay: { pattern: /^\d{6,12}$/, message: "Enter the Binance Pay ID (6 to 12 digits)." },
 };
 
 /**
@@ -280,7 +279,7 @@ function settleMethod(m: MethodInput): { method: MethodInput; problems: { field:
       if (!/bank|wire/i.test(out.name)) problem("name", "Name a bank payout type with the word \"bank\" or \"wire\" (for example \"Bank transfer\"), so the portal and app show the bank form.");
     } else {
       if (!out.network) problem("network", "Choose the network.");
-      else if (!NETWORK_WORD[out.network].word.test(out.name) || /bank|wire|iban/i.test(out.name)) {
+      else if (!NETWORK_WORD[out.network].word.test(out.name.replace(/\s+/g, "")) || /bank|wire|iban/i.test(out.name)) {
         problem("name", `Name this payout type after its network (for example "${NETWORK_WORD[out.network].example}"), so the portal and app show the right form.`);
       }
     }

@@ -5,7 +5,6 @@ import {
   checkEmailCode,
   clientName,
   clientPasswordProblem,
-  CODE_MAX_ATTEMPTS,
   CODE_TTL_MS,
   codeHash,
   emailField,
@@ -136,18 +135,25 @@ export function clientAuthRouter(deps: AppDeps): Router {
       const signedIn = await optionalClient(req);
       if (signedIn?.kind === "impersonation") throw new HttpError(403, "VIEW_ONLY", "This is a view-only staff session. Changes are not allowed.");
       const purpose = purposeFor(body.email, signedIn, body.purpose ?? body.type);
-      if (purpose !== "withdrawal" && (await emailTaken(body.email))) throw fieldError("email", "The email has already been taken.");
-      limit(otpEmailBurst, `${purpose}:${body.email}`, "Please wait before requesting another code.");
-      limit(otpEmailHour, `${purpose}:${body.email}`, "Too many codes requested. Please wait before retrying.");
+      // A withdrawal code always goes to the client's own address, whatever the form sent.
+      const email = purpose === "withdrawal" ? signedIn!.email : body.email;
+      if (purpose !== "withdrawal" && (await emailTaken(email))) throw fieldError("email", "The email has already been taken.");
+      // A signed-in client's codes are theirs alone: counted, replaced and checked per client,
+      // so another client asking for codes to the same address cannot cancel or block them.
+      const key = signedIn ? `${purpose}:client:${signedIn.id}` : `${purpose}:${email}`;
+      limit(otpEmailBurst, key, "Please wait before requesting another code.");
+      limit(otpEmailHour, key, "Too many codes requested. Please wait before retrying.");
       const code = newEmailCode();
       await transaction(db, async (conn) => {
-        await exec(conn, "UPDATE email_codes SET consumed_at = CURRENT_TIMESTAMP(3) WHERE email = ? AND purpose = ? AND consumed_at IS NULL", [body.email, purpose]);
+        if (signedIn)
+          await exec(conn, "UPDATE email_codes SET consumed_at = CURRENT_TIMESTAMP(3) WHERE email = ? AND purpose = ? AND client_id = ? AND consumed_at IS NULL", [email, purpose, signedIn.id]);
+        else await exec(conn, "UPDATE email_codes SET consumed_at = CURRENT_TIMESTAMP(3) WHERE email = ? AND purpose = ? AND consumed_at IS NULL", [email, purpose]);
         await exec(conn, "INSERT INTO email_codes (email, purpose, client_id, code_hash, expires_at) VALUES (?, ?, ?, ?, ?)", [
-          body.email, purpose, signedIn?.id ?? null, codeHash(config, body.email, purpose, code), new Date(Date.now() + CODE_TTL_MS),
+          email, purpose, signedIn?.id ?? null, codeHash(config, email, purpose, code), new Date(Date.now() + CODE_TTL_MS),
         ]);
         const what = purpose === "register" ? "finish creating your BIS Markets account" : purpose === "withdrawal" ? "confirm your withdrawal" : "confirm your new email address";
         await queueEmail(conn, config, {
-          to: body.email,
+          to: email,
           template: `otp_${purpose}`,
           subject: "Your BIS Markets verification code",
           text: `Your verification code is ${code}\n\nUse it to ${what}. It expires in 10 minutes.\n\nIf you did not ask for this code, ignore this email. BIS Markets staff will never ask you for it.`,
@@ -168,25 +174,13 @@ export function clientAuthRouter(deps: AppDeps): Router {
         req.body,
       );
       const signedIn = await optionalClient(req);
-      const requested = body.purpose ?? body.type;
+      // Without a session only a sign-up code can be checked. Withdrawal and new-email codes
+      // need the client's own session and only their own code counts, so a stranger who
+      // knows an address cannot use up its codes with wrong guesses.
+      const purpose = signedIn ? purposeFor(body.email, signedIn, body.purpose ?? body.type) : "register";
+      const email = purpose === "withdrawal" ? signedIn!.email : body.email;
       // Checking does not use the code up: the portal sends it again with the real request.
-      const ok = await transaction(db, async (conn) => {
-        let purpose: CodePurpose;
-        if (signedIn) purpose = purposeFor(body.email, signedIn, requested);
-        else if (requested) purpose = requested === "withdrawal" ? "withdrawal" : "register";
-        else {
-          // The portal checks a withdrawal code here without its token. Only the
-          // newest live code is checked, so one wrong guess counts once.
-          const live = await one<{ purpose: CodePurpose }>(
-            conn,
-            `SELECT purpose FROM email_codes WHERE email = ? AND purpose IN ('register', 'withdrawal') AND consumed_at IS NULL
-               AND expires_at > CURRENT_TIMESTAMP(3) AND attempts < ? ORDER BY id DESC LIMIT 1`,
-            [body.email, CODE_MAX_ATTEMPTS],
-          );
-          purpose = live?.purpose ?? "register";
-        }
-        return checkEmailCode(conn, config, body.email, purpose, body.verification_code, false);
-      });
+      const ok = await transaction(db, (conn) => checkEmailCode(conn, config, email, purpose, body.verification_code, false, signedIn?.id));
       if (!ok) throw fieldError("verification_code", "The verification code is invalid or has expired.");
       res.json({ success: true, message: "Code verified." });
     }),
@@ -477,10 +471,10 @@ export function clientAuthRouter(deps: AppDeps): Router {
       if (!row.password_hash || !(await verifyPassword(row.password_hash, body.password))) throw fieldError("password", "The password is incorrect.");
       if (body.email === row.email) throw fieldError("email", "This is already your email address.");
       if (await emailTaken(body.email)) throw fieldError("email", "The email has already been taken.");
-      const ok = await transaction(db, (conn) => checkEmailCode(conn, config, body.email, "update_email", body.verification_code, false));
+      const ok = await transaction(db, (conn) => checkEmailCode(conn, config, body.email, "update_email", body.verification_code, false, client.id));
       if (!ok) throw fieldError("verification_code", "The verification code is invalid or has expired.");
       await transaction(db, async (conn) => {
-        if (!(await checkEmailCode(conn, config, body.email, "update_email", body.verification_code, true))) throw fieldError("verification_code", "The verification code is invalid or has expired.");
+        if (!(await checkEmailCode(conn, config, body.email, "update_email", body.verification_code, true, client.id))) throw fieldError("verification_code", "The verification code is invalid or has expired.");
         try {
           await exec(conn, "UPDATE clients SET email = ?, email_verified_at = CURRENT_TIMESTAMP(3) WHERE id = ?", [body.email, client.id]);
         } catch (err) {
