@@ -385,6 +385,10 @@ describe.skipIf(!hasDb)("staff deposits", () => {
     await openProof(agent, again.id);
     expect((await approve(agent, again.id, { receivedAmount: "6000" })).body.status).toBe("second_approval");
     expect((await post(manager, url(again.id, "/return"), { note: "Check the amount on the statement" })).status).toBe(200);
+    // A first reviewer cannot reject it either: the client could then send it again as a fresh one-person request.
+    const refused = "This deposit was sent back from the second approval, so only staff who give second approvals can reject it.";
+    expect((await reject(agent, again.id)).body.error.message).toBe(refused);
+    expect((await detail(agent, again.id)).can.reject).toEqual({ ok: false, reason: refused });
     await openProof(manager, again.id);
     expect((await approve(manager, again.id, { receivedAmount: "5000", note: "Statement shows 5,000" })).body.status).toBe("second_approval");
     expect(await credits(again.id)).toBe(0);

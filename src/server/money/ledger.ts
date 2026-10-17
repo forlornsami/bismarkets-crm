@@ -190,11 +190,20 @@ async function verifyTransactions(conn: Conn): Promise<string[]> {
     if (!batch.length) return problems;
     after = Number(batch.at(-1)!.id);
     const ids = batch.map((t) => Number(t.id));
-    const entries = await rows<{ transaction_id: number; account: string; amount_cents: number }>(
+    const entries = await rows<{ id: number; transaction_id: number; account: string; client_id: number | null; currency: string; amount_cents: number }>(
       conn,
-      `SELECT transaction_id, account, amount_cents FROM ledger_entries WHERE transaction_id IN (${inList(ids)})`,
+      `SELECT id, transaction_id, account, client_id, currency, amount_cents FROM ledger_entries WHERE transaction_id IN (${inList(ids)})`,
       ids,
     );
+    // The client's wallet page lists entries by their client_id, so it must name the account's owner.
+    for (const e of entries) {
+      const owner = CLIENT_ACCOUNT.exec(e.account);
+      const ownerId = owner ? Number(owner[1]) : null;
+      if ((e.client_id === null ? null : Number(e.client_id)) !== ownerId) {
+        problems.push(`Ledger entry ${e.id} on ${e.account} is marked for client ${e.client_id ?? "none"}, not ${ownerId ?? "none"}.`);
+      }
+      if (e.currency !== "USD") problems.push(`Ledger entry ${e.id} on ${e.account} is in ${e.currency}; the ledger is in USD.`);
+    }
     const sourcesOf = async <T extends { id: number }>(type: LedgerSource, sql: string) => {
       const wanted = [...new Set(batch.filter((t) => t.source_type === type).map((t) => Number(t.source_id)))];
       const found = wanted.length ? await rows<T>(conn, `${sql} WHERE id IN (${inList(wanted)})`, wanted) : [];

@@ -962,6 +962,14 @@ describe.skipIf(!hasDb)("staff withdrawals", () => {
     const wrongTx = await post("withdrawal_paid", elsewhere.id, [{ account: holdAccount(clientId), amount: -5_000 }, { account: payoutAccount(cryptoType), amount: 5_000 }]);
     // A credit for a deposit that does not exist.
     const ghostTx = await post("deposit", 99_999_999, [{ account: walletAccount(clientId), amount: 50_000 }, { account: depositMethodAccount(bankDeposit), amount: -50_000 }]);
+    // The right accounts and amounts, written by hand with entries marked for another client and in rupees.
+    const mislabelled = await withdraw(payout, 4_000);
+    await exec(env.db, "UPDATE withdrawals SET status = 'paid' WHERE id = ?", [mislabelled.id]);
+    const other = await makeClient();
+    const raw = await exec(env.db, "INSERT INTO ledger_transactions (kind, source_type, source_id, client_id, memo) VALUES ('withdrawal_paid', 'withdrawal', ?, ?, 'tampered')", [mislabelled.id, clientId]);
+    const entry = await exec(env.db, "INSERT INTO ledger_entries (transaction_id, account, client_id, currency, amount_cents) VALUES (?, ?, ?, 'USD', -4000)", [raw.insertId, holdAccount(clientId), other]);
+    const rupees = await exec(env.db, "INSERT INTO ledger_entries (transaction_id, account, client_id, currency, amount_cents) VALUES (?, ?, NULL, 'PKR', 4000)", [raw.insertId, payoutAccount(bankType)]);
+    await exec(env.db, "UPDATE wallets SET held_cents = held_cents - 4000 WHERE client_id = ?", [clientId]);
 
     const problems = await verifyLedger(env.db);
     expect(problems).toEqual(
@@ -970,8 +978,10 @@ describe.skipIf(!hasDb)("staff withdrawals", () => {
         `Withdrawal ${vanished.reference} is rejected, but the ledger has 1 payout(s) and 0 return(s) to the wallet.`,
         `Ledger transaction ${wrongTx} (withdrawal_paid) for ${elsewhere.reference} moves client:${clientId}:hold -5000, payout:${cryptoType} 5000, not client:${clientId}:hold -5000, payout:${bankType} 5000.`,
         `Ledger transaction ${ghostTx} (deposit) belongs to deposit 99999999, which does not exist.`,
+        `Ledger entry ${entry.insertId} on client:${clientId}:hold is marked for client ${other}, not ${clientId}.`,
+        `Ledger entry ${rupees.insertId} on payout:${bankType} is in PKR; the ledger is in USD.`,
       ]),
     );
-    expect(problems).toHaveLength(4);
+    expect(problems).toHaveLength(6);
   });
 });

@@ -411,12 +411,21 @@ export function clientMoneyRouter(deps: AppDeps): Router {
         if (again) return { row: again, isNew: false };
         const { method } = request;
         if (!(await one(conn, `${DEPOSIT_METHOD} AND id = ?`, [method.id]))) throw fieldError("method", "Choose a deposit method.");
+        // The same screenshot as a deposit sent back from the second approval stays a two-person decision.
+        const sentBack = await one(
+          conn,
+          "SELECT 1 AS x FROM deposits d JOIN deposit_proofs p ON p.deposit_id = d.id WHERE d.client_id = ? AND p.sha256 = ? AND d.needs_second_approval = 1 LIMIT 1",
+          [client.id, request.sha256],
+        );
         const { id, reference } = await withReference("D", async (reference) => {
           const r = await exec(
             conn,
-            `INSERT INTO deposits (reference, client_id, wallet_id, payment_method_id, method_name, currency, amount_minor, usd_rate, rate_set_by, amount_cents, network, submitted_ip)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [reference, client.id, wallet.id, method.id, method.name, method.currency, request.amountMinor, request.rate, request.rateSetBy, request.amountCents, request.network, req.clientIp],
+            `INSERT INTO deposits (reference, client_id, wallet_id, payment_method_id, method_name, currency, amount_minor, usd_rate, rate_set_by, amount_cents, needs_second_approval, network, submitted_ip)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              reference, client.id, wallet.id, method.id, method.name, method.currency, request.amountMinor, request.rate, request.rateSetBy, request.amountCents,
+              sentBack ? 1 : 0, request.network, req.clientIp,
+            ],
           );
           return { id: r.insertId, reference };
         });

@@ -19,3 +19,7 @@ ALTER TABLE money_settings ADD COLUMN usd_to_pkr_set_by BIGINT UNSIGNED NULL AFT
   ADD CONSTRAINT fk_money_settings_rate_staff FOREIGN KEY (usd_to_pkr_set_by) REFERENCES staff_users (id) ON DELETE SET NULL;
 ALTER TABLE deposits ADD COLUMN rate_set_by BIGINT UNSIGNED NULL AFTER usd_rate,
   ADD CONSTRAINT fk_deposit_rate_staff FOREIGN KEY (rate_set_by) REFERENCES staff_users (id) ON DELETE SET NULL;
+
+-- The Admin role's description, where it is still the one first seeded.
+UPDATE roles SET description = 'Runs the brokerage day to day; cannot change roles or MT5 server credentials, or approve and pay out money.'
+WHERE slug = 'admin' AND is_system = 1 AND description = 'Runs the brokerage day to day; cannot change roles or MT5 server credentials.';

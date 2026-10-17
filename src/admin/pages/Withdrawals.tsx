@@ -446,7 +446,9 @@ export function WithdrawalWorkbench({ id }: { id: string }) {
       // Shown fresh if it is opened again, without fetching (and auditing) it now.
       void client.invalidateQueries({ queryKey: ["withdrawal-detail", sid], refetchType: "none" });
       for (const key of [["withdrawals"], ["withdrawals-summary"]]) void client.invalidateQueries({ queryKey: key });
-      next.mutate({});
+      // Staff who may only reject have no queue to be handed the next item from.
+      if (can("withdrawal.process") || can("withdrawal.approve") || can("withdrawal.pay")) next.mutate({});
+      else back();
     },
     // Someone else may have decided or taken the item, or the rules changed: show the item as it is now.
     onError: (e) => {

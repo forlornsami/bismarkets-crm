@@ -204,6 +204,10 @@ function blockOf(staff: StaffContext, r: Row, action: Action, money = true): Htt
   if (holder && holder !== staff.id) return conflict(`${r.claimer_name ?? "Someone else"} is reviewing this deposit right now.`);
   // Four eyes: above the limit, the person who gave the first approval never gives the second.
   if (action === "secondApprove" && r.first_reviewed_by === staff.id) return forbidden("You gave the first approval, so another person must give the second.");
+  // A second reviewer objected: a first reviewer rejecting it would let the client send it again with a clean slate.
+  if (action === "reject" && r.needs_second_approval === 1 && !staff.permissions.has("deposit.approve_large")) {
+    return forbidden("This deposit was sent back from the second approval, so only staff who give second approvals can reject it.");
+  }
   if (money && (action === "approve" || action === "secondApprove")) {
     const block = staffMoneyBlock({ status: r.client_status, kyc_status: r.kyc_status });
     if (block) return badRequest(block);

@@ -471,6 +471,13 @@ describe.skipIf(!hasDb)("client money API", () => {
     const resent = await deposit(ann, { method: String(m.trc), amount: "75", wallet_key: ann.key }, fresh);
     expect(resent.status).toBe(201);
     expect(resent.body.deposit.reference).not.toBe(a!.body.deposit.reference);
+    const twoPerson = async (reference: string) => (await one<{ n: number }>(env.db, "SELECT needs_second_approval AS n FROM deposits WHERE reference = ?", [reference]))!.n;
+    expect(await twoPerson(resent.body.deposit.reference)).toBe(0);
+    // A screenshot whose deposit was sent back from the second approval keeps needing two people when it comes again.
+    await exec(env.db, "UPDATE deposits SET status = 'rejected', needs_second_approval = 1 WHERE reference = ?", [resent.body.deposit.reference]);
+    const third = await deposit(ann, { method: String(m.bankUsd), amount: "75", wallet_key: ann.key }, fresh);
+    expect(third.status).toBe(201);
+    expect(await twoPerson(third.body.deposit.reference)).toBe(1);
   });
 
   it("keeps at most five deposits waiting, but still answers a retry of one of them", async () => {
