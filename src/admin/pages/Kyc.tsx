@@ -552,6 +552,10 @@ export function KycWorkbench({ id }: { id: string }) {
   const [pagesSeen, setPagesSeen] = useState<ReadonlyMap<number, ReadonlySet<number>>>(() => new Map());
   const [pageCounts, setPageCounts] = useState<ReadonlyMap<number, number>>(() => new Map());
   const reported = useRef(new Set<string>());
+  const toastRef = useRef(toast);
+  toastRef.current = toast;
+  const mounted = useRef(true);
+  useEffect(() => () => void (mounted.current = false), []);
   const [showOther, setShowOther] = useState(false);
   const decided = useRef(false);
   const lastActive = useRef(Date.now());
@@ -569,15 +573,24 @@ export function KycWorkbench({ id }: { id: string }) {
   }, [d, me]);
   const markViewed = useCallback((fileId: number) => setViewed((prev) => (prev.has(fileId) ? prev : new Set(prev).add(fileId))), []);
   // Each PDF page drawn is reported once; it counts here only after the server recorded it, as approving checks there.
+  // A dropped connection is retried a few times; after that the reviewer is told, and redrawing the page tries again.
   const markPage = useCallback((fileId: number, page: number, pages: number) => {
     setPageCounts((prev) => (prev.get(fileId) === pages ? prev : new Map(prev).set(fileId, pages)));
     const key = `${fileId}:${page}`;
     if (reported.current.has(key)) return;
     reported.current.add(key);
-    api.post(`/api/staff/kyc/documents/${fileId}/pages`, { page }).then(
-      () => setPagesSeen((prev) => new Map(prev).set(fileId, new Set(prev.get(fileId) ?? []).add(page))),
-      () => reported.current.delete(key),
-    );
+    const send = (attempt: number) =>
+      api.post(`/api/staff/kyc/documents/${fileId}/pages`, { page }).then(
+        () => setPagesSeen((prev) => new Map(prev).set(fileId, new Set(prev.get(fileId) ?? []).add(page))),
+        (e: unknown) => {
+          if (!mounted.current) return;
+          const passing = !(e instanceof ApiError) || e.status >= 500 || e.status === 429;
+          if (passing && attempt < 3) return void setTimeout(() => mounted.current && send(attempt + 1), 1000 * 2 ** attempt);
+          reported.current.delete(key);
+          toastRef.current(`Page ${page} could not be marked as opened. Zoom or turn the page to try again, or download the PDF.`, "bad");
+        },
+      );
+    void send(0);
   }, []);
 
   // Reload the item to learn who holds it now, or whether it was decided meanwhile.

@@ -64,26 +64,26 @@ export async function prepareDocument(bytes: Buffer, mime: DocumentMime): Promis
 
 /**
  * Opens a PDF the way the review screen will. `pages` is null when pdf.js
- * cannot read the file (the reviewer then downloads it). Many bank statements
- * are encrypted with an empty user password (owner restrictions only); those
- * open without a prompt and are accepted.
+ * cannot read the file in time (the reviewer then downloads it). Many bank
+ * statements are encrypted with an empty user password (owner restrictions
+ * only); those open without a prompt and are accepted.
  */
-export async function inspectPdf(bytes: Buffer): Promise<{ needsPassword: boolean; pages: number | null }> {
-  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
-  // A copy: pdf.js may take over the buffer it is given, and the original is stored.
-  const task = pdfjs.getDocument({ data: new Uint8Array(bytes), disableFontFace: true, useSystemFonts: false, verbosity: 0 });
+export async function inspectPdf(bytes: Buffer, timeoutMs = PDF_TIMEOUT_MS): Promise<{ needsPassword: boolean; pages: number | null }> {
+  // pdf.js has no worker of its own in Node and parses on the calling thread,
+  // where a crafted PDF could block every request or exhaust the heap. So it
+  // runs in a short-lived worker with a time and memory limit; giving up only
+  // means the page count is unknown.
   try {
-    return { needsPassword: false, pages: (await task.promise).numPages };
-  } catch (error) {
-    return { needsPassword: (error as { name?: string }).name === "PasswordException", pages: null };
-  } finally {
-    await task.destroy();
+    const m = await inWorker<{ pages?: number; password?: boolean; error?: string }>(PDF_WORKER, { module: requireHere.resolve("pdfjs-dist/legacy/build/pdf.mjs"), bytes }, timeoutMs, 256);
+    return { needsPassword: m.password === true, pages: typeof m.pages === "number" ? m.pages : null };
+  } catch {
+    return { needsPassword: false, pages: null };
   }
 }
 
 // heic-convert decodes in WebAssembly on the calling thread, which takes
-// seconds for a phone photo, so it runs in a short-lived worker and never
-// blocks other requests. At most two run at a time.
+// seconds for a phone photo, so it runs in a short-lived worker too and never
+// blocks other requests. At most two workers run at a time.
 const requireHere = createRequire(import.meta.url);
 const HEIC_WORKER = `
 const { parentPort, workerData } = require("node:worker_threads");
@@ -92,28 +92,40 @@ require(workerData.module)({ buffer: workerData.bytes, format: "PNG" }).then(
   (error) => parentPort.postMessage({ error: String((error && error.message) || error) }),
 );`;
 const HEIC_TIMEOUT_MS = 60_000;
-let heicRunning = 0;
-const heicWaiting: (() => void)[] = [];
-
-export async function heicToPng(bytes: Buffer): Promise<Buffer> {
-  // A finished conversion hands its slot straight to the next one waiting.
-  if (heicRunning < 2) heicRunning++;
-  else await new Promise<void>((resolve) => heicWaiting.push(resolve));
+const PDF_WORKER = `
+const { parentPort, workerData } = require("node:worker_threads");
+const { pathToFileURL } = require("node:url");
+import(pathToFileURL(workerData.module).href).then(async (pdfjs) => {
+  const task = pdfjs.getDocument({ data: workerData.bytes, disableFontFace: true, useSystemFonts: false, verbosity: 0 });
   try {
-    return await new Promise<Buffer>((resolve, reject) => {
-      const worker = new Worker(HEIC_WORKER, {
-        eval: true,
-        workerData: { module: requireHere.resolve("heic-convert"), bytes },
-        resourceLimits: { maxOldGenerationSizeMb: 512 },
-      });
+    parentPort.postMessage({ pages: (await task.promise).numPages });
+  } catch (error) {
+    parentPort.postMessage({ password: !!error && error.name === "PasswordException" });
+  } finally {
+    await task.destroy();
+  }
+}, (error) => parentPort.postMessage({ error: String((error && error.message) || error) }));`;
+const PDF_TIMEOUT_MS = 10_000;
+let running = 0;
+const waiting: (() => void)[] = [];
+
+/** Runs `code` in a fresh worker and resolves with its one message; it is stopped after `timeoutMs`. */
+async function inWorker<T extends { error?: string }>(code: string, workerData: { module: string; bytes: Buffer }, timeoutMs: number, maxOldGenerationSizeMb: number): Promise<T> {
+  // A finished worker hands its slot straight to the next one waiting.
+  if (running < 2) running++;
+  else await new Promise<void>((resolve) => waiting.push(resolve));
+  try {
+    return await new Promise<T>((resolve, reject) => {
+      // The bytes are copied into the worker; the caller's buffer is what gets stored.
+      const worker = new Worker(code, { eval: true, workerData, resourceLimits: { maxOldGenerationSizeMb } });
       const timer = setTimeout(() => {
-        reject(new Error("HEIC conversion timed out"));
+        reject(new Error("The worker timed out"));
         void worker.terminate();
-      }, HEIC_TIMEOUT_MS);
-      worker.once("message", (m: { png?: Uint8Array; error?: string }) => {
+      }, timeoutMs);
+      worker.once("message", (m: T) => {
         clearTimeout(timer);
-        if (m.png) resolve(Buffer.from(m.png.buffer, m.png.byteOffset, m.png.byteLength));
-        else reject(new Error(m.error ?? "HEIC conversion failed"));
+        if (m.error) reject(new Error(m.error));
+        else resolve(m);
         void worker.terminate();
       });
       worker.once("error", (error) => {
@@ -122,12 +134,18 @@ export async function heicToPng(bytes: Buffer): Promise<Buffer> {
       });
       worker.once("exit", () => {
         clearTimeout(timer);
-        reject(new Error("HEIC conversion stopped"));
+        reject(new Error("The worker stopped"));
       });
     });
   } finally {
-    const next = heicWaiting.shift();
+    const next = waiting.shift();
     if (next) next();
-    else heicRunning--;
+    else running--;
   }
+}
+
+export async function heicToPng(bytes: Buffer): Promise<Buffer> {
+  const { png } = await inWorker<{ png?: Uint8Array; error?: string }>(HEIC_WORKER, { module: requireHere.resolve("heic-convert"), bytes }, HEIC_TIMEOUT_MS, 512);
+  if (!png) throw new Error("HEIC conversion failed");
+  return Buffer.from(png.buffer, png.byteOffset, png.byteLength);
 }

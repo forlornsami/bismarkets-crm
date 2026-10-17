@@ -9,7 +9,7 @@ import { documentType, kycDocumentContext, kycRequired } from "../src/server/cli
 import { createClientSession } from "../src/server/clients/session";
 import { decryptBytes, decryptField, sha256 } from "../src/server/lib/crypto";
 import { exec, one, rows } from "../src/server/lib/db";
-import { DocumentProblem, prepareDocument } from "../src/server/lib/documents";
+import { DocumentProblem, inspectPdf, prepareDocument } from "../src/server/lib/documents";
 import { outboxContext } from "../src/server/lib/email";
 import { createStaff, hasDb, ORIGIN, patch, post, setup, signIn, stepUp, type SignedIn, type TestEnv } from "./helpers";
 
@@ -90,6 +90,18 @@ describe("document handling", () => {
     // Pages are counted so approving can require every one; a PDF pdf.js cannot read is kept for download.
     expect(await prepareDocument(pdf, "application/pdf")).toMatchObject({ bytes: pdf, pages: 2 });
     expect(await prepareDocument(brokenPdf, "application/pdf")).toMatchObject({ bytes: brokenPdf, pages: null });
+  });
+
+  it("reads PDFs off the main thread and gives up on one that would hang it", async () => {
+    // A cross-reference stream with no entry widths and a huge range keeps pdf.js busy for minutes.
+    const hang = Buffer.from("%PDF-1.5\n1 0 obj<</Type/XRef/Size 2000000000/W[0 0 0]/Index[0 2000000000]/Root 2 0 R/Length 0>>stream\n\nendstream\nendobj\nstartxref\n9\n%%EOF\n");
+    let ticks = 0;
+    const timer = setInterval(() => ticks++, 50);
+    const started = Date.now();
+    expect(await inspectPdf(hang, 1000)).toEqual({ needsPassword: false, pages: null });
+    clearInterval(timer);
+    expect(Date.now() - started).toBeLessThan(5000);
+    expect(ticks).toBeGreaterThan(10);
   });
 });
 
@@ -601,7 +613,7 @@ describe.skipIf(!hasDb)("KYC", () => {
     expect(await warnings(reviewer, sub)).toContain("The client's last name changed after these documents were sent. Compare against the details shown here.");
   });
 
-  it("leaves blank details open to fill in while a staff upload waits, and locks them once filled", async () => {
+  it("leaves blank details open to fill in while a staff upload waits, and keeps an approval as it was checked", async () => {
     const bo = await register("blank@client.test", "Bo", "Blank");
     const b = bearer(bo.token);
     await stepUp(env, reviewer);
@@ -609,19 +621,25 @@ describe.skipIf(!hasDb)("KYC", () => {
       .field("client_id", String(bo.id)).field("type", "4").field("sub_type", "1").field("note", "Sent by email on 16 October")
       .attach("document1", await photo("#123456"), { filename: "bill.png", contentType: "image/png" });
     expect(staffUpload.status).toBe(201);
-    // Nothing was checked yet, so the empty address fields are not locked; the name is.
+    // Nothing was checked yet, so the empty address fields are not locked.
     expect((await api().get("/api/kyc").set(b)).body.locked_profile_fields).toEqual([]);
     expect((await boss.agent.get(`/api/staff/clients/${bo.id}`)).body.lockedFields).toEqual([]);
-    const { zipcode: _zip, ...noZip } = PROFILE;
-    expect((await api().patch("/api/user").set(b).send({ ...noZip, dob: "1985-05-05" })).status).toBe(200);
+    const { zipcode: _zip, address: _address, ...partial } = PROFILE;
+    expect((await api().patch("/api/user").set(b).send({ ...partial, dob: "1985-05-05" })).status).toBe(200);
+    expect((await api().get("/api/kyc").set(b)).body.locked_profile_fields).toEqual(["country", "city"]);
+    expect((await api().patch("/api/user").set(b).send({ city: "Leeds" })).body.errors).toEqual({ city: [LOCKED] });
+    // Staff without the override may fill in a blank detail too, but not change one that is filled.
+    const refused = "These details were checked against the client's documents. Ask a compliance admin to change them.";
+    expect((await patch(salesManager, `/api/staff/clients/${bo.id}`, { city: "York" })).body.error.message).toBe(refused);
+    expect((await patch(salesManager, `/api/staff/clients/${bo.id}`, { address: "1 Baker St" })).status).toBe(200);
     expect((await api().get("/api/kyc").set(b)).body.locked_profile_fields).toEqual(["country", "city", "address"]);
-    const moved = await api().patch("/api/user").set(b).send({ city: "Leeds" });
-    expect(moved.body.errors).toEqual({ city: [LOCKED] });
-    // Staff without the override may fill in the blank postcode too, but not change what is filled.
-    expect((await patch(salesManager, `/api/staff/clients/${bo.id}`, { city: "York" })).body.error.message).toBe("These details were checked against the client's documents. Ask a compliance admin to change them.");
-    expect((await patch(salesManager, `/api/staff/clients/${bo.id}`, { zipcode: "LS1 1AA" })).status).toBe(200);
+
+    // Approved without a postcode: it stays as the reviewer saw it, blank.
+    await stepUp(env, second);
+    expect((await approve(second, staffUpload.body.id)).status).toBe(200);
     expect((await api().get("/api/kyc").set(b)).body.locked_profile_fields).toEqual(["country", "city", "address", "zipcode"]);
-    expect((await api().patch("/api/user").set(b).send({ zipcode: "LS2 2BB" })).body.errors).toEqual({ zipcode: [LOCKED] });
+    expect((await api().patch("/api/user").set(b).send({ zipcode: "LS1 1AA" })).body.errors).toEqual({ zipcode: [LOCKED] });
+    expect((await patch(salesManager, `/api/staff/clients/${bo.id}`, { zipcode: "LS1 1AA" })).body.error.message).toBe(refused);
   });
 
   it("warns about the same person, reused files and shared files without naming clients out of scope", async () => {

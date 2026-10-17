@@ -188,7 +188,9 @@ const MAX_AREA = 16_000_000;
 const MAX_SIDE = 8192;
 
 /** One page drawn to fit the stage, then zoomed and turned; turning never clips. `onDrawn` runs each time a PDF page is on screen. */
-function PageCanvas({ opened, page, turn, zoom, box, label, onDrawn }: { opened: Exclude<Opened, { kind: "failed" }>; page: number; turn: number; zoom: number; box: { w: number; h: number }; label: string; onDrawn?: (page: number) => void }) {
+function PageCanvas({
+  opened, page, turn, zoom, box, label, onDrawn, fallback,
+}: { opened: Exclude<Opened, { kind: "failed" }>; page: number; turn: number; zoom: number; box: { w: number; h: number }; label: string; onDrawn?: (page: number) => void; fallback?: ReactNode }) {
   const ref = useRef<HTMLCanvasElement>(null);
   const [error, setError] = useState<string | null>(null);
   const drawn = useRef(onDrawn);
@@ -256,8 +258,17 @@ function PageCanvas({ opened, page, turn, zoom, box, label, onDrawn }: { opened:
       task?.cancel();
     };
   }, [opened, page, rotation, zoom, box.w, box.h]);
-  if (error) return <p className="viewer-note error-text">{error}</p>;
-  return <canvas ref={ref} className="viewer-page" role="img" aria-label={label} />;
+  return (
+    <>
+      {error && (
+        <p className="viewer-note error-text">
+          {error} {fallback}
+        </p>
+      )}
+      {/* Kept while the error shows, so the next page, zoom or turn draws again. */}
+      <canvas ref={ref} className="viewer-page" role="img" aria-label={label} style={error ? { display: "none" } : undefined} />
+    </>
+  );
 }
 
 /**
@@ -522,6 +533,13 @@ export function DocumentViewer({
             box={box}
             label={pages > 1 ? `${file.label}, page ${page} of ${pages}` : file.label}
             onDrawn={current.kind === "pdf" ? (p) => pageViewedRef.current?.(file.id, p, pages) : undefined}
+            fallback={
+              current.kind === "pdf" && (
+                <a className="button button-ghost button-small" href={downloadUrl} download onClick={() => onViewed?.(file.id)}>
+                  <Download size={15} /> Download the PDF
+                </a>
+              )
+            }
           />
         )}
       </div>

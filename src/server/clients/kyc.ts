@@ -233,13 +233,19 @@ export const lockClient = (conn: Conn, clientId: number) =>
 
 /**
  * Profile fields (snake_case) that are under review or verified, so neither the
- * client nor most staff may change them. A blank field was never checked, so it
- * stays open to fill in (staff may upload for a client whose profile is empty).
+ * client nor most staff may change them. Once approved, every field stays as the
+ * reviewer saw it, blank ones included. While under review, a blank field was
+ * never checked, so it stays open to fill in (staff may upload for a client
+ * whose profile is still empty); the reviewer is warned of the change.
  */
 export function lockedProfileFields(latest: LatestSubmissions, profile: Pick<ClientRow, SnapshotField>): SnapshotField[] {
-  const held = (s: SubmissionRow | null) => s?.status === "pending" || s?.status === "approved";
-  const fields = [...(held(latest.identity) ? VERIFIED_FIELDS.identity : []), ...(held(latest.address) ? VERIFIED_FIELDS.address : [])];
-  return fields.filter((f) => !sameProfileValue(profile[f], ""));
+  const of = (key: KycCategory): readonly SnapshotField[] => {
+    const s = latest[key];
+    if (s?.status === "approved") return VERIFIED_FIELDS[key];
+    if (s?.status === "pending") return VERIFIED_FIELDS[key].filter((f) => !sameProfileValue(profile[f], ""));
+    return [];
+  };
+  return [...of("identity"), ...of("address")];
 }
 
 export type KycOverall = "none" | "partial" | "pending" | "approved" | "rejected";
