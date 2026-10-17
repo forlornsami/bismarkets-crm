@@ -177,5 +177,10 @@ describe("request log paths", () => {
     expect(loggablePath("/api/payment-qr/ca02d5c2c06c97a8e7a6efb2614873b3?v=1")).toBe("/api/payment-qr/:token");
     expect(loggablePath("/api/user?token=secret")).toBe("/api/user");
     expect(loggablePath("/api/staff/withdrawals/7/qr")).toBe("/api/staff/withdrawals/7/qr");
+    // Routing ignores case and repeated slashes; the token goes whatever the spelling.
+    const t = "ca02d5c2c06c97a8e7a6efb2614873b3";
+    for (const path of [`/API/Payout-QR/${t}`, `//api/payout-qr/${t}`, `/api//payout-qr/${t}`, `/api/payout-qr//${t}/`, `/api/payout%2Dqr/${t}`, `/api/%70ayout-qr/${t}`]) {
+      expect([path, loggablePath(path).includes(t.slice(0, 8))]).toEqual([path, false]);
+    }
   });
 });

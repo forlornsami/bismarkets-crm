@@ -649,6 +649,11 @@ describe.skipIf(!hasDb)("staff withdrawals", () => {
     await transaction(env.db, (conn) => writeAudit(conn, staffActor, { action: "client.updated", entityType: "client", entityId: clientId, meta: { fields: ["city"] } }));
     await new Promise((r) => setTimeout(r, 5));
     await transaction(env.db, (conn) => writeAudit(conn, staffActor, { action: "client.updated", entityType: "client", entityId: clientId, meta: { fields: ["email", "city"] } }));
+    // Renaming a payout account or making it the default sends money nowhere new.
+    const clientActor = { actor: { type: "client" as const, id: clientId, label: "sara" }, ip: "", userAgent: "" };
+    for (const meta of [{ fields: [], default: true }, { fields: ["method_name"] }, { fields: ["method_name"], default: false }]) {
+      await transaction(env.db, (conn) => writeAudit(conn, clientActor, { action: "payout_method.updated", entityType: "client", entityId: clientId, meta: { id: payout.id, ...meta } }));
+    }
     const w = await withdraw(payout, 50_000);
 
     const view = await agentA.agent.get(W(w.id));
@@ -663,6 +668,13 @@ describe.skipIf(!hasDb)("staff withdrawals", () => {
       { tone: "warn", text: "This client deposited by crypto, but is withdrawing to bank." },
       { tone: "info", text: "Needs a second approval from another person." },
     ]);
+    // A changed account number does.
+    await transaction(env.db, (conn) =>
+      writeAudit(conn, clientActor, { action: "payout_method.updated", entityType: "client", entityId: clientId, meta: { id: payout.id, fields: ["method_name", "account_number"] } }),
+    );
+    expect((await agentA.agent.get(W(w.id))).body.warnings).toContainEqual({
+      tone: "warn", text: `Recent security changes on this account: password reset on ${day}, email address changed by staff on ${day} and payout account changed on ${day}.`,
+    });
     expect(view.body.history.deposits).toMatchObject({ approvedCount: 2, approvedTotalCents: 100_000, byMethod: [{ methodName: "USDT TRC20", kind: "crypto", totalCents: 100_000 }] });
 
     // Staff who may not see the other client are not told who it is.
@@ -704,6 +716,13 @@ describe.skipIf(!hasDb)("staff withdrawals", () => {
       ((await s.agent.get(`/api/staff/clients/${clientId}/activity`)).body.items as { action: string; meta: Record<string, unknown> }[]).find((a) => a.action === "withdrawal.approved")!.meta;
     expect(await entry(agentA)).toMatchObject({ withdrawalId: w.id, reference: w.reference, amountCents: 10_000, stage: "single", internalNote: "Called the client" });
     expect(await entry(support)).toEqual({ withdrawalId: w.id, reference: w.reference, stage: "single" });
+    // Saved payout accounts: which one and what changed, but not the account ending.
+    const added = { action: "payout_method.added", entityType: "client", entityId: clientId, meta: { id: payout.id, kind: "bank", type: "Bank transfer", ending: "4321", default: true, qr: false } };
+    await transaction(env.db, (conn) => writeAudit(conn, { actor: { type: "client", id: clientId, label: "client" }, ip: "", userAgent: "" }, added));
+    const accountEntry = async (s: SignedIn) =>
+      ((await s.agent.get(`/api/staff/clients/${clientId}/activity`)).body.items as { action: string; meta: Record<string, unknown> }[]).find((a) => a.action === "payout_method.added")!.meta;
+    expect(await accountEntry(agentA)).toMatchObject({ ending: "4321", type: "Bank transfer" });
+    expect(await accountEntry(support)).toEqual({ id: payout.id, kind: "bank", default: true });
     expect((await reject(agentA, w.id)).status).toBe(200);
   });
 

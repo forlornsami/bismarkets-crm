@@ -52,6 +52,7 @@ export function clientAuthRouter(deps: AppDeps): Router {
   const registerIp = new RateLimiter(40, 60 * 60_000);
   const otpEmailBurst = new RateLimiter(1, 60_000);
   const otpEmailHour = new RateLimiter(6, 60 * 60_000);
+  const otpAddressHour = new RateLimiter(6, 60 * 60_000);
   const otpIp = new RateLimiter(30, 60 * 60_000);
   const verifyIp = new RateLimiter(40, 15 * 60_000);
   const resetEmail = new RateLimiter(3, 60 * 60_000);
@@ -143,6 +144,8 @@ export function clientAuthRouter(deps: AppDeps): Router {
       const key = signedIn ? `${purpose}:client:${signedIn.id}` : `${purpose}:${email}`;
       limit(otpEmailBurst, key, "Please wait before requesting another code.");
       limit(otpEmailHour, key, "Too many codes requested. Please wait before retrying.");
+      // A new address is anyone's to type in: however many accounts ask, it gets a few codes an hour.
+      if (purpose === "update_email") limit(otpAddressHour, email.toLowerCase(), "Too many codes requested. Please wait before retrying.");
       const code = newEmailCode();
       await transaction(db, async (conn) => {
         if (signedIn)
@@ -174,6 +177,8 @@ export function clientAuthRouter(deps: AppDeps): Router {
         req.body,
       );
       const signedIn = await optionalClient(req);
+      // A wrong guess counts against the client's code, so a view-only session may not make one.
+      if (signedIn?.kind === "impersonation") throw new HttpError(403, "VIEW_ONLY", "This is a view-only staff session. Changes are not allowed.");
       // Without a session only a sign-up code can be checked. Withdrawal and new-email codes
       // need the client's own session and only their own code counts, so a stranger who
       // knows an address cannot use up its codes with wrong guesses.

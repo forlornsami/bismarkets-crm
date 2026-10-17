@@ -667,6 +667,11 @@ function LimitsCard() {
     }
   }
   if (!RATE.test(form.usdToPkr.trim()) || /^0+(\.0+)?$/.test(form.usdToPkr.trim())) problems.usdToPkr = "Enter the rate as a number above zero, with up to 6 decimals, such as 280 or 279.5.";
+  else {
+    // As the server checks it: one change moves the rate by at most 20% either way.
+    const [was, now] = [Number(initial.usdToPkr), Number(form.usdToPkr.trim())];
+    if (was > 0 && (now * 100 > was * 120 || was * 100 > now * 120)) problems.usdToPkr = `Change the rate by at most 20% at a time (now ${initial.usdToPkr}). For a bigger change, make it in steps.`;
+  }
   const max = cents.maxWithdrawalCents;
   const min = cents.minWithdrawalCents;
   if (typeof max === "number" && typeof min === "number" && max < min) problems.maxWithdrawalCents = "The maximum must be at least the minimum withdrawal.";

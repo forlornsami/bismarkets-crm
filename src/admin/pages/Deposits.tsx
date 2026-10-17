@@ -99,6 +99,8 @@ interface DepositDetail extends DepositItem {
   rejectReasons: string[];
   claimMinutes: number;
   secondApprovalAboveCents: number;
+  /** You set the method's account details or the rate: your approval goes to a second person. */
+  setByYou?: boolean;
   expectedReference: string;
 }
 
@@ -468,7 +470,7 @@ export function DepositWorkbench({ id }: { id: string }) {
   const differs = parsed.minor !== undefined && parsed.minor !== d.amountMinor;
   const credited = parsed.minor !== undefined ? toUsdCents(parsed.minor, d.currency, d.usdRate) : null;
   const limit = typeof d.secondApprovalAboveCents === "number" ? d.secondApprovalAboveCents : null;
-  const needsSecond = stage === "first" && (d.sentBack || (limit !== null ? (credited ?? d.amountCents) > limit : d.needsSecondApproval));
+  const needsSecond = stage === "first" && (d.sentBack || d.setByYou || (limit !== null ? (credited ?? d.amountCents) > limit : d.needsSecondApproval));
   const approveHint =
     stage === "first" && !complete
       ? anyProblem

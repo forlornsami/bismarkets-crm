@@ -388,7 +388,7 @@ describe.skipIf(!hasDb)("client money API", () => {
     });
     annUsd = res.body.deposit.reference;
     const row = (await one<Record<string, unknown>>(env.db, "SELECT d.*, w.client_id AS wallet_owner FROM deposits d JOIN wallets w ON w.id = d.wallet_id WHERE d.reference = ?", [annUsd]))!;
-    expect(row).toMatchObject({ client_id: ann.id, wallet_owner: ann.id, payment_method_id: m.bankUsd, status: "pending", currency: "USD", amount_minor: 15050, usd_rate: "1.000000", amount_cents: 15050, credited_cents: null });
+    expect(row).toMatchObject({ client_id: ann.id, wallet_owner: ann.id, payment_method_id: m.bankUsd, status: "pending", currency: "USD", amount_minor: 15050, usd_rate: "1.000000", rate_set_by: null, amount_cents: 15050, credited_cents: null });
     expect(row.submitted_ip).not.toBe("");
     const proof = (await one<{ mime: string; sha256: string; file_name: string; editor: string | null; size_bytes: number; bytes_enc: Buffer }>(env.db, "SELECT * FROM deposit_proofs WHERE deposit_id = ?", [row.id]))!;
     expect(proof).toMatchObject({ mime: "image/png", sha256: sha256(annProof), file_name: "IMG_2041", editor: null });
@@ -417,12 +417,16 @@ describe.skipIf(!hasDb)("client money API", () => {
   });
 
   it("converts a rupee deposit to US dollars at the rate shown", async () => {
+    // Whoever set the rate is kept with the deposit: they cannot approve it alone.
+    const setter = await createStaff(env.db, "rates@bis.test", "finance_manager");
+    await exec(env.db, "UPDATE money_settings SET usd_to_pkr_set_by = ? WHERE id = 1", [setter]);
     const res = await deposit(ann, { method: String(m.bankPkr), amount: "28000", wallet_key: ann.key }, await png("#118834"));
     expect(res.status).toBe(201);
     expect(res.body.deposit).toMatchObject({ amount: 100, currency: "USD", method_name: "Local bank (PKR)" });
-    expect(await one(env.db, "SELECT currency, amount_minor, usd_rate, amount_cents FROM deposits WHERE reference = ?", [res.body.deposit.reference])).toEqual({
-      currency: "PKR", amount_minor: 2_800_000, usd_rate: "280.000000", amount_cents: 10_000,
+    expect(await one(env.db, "SELECT currency, amount_minor, usd_rate, rate_set_by, amount_cents FROM deposits WHERE reference = ?", [res.body.deposit.reference])).toEqual({
+      currency: "PKR", amount_minor: 2_800_000, usd_rate: "280.000000", rate_set_by: setter, amount_cents: 10_000,
     });
+    await exec(env.db, "UPDATE money_settings SET usd_to_pkr_set_by = NULL WHERE id = 1");
     expect((await lastBell(ann.id))!.body).toBe("We will check your payment of PKR 28,000.00 (about USD 100.00) and add it to your wallet.");
   });
 

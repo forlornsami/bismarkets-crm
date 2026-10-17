@@ -62,7 +62,11 @@ describe.skipIf(!hasDb)("staff deposits", () => {
   }
 
   /** A deposit as the client API stores it: the row and its encrypted proof. */
-  async function makeDeposit(clientId: number, methodId: number, o: { amountMinor?: number; currency?: "USD" | "PKR"; rate?: string; proof?: Buffer; editor?: string | null; hoursOld?: number } = {}) {
+  async function makeDeposit(
+    clientId: number,
+    methodId: number,
+    o: { amountMinor?: number; currency?: "USD" | "PKR"; rate?: string; rateSetBy?: number; proof?: Buffer; editor?: string | null; hoursOld?: number } = {},
+  ) {
     const wallet = await walletOf(env.db, clientId);
     const reference = newReference("D");
     const currency = o.currency ?? "USD";
@@ -72,8 +76,8 @@ describe.skipIf(!hasDb)("staff deposits", () => {
     const method = await one<{ name: string }>(env.db, "SELECT name FROM payment_methods WHERE id = ?", [methodId]);
     const r = await exec(
       env.db,
-      "INSERT INTO deposits (reference, client_id, wallet_id, payment_method_id, method_name, currency, amount_minor, usd_rate, amount_cents, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      [reference, clientId, wallet.id, methodId, method!.name, currency, amountMinor, rate, amountCents, new Date(Date.now() - (o.hoursOld ?? 1) * 3_600_000)],
+      "INSERT INTO deposits (reference, client_id, wallet_id, payment_method_id, method_name, currency, amount_minor, usd_rate, rate_set_by, amount_cents, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [reference, clientId, wallet.id, methodId, method!.name, currency, amountMinor, rate, o.rateSetBy ?? null, amountCents, new Date(Date.now() - (o.hoursOld ?? 1) * 3_600_000)],
     );
     const proof = o.proof ?? (await screenshot());
     await exec(env.db, "INSERT INTO deposit_proofs (deposit_id, mime, size_bytes, sha256, file_name, editor, bytes_enc) VALUES (?, 'image/png', ?, ?, 'payment.png', ?, ?)", [
@@ -558,6 +562,63 @@ describe.skipIf(!hasDb)("staff deposits", () => {
     expect(await verifyLedger(env.db)).toEqual([]);
   });
 
+  it("never lets whoever set where a deposit was paid, or its rupee rate, approve it alone", async () => {
+    const setBy = async (id: number) => (await one<{ who: number | null }>(env.db, "SELECT details_set_by AS who FROM payment_methods WHERE id = ?", [id]))!.who;
+    const own = (await post(manager, "/api/staff/money/methods", {
+      direction: "deposit", kind: "bank", name: "Faysal Bank", bankName: "Faysal Bank", accountTitle: "BIS Markets Ltd", accountNumber: "7777 8888 99",
+    })).body;
+    expect(await setBy(own.id)).toBe(manager.staffId);
+    const clientId = await makeClient();
+
+    // The person who chose the account: their approval goes to a second person, whatever the amount.
+    const d1 = await makeDeposit(clientId, own.id);
+    await openProof(manager, d1.id);
+    const mine = await detail(manager, d1.id);
+    expect(mine.setByYou).toBe(true);
+    expect(mine.warnings).toContainEqual({ tone: "info", text: "You set this method's account details, so another person must also approve this deposit, whatever the amount." });
+    expect((await approve(manager, d1.id)).body).toMatchObject({ status: "second_approval" });
+    expect((await audits("deposit.first_approved", d1.id))[0]!.meta_json).toMatchObject({ reviewerSet: { method: true, rate: false } });
+    await openProof(manager2, d1.id);
+    const second = await detail(manager2, d1.id);
+    expect(second.setByYou).toBe(false);
+    expect(second.warnings).toContainEqual({ tone: "warn", text: "The first reviewer set this method's account details. Check that the account is the company's own before approving." });
+    expect((await secondApprove(manager2, d1.id)).body).toMatchObject({ status: "approved", creditedCents: 10_000 });
+
+    // Anyone else approves it alone as usual.
+    const d2 = await makeDeposit(clientId, own.id);
+    await openProof(agent, d2.id);
+    expect((await detail(agent, d2.id)).setByYou).toBe(false);
+    expect((await approve(agent, d2.id)).body).toMatchObject({ status: "approved" });
+
+    // A wording change keeps who set the account; a new account number moves it to whoever entered it.
+    await patch(manager2, `/api/staff/money/methods/${own.id}`, { feeLabel: "Free" });
+    expect(await setBy(own.id)).toBe(manager.staffId);
+    await patch(manager2, `/api/staff/money/methods/${own.id}`, { accountNumber: "7777 8888 00" });
+    expect(await setBy(own.id)).toBe(manager2.staffId);
+    const d3 = await makeDeposit(clientId, own.id);
+    await openProof(manager, d3.id);
+    expect((await approve(manager, d3.id)).body).toMatchObject({ status: "approved" });
+
+    // The same for the rupee rate a deposit was made at.
+    const p1 = await makeDeposit(clientId, pkrBank, { currency: "PKR", amountMinor: 2_800_000, rateSetBy: manager2.staffId });
+    await openProof(manager2, p1.id);
+    expect((await detail(manager2, p1.id)).warnings).toContainEqual({
+      tone: "info", text: "You set the rupee rate this deposit uses, so another person must also approve this deposit, whatever the amount.",
+    });
+    expect((await approve(manager2, p1.id, { receivedAmount: "28000" })).body).toMatchObject({ status: "second_approval" });
+    await openProof(manager, p1.id);
+    expect((await detail(manager, p1.id)).warnings).toContainEqual({ tone: "warn", text: "The first reviewer set the rupee rate this deposit uses. Check that the rate is right before approving." });
+    expect((await secondApprove(manager, p1.id)).body).toMatchObject({ status: "approved", creditedCents: 10_000 });
+    const p2 = await makeDeposit(clientId, pkrBank, { currency: "PKR", amountMinor: 2_800_000, rateSetBy: manager2.staffId });
+    await openProof(agent, p2.id);
+    expect((await approve(agent, p2.id, { receivedAmount: "28000" })).body).toMatchObject({ status: "approved" });
+    // A dollar deposit does not use the rate.
+    const u = await makeDeposit(clientId, usdBank, { rateSetBy: manager2.staffId });
+    await openProof(manager2, u.id);
+    expect((await approve(manager2, u.id)).body).toMatchObject({ status: "approved" });
+    expect(await available(clientId)).toBe(60_000);
+  });
+
   it("gives each deposit to one reviewer at a time, and audits a take-over", async () => {
     const clientId = await makeClient();
     const d = await makeDeposit(clientId, usdBank, { hoursOld: 900 });
@@ -645,9 +706,24 @@ describe.skipIf(!hasDb)("staff deposits", () => {
         entity_type: "money_settings", entity_id: "1",
         before_json: { minDepositCents: 5000, usdToPkr: "280", maxWithdrawalCents: null }, after_json: { minDepositCents: 2000, usdToPkr: "278.5", maxWithdrawalCents: 2_000_000 },
       });
+      const rateBy = async () => (await one<{ who: number | null }>(env.db, "SELECT usd_to_pkr_set_by AS who FROM money_settings WHERE id = 1"))!.who;
+      expect(await rateBy()).toBe(manager2.staffId);
+      // Other changes keep who set the rate.
+      expect((await patch(manager, settingsUrl, { minTransferCents: 1500 })).body).toMatchObject({ minTransferCents: 1500, updatedBy: { id: manager.staffId } });
+      expect(await rateBy()).toBe(manager2.staffId);
       const thresholds = await patch(boss, settingsUrl, { depositSecondApprovalCents: 400_000, withdrawalSecondApprovalCents: 90_000, firstWithdrawalSecondApproval: false });
       expect(thresholds.body).toMatchObject({ depositSecondApprovalCents: 400_000, withdrawalSecondApprovalCents: 90_000, firstWithdrawalSecondApproval: false });
       expect((await patch(boss, settingsUrl, { depositSecondApprovalCents: 500_000, withdrawalSecondApprovalCents: 100_000, firstWithdrawalSecondApproval: true, usdToPkr: "280" })).status).toBe(200);
+      expect(await rateBy()).toBe(boss.staffId);
+    });
+
+    it("moves the rupee rate by at most 20% at a time", async () => {
+      for (const far of ["28", "2800", "336.01", "233.33"]) {
+        const res = await patch(manager, settingsUrl, { usdToPkr: far });
+        expect([far, res.status, res.body.error?.details]).toEqual([far, 400, [{ field: "usdToPkr", message: "Change the rate by at most 20% at a time (now 280). For a bigger change, make it in steps." }]]);
+      }
+      expect((await patch(manager, settingsUrl, { usdToPkr: "336" })).body).toMatchObject({ usdToPkr: "336" });
+      expect((await patch(manager, settingsUrl, { usdToPkr: "280" })).body).toMatchObject({ usdToPkr: "280" });
     });
 
     it("validates every value", async () => {
@@ -756,9 +832,10 @@ describe.skipIf(!hasDb)("staff deposits", () => {
       // Clients scan it, so it must hold the method's own address.
       const blank = await sharp({ create: { width: 300, height: 300, channels: 3, background: "#000000" } }).png().toBuffer();
       expect((await upload(manager, crypto, blank, "image/png")).body.error.message).toBe("No QR code could be read in this picture. Upload a clear picture of the QR code alone.");
-      expect((await upload(manager, crypto, await QRCode.toBuffer("TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE", { width: 300 }), "image/png")).body.error.message).toBe(
-        `This QR code does not hold the method's wallet address (${TRC20}). Upload the QR code of that address.`,
-      );
+      const notOurs = `This QR code does not pay the method's wallet address (${TRC20}) alone. Upload the QR code of that address.`;
+      expect((await upload(manager, crypto, await QRCode.toBuffer("TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE", { width: 300 }), "image/png")).body.error.message).toBe(notOurs);
+      // A payment link that pays another address while naming ours in a parameter.
+      expect((await upload(manager, crypto, await QRCode.toBuffer(`tron:TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE?note=${TRC20}`, { width: 300 }), "image/png")).body.error.message).toBe(notOurs);
       expect((await upload(manager, crypto, await QRCode.toBuffer(`${TRC20}9`, { width: 300 }), "image/png")).status).toBe(400);
       const res = await upload(manager, crypto, qr);
       expect(res.status).toBe(200);
@@ -788,6 +865,10 @@ describe.skipIf(!hasDb)("staff deposits", () => {
       // A new wallet address takes the old QR code with it.
       const bep = (await post(manager, methods, { direction: "deposit", kind: "crypto", name: "USDT BEP20", network: "bep20", walletAddress: "0x52908400098527886E0F7030069857D2E4169EE7" })).body;
       expect((await upload(manager, bep.id, await QRCode.toBuffer("0x52908400098527886e0f7030069857d2e4169ee7", { width: 300 }), "image/png")).body.hasQr).toBe(true);
+      // A USDT transfer link names the token contract besides the payee; any other address is refused.
+      const usdtLink = (contract: string) => `ethereum:${contract}@56/transfer?address=0x52908400098527886E0F7030069857D2E4169EE7&uint256=1e19`;
+      expect((await upload(manager, bep.id, await QRCode.toBuffer(usdtLink("0x55d398326f99059fF775485246999027B3197955"), { width: 300 }), "image/png")).status).toBe(200);
+      expect((await upload(manager, bep.id, await QRCode.toBuffer(usdtLink("0x2222222222222222222222222222222222222222"), { width: 300 }), "image/png")).status).toBe(400);
       const moved = await patch(manager, `${methods}/${bep.id}`, { walletAddress: "0x1111111111111111111111111111111111111111" });
       expect(moved.body).toMatchObject({ walletAddress: "0x1111111111111111111111111111111111111111", hasQr: false, qrUrl: null });
       const audit = await one<{ meta_json: Record<string, unknown> }>(env.db, "SELECT meta_json FROM audit_log WHERE action = 'payment_method.updated' AND entity_id = ? ORDER BY id DESC LIMIT 1", [String(bep.id)]);

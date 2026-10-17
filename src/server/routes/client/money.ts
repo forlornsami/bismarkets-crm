@@ -84,6 +84,8 @@ interface DepositRequest {
   amountMinor: number;
   /** Rupees per dollar for a PKR method, 1 for USD, as shown to the client now. */
   rate: string;
+  /** Who set that rupee rate (null for USD): they cannot approve this deposit alone. */
+  rateSetBy: number | null;
   amountCents: number;
   network: string;
   original: Buffer;
@@ -340,7 +342,7 @@ export function clientMoneyRouter(deps: AppDeps): Router {
     // Recorded as sent, for staff; it changes nothing (every method here is manual).
     const network = formText(form.values.network)?.trim() ?? "";
     return {
-      method, amountMinor: amount.minor, rate, amountCents, network: /^[\w.-]{1,16}$/.test(network) ? network : "",
+      method, amountMinor: amount.minor, rate, rateSetBy: method.currency === "USD" ? null : settings.usd_to_pkr_set_by, amountCents, network: /^[\w.-]{1,16}$/.test(network) ? network : "",
       original, sha256: sha256(original), fileName: safeFileName(file.name, "payment"),
     };
   }
@@ -412,9 +414,9 @@ export function clientMoneyRouter(deps: AppDeps): Router {
         const { id, reference } = await withReference("D", async (reference) => {
           const r = await exec(
             conn,
-            `INSERT INTO deposits (reference, client_id, wallet_id, payment_method_id, method_name, currency, amount_minor, usd_rate, amount_cents, network, submitted_ip)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [reference, client.id, wallet.id, method.id, method.name, method.currency, request.amountMinor, request.rate, request.amountCents, request.network, req.clientIp],
+            `INSERT INTO deposits (reference, client_id, wallet_id, payment_method_id, method_name, currency, amount_minor, usd_rate, rate_set_by, amount_cents, network, submitted_ip)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [reference, client.id, wallet.id, method.id, method.name, method.currency, request.amountMinor, request.rate, request.rateSetBy, request.amountCents, request.network, req.clientIp],
           );
           return { id: r.insertId, reference };
         });

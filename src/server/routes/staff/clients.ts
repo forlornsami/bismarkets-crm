@@ -559,6 +559,10 @@ export function staffClientsRouter(deps: AppDeps): Router {
           if (fullMoney[area]) return rest;
           return Object.fromEntries(["depositId", "withdrawalId", "reference", "stage", "reason"].filter((k) => k in m).map((k) => [k, m[k]]));
         }
+        // Saved payout accounts: which one and what changed, without its type or account ending.
+        if (area === "payout_method" && !fullMoney.withdrawal) {
+          return Object.fromEntries(["id", "kind", "fields", "default"].filter((k) => k in m).map((k) => [k, m[k]]));
+        }
         return m;
       };
       res.json({

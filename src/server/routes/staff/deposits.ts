@@ -43,6 +43,7 @@ interface Row {
   currency: "USD" | "PKR";
   amount_minor: number;
   usd_rate: string;
+  rate_set_by: number | null;
   amount_cents: number;
   network: string;
   received_minor: number | null;
@@ -71,6 +72,7 @@ interface Row {
   assigned_staff_id: number | null;
   client_created_at: Date;
   method_kind: "bank" | "crypto";
+  method_set_by: number | null;
   proof_sha: string | null;
   proof_editor: string | null;
   // Checks on the proof and the client's history, worked out by the query (see flagsOf).
@@ -80,10 +82,10 @@ interface Row {
   first_deposit: number;
 }
 
-const SELECT = `SELECT d.id, d.reference, d.client_id, d.payment_method_id, d.method_name, d.status, d.currency, d.amount_minor, d.usd_rate, d.amount_cents, d.network,
+const SELECT = `SELECT d.id, d.reference, d.client_id, d.payment_method_id, d.method_name, d.status, d.currency, d.amount_minor, d.usd_rate, d.rate_set_by, d.amount_cents, d.network,
   d.received_minor, d.credited_cents, d.needs_second_approval, d.sender_name, d.bank_reference, DATE_FORMAT(d.received_on, '%Y-%m-%d') AS received_on, d.reject_reason, d.checklist, d.notes,
   d.first_reviewed_by, fr.name AS first_reviewer_name, d.decided_by, d.decided_at, dc.name AS decider_name, d.claimed_by, d.claimed_until, cl.name AS claimer_name, d.created_at,
-  c.first_name, c.last_name, c.email, c.status AS client_status, c.kyc_status, c.assigned_staff_id, c.created_at AS client_created_at, pm.kind AS method_kind,
+  c.first_name, c.last_name, c.email, c.status AS client_status, c.kyc_status, c.assigned_staff_id, c.created_at AS client_created_at, pm.kind AS method_kind, pm.details_set_by AS method_set_by,
   p.sha256 AS proof_sha, p.editor AS proof_editor,
   EXISTS (SELECT 1 FROM deposit_proofs p2 JOIN deposits d2 ON d2.id = p2.deposit_id WHERE p2.sha256 = p.sha256 AND d2.client_id <> d.client_id) AS shared_others,
   EXISTS (SELECT 1 FROM deposit_proofs p2 JOIN deposits d2 ON d2.id = p2.deposit_id WHERE p2.sha256 = p.sha256 AND d2.client_id = d.client_id AND d2.id <> d.id) AS reused_own,
@@ -101,6 +103,18 @@ const expectedCents = (r: Row) => (r.credited_cents !== null ? Number(r.credited
 const aboveLimit = (r: Row, threshold: number) => expectedCents(r) > threshold || r.needs_second_approval === 1;
 const needsSecondApproval = (r: Row, threshold: number) =>
   r.status === "second_approval" || (r.status === "approved" ? r.first_reviewed_by !== null && r.first_reviewed_by !== r.decided_by : aboveLimit(r, threshold));
+
+/**
+ * What this staff member set that the deposit depends on: where clients pay its method (the account
+ * details), or the rupee rate it uses. A first approval by that person is never enough alone.
+ */
+const setBy = (r: Row, staffId: number | null) => ({
+  method: staffId !== null && r.method_set_by !== null && Number(r.method_set_by) === staffId,
+  rate: staffId !== null && r.currency === "PKR" && r.rate_set_by !== null && Number(r.rate_set_by) === staffId,
+});
+const setsAny = (s: ReturnType<typeof setBy>) => s.method || s.rate;
+const setWords = (s: ReturnType<typeof setBy>) =>
+  [s.method && "this method's account details", s.rate && "the rupee rate this deposit uses"].filter(Boolean).join(" and ");
 
 type Warning = { tone: "bad" | "warn" | "info"; text: string; href?: string };
 
@@ -352,6 +366,15 @@ export function staffDepositsRouter(deps: AppDeps): Router {
       const why = r.status === "pending" && r.needs_second_approval === 1 ? " It was sent back from the second approval, so this applies whatever the amount." : "";
       out.push({ tone: "info", text: `Needs a second approval from another person.${why}` });
     }
+    const mine = setBy(r, staff.id);
+    if (r.status === "pending" && setsAny(mine)) {
+      out.push({ tone: "info", text: `You set ${setWords(mine)}, so another person must also approve this deposit, whatever the amount.` });
+    }
+    const firsts = setBy(r, r.first_reviewed_by);
+    if (r.status === "second_approval" && setsAny(firsts)) {
+      const check = [firsts.method && "the account is the company's own", firsts.rate && "the rate is right"].filter(Boolean).join(" and ");
+      out.push({ tone: "warn", text: `The first reviewer set ${setWords(firsts)}. Check that ${check} before approving.` });
+    }
     const order = { bad: 0, warn: 1, info: 2 };
     return out.sort((a, b) => order[a.tone] - order[b.tone]);
   }
@@ -432,6 +455,8 @@ export function staffDepositsRouter(deps: AppDeps): Router {
       warnings: await warningsFor(db, staff, r, threshold),
       proofOpenedByMe: await proofOpenedBy(db, staff.id, r),
       stage: r.status === "pending" ? ("first" as const) : r.status === "second_approval" ? ("second" as const) : null,
+      /** This reviewer set the method's account details or the rate: their approval goes to a second person. */
+      setByYou: r.status === "pending" && setsAny(setBy(r, staff.id)),
       can: { approve: action("approve"), secondApprove: action("secondApprove"), reject: action("reject"), returnToFirst: action("returnToFirst") },
       checklist: { first: DEPOSIT_CHECKLIST.first, second: DEPOSIT_CHECKLIST.second },
       rejectReasons: DEPOSIT_REJECT_REASONS,
@@ -694,7 +719,8 @@ export function staffDepositsRouter(deps: AppDeps): Router {
         }
         const entered = await loadVisible(req, r.id, conn);
         const warnings = (await warningsFor(conn, staff, entered, threshold)).filter((w) => w.tone !== "info").map((w) => w.text);
-        if (credited > threshold || r.needs_second_approval === 1) {
+        const mine = setBy(r, staff.id);
+        if (credited > threshold || r.needs_second_approval === 1 || setsAny(mine)) {
           await exec(conn, "UPDATE deposits SET status = 'second_approval' WHERE id = ?", [r.id]);
           await appendNote(conn, "deposits", r.id, staff, "first_approval", body.note);
           await writeAudit(conn, ctx(req), {
@@ -703,7 +729,7 @@ export function staffDepositsRouter(deps: AppDeps): Router {
             meta: {
               depositId: r.id, reference: r.reference, received: { minor: received.minor, currency: r.currency, usdRate: r.usd_rate }, creditedCents: credited,
               senderName: body.senderName, bankReference: body.bankReference, receivedOn: body.receivedOn, method: { id: r.payment_method_id, name: r.method_name },
-              checklist: body.checklist, warnings, thresholdCents: threshold, ...(body.note ? { internalNote: body.note } : {}),
+              checklist: body.checklist, warnings, thresholdCents: threshold, ...(setsAny(mine) ? { reviewerSet: mine } : {}), ...(body.note ? { internalNote: body.note } : {}),
             },
           });
           return;

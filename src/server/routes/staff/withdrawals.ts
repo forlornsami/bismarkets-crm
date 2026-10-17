@@ -439,11 +439,15 @@ export function staffWithdrawalsRouter(deps: AppDeps): Router {
     }
 
     // Staff edits are logged as client.updated (or client.verified_details_changed) with the fields they changed.
+    // A payout account renamed or made the default (no detail among its fields) sends money nowhere new.
     const changes = await rows<{ action: string; at: Date }>(
       db,
       `SELECT action, MAX(occurred_at) AS at FROM (
          SELECT CASE WHEN action IN ('client.updated', 'client.verified_details_changed') AND JSON_CONTAINS(JSON_EXTRACT(meta_json, '$.fields'), '"email"')
-                     THEN 'staff.email_changed' WHEN action = 'client.verified_details_changed' THEN 'staff.verified_changed' ELSE action END AS action,
+                     THEN 'staff.email_changed' WHEN action = 'client.verified_details_changed' THEN 'staff.verified_changed'
+                     WHEN action = 'payout_method.updated'
+                       AND JSON_LENGTH(JSON_EXTRACT(meta_json, '$.fields')) <= JSON_CONTAINS(JSON_EXTRACT(meta_json, '$.fields'), '"method_name"')
+                     THEN 'payout_method.renamed' ELSE action END AS action,
                 occurred_at
          FROM audit_log
          WHERE entity_type = 'client' AND entity_id = ? AND occurred_at >= ?

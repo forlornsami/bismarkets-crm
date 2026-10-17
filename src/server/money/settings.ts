@@ -8,6 +8,8 @@ export interface MoneySettings {
   min_transfer_cents: number;
   /** DECIMAL as text, e.g. "280.000000". */
   usd_to_pkr: string;
+  /** Who last set usd_to_pkr: their first approval of a deposit at that rate is not enough alone. */
+  usd_to_pkr_set_by: number | null;
   deposit_second_approval_cents: number;
   withdrawal_second_approval_cents: number;
   first_withdrawal_second_approval: boolean;
@@ -19,7 +21,7 @@ export interface MoneySettings {
 export async function loadMoneySettings(conn: Conn, lock = false): Promise<MoneySettings> {
   const r = await one<Omit<MoneySettings, "first_withdrawal_second_approval" | "usd_to_pkr"> & { first_withdrawal_second_approval: number; usd_to_pkr: string | number }>(
     conn,
-    `SELECT min_deposit_cents, min_withdrawal_cents, max_withdrawal_cents, min_transfer_cents, usd_to_pkr, deposit_second_approval_cents,
+    `SELECT min_deposit_cents, min_withdrawal_cents, max_withdrawal_cents, min_transfer_cents, usd_to_pkr, usd_to_pkr_set_by, deposit_second_approval_cents,
        withdrawal_second_approval_cents, first_withdrawal_second_approval, updated_at, updated_by
      FROM money_settings WHERE id = 1${lock ? " FOR SHARE" : ""}`,
   );

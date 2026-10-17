@@ -9,3 +9,13 @@ ALTER TABLE deposits ADD COLUMN needs_second_approval TINYINT(1) NOT NULL DEFAUL
 DELETE rp FROM role_permissions rp JOIN roles r ON r.id = rp.role_id
 WHERE r.slug = 'admin' AND r.is_system = 1
   AND rp.permission IN ('deposit.process', 'deposit.approve_large', 'withdrawal.process', 'withdrawal.approve', 'withdrawal.pay', 'wallet.adjust', 'ib.payout');
+
+-- Whoever set where clients pay a deposit method (its account details) or the
+-- rupee rate a deposit uses cannot approve that deposit alone: their first
+-- approval sends it to a second person, whatever the amount.
+ALTER TABLE payment_methods ADD COLUMN details_set_by BIGINT UNSIGNED NULL AFTER updated_by,
+  ADD CONSTRAINT fk_payment_method_details_staff FOREIGN KEY (details_set_by) REFERENCES staff_users (id) ON DELETE SET NULL;
+ALTER TABLE money_settings ADD COLUMN usd_to_pkr_set_by BIGINT UNSIGNED NULL AFTER usd_to_pkr,
+  ADD CONSTRAINT fk_money_settings_rate_staff FOREIGN KEY (usd_to_pkr_set_by) REFERENCES staff_users (id) ON DELETE SET NULL;
+ALTER TABLE deposits ADD COLUMN rate_set_by BIGINT UNSIGNED NULL AFTER usd_rate,
+  ADD CONSTRAINT fk_deposit_rate_staff FOREIGN KEY (rate_set_by) REFERENCES staff_users (id) ON DELETE SET NULL;

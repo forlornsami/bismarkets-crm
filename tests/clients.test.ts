@@ -220,6 +220,8 @@ describe.skipIf(!hasDb)("client portal API", () => {
     expect(me.body).toMatchObject({ is_staff: true, read_only: true, impersonation: true });
     expect((await api().patch("/api/user").set(auth).send({ city: "Paris" })).status).toBe(403);
     expect((await api().post("/api/send-otp").set(auth).send({ email: "new@client.test" })).status).toBe(403);
+    // Checking a code counts wrong guesses against the client's own, so it is refused too.
+    expect((await api().post("/api/verify-otp").set(auth).send({ email: "view@client.test", verification_code: "000000", purpose: "withdrawal" })).status).toBe(403);
 
     const minutes = (new Date(res.body.expiresAt).getTime() - Date.now()) / 60_000;
     expect(minutes).toBeLessThanOrEqual(env.config.impersonationMs / 60_000);
@@ -230,6 +232,16 @@ describe.skipIf(!hasDb)("client portal API", () => {
 
     // Roles without client.impersonate cannot do it.
     expect((await post(sales, `/api/staff/clients/${user.id}/impersonate`, { reason: "Checking the dashboard" })).status).toBe(403);
+  });
+
+  it("sends a few new-address codes an hour to one address, however many accounts ask", async () => {
+    const statuses: number[] = [];
+    for (let i = 1; i <= 7; i++) {
+      const { token } = await register(`asker${i}@client.test`);
+      statuses.push((await api().post("/api/send-otp").set({ Authorization: `Bearer ${token}` }).send({ email: "Outside@Elsewhere.test" })).status);
+    }
+    expect(statuses).toEqual([200, 200, 200, 200, 200, 200, 429]);
+    expect(Number((await one<{ n: number }>(env.db, "SELECT COUNT(*) AS n FROM email_outbox WHERE to_email = 'outside@elsewhere.test'"))!.n)).toBe(6);
   });
 
   it("records notes, edits and the activity timeline", async () => {

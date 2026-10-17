@@ -11,7 +11,7 @@ import { sha256 } from "../../lib/crypto";
 import { exec, one, rows, transaction, type Conn } from "../../lib/db";
 import { badRequest, conflict, forbidden, handler, notFound, parse, unauthorized } from "../../lib/http";
 import { imageInfo } from "../../lib/images";
-import { qrNamesAddress, readQrText } from "../../lib/qr";
+import { qrPaysOnly, readQrText } from "../../lib/qr";
 import { MAX_AMOUNT_MINOR, rateMicros } from "../../money/amounts";
 import { walletOf } from "../../money/ledger";
 import { clientScope, moneyId } from "../../money/review";
@@ -69,6 +69,15 @@ const settingsBody = z
   })
   .strict();
 type SettingsBody = z.infer<typeof settingsBody>;
+
+/** How far one change may move the rupee rate, either way. */
+const RATE_STEP_PERCENT = 20;
+/** Whether `next` is within RATE_STEP_PERCENT of `current` (both rates as text). */
+const rateStepOk = (current: string, next: string) => {
+  const [a, b] = [rateMicros(current), rateMicros(next)];
+  const step = BigInt(100 + RATE_STEP_PERCENT);
+  return b * 100n <= a * step && a * 100n <= b * step;
+};
 
 /** "280.000000" → "280", "278.500000" → "278.5". */
 const rateText = (rate: string) => (rate.includes(".") ? rate.replace(/0+$/, "").replace(/\.$/, "") : rate);
@@ -351,8 +360,16 @@ export function staffMoneyRouter(deps: AppDeps): Router {
         if (next.maxWithdrawalCents !== null && next.maxWithdrawalCents < next.minWithdrawalCents) {
           throw badRequest("Check the highlighted fields.", [{ field: "maxWithdrawalCents", message: "The maximum withdrawal must be at least the minimum withdrawal." }]);
         }
+        // Every rupee deposit credits dollars at this rate, so a slip of a digit must not get through.
+        const rateChanged = changed.includes("usdToPkr");
+        if (rateChanged && !rateStepOk(current.usdToPkr, next.usdToPkr)) {
+          throw badRequest("Check the highlighted fields.", [{ field: "usdToPkr", message: `Change the rate by at most ${RATE_STEP_PERCENT}% at a time (now ${current.usdToPkr}). For a bigger change, make it in steps.` }]);
+        }
         const values = changed.map((k) => (k === "firstWithdrawalSecondApproval" ? (body[k] ? 1 : 0) : body[k]));
-        await exec(conn, `UPDATE money_settings SET ${changed.map((k) => `${SETTINGS[k].column} = ?`).join(", ")}, updated_by = ? WHERE id = 1`, [...values, staff.id]);
+        // Whoever sets the rate cannot alone approve the deposits made at it (see the deposit review).
+        await exec(conn, `UPDATE money_settings SET ${changed.map((k) => `${SETTINGS[k].column} = ?`).join(", ")}${rateChanged ? ", usd_to_pkr_set_by = ?" : ""}, updated_by = ? WHERE id = 1`, [
+          ...values, ...(rateChanged ? [staff.id] : []), staff.id,
+        ]);
         const after = await currentSettings(conn);
         await writeAudit(conn, ctx(req), {
           action: "money_settings.updated", entityType: "money_settings", entityId: 1,
@@ -391,8 +408,9 @@ export function staffMoneyRouter(deps: AppDeps): Router {
       const staff = staffOf(req);
       const created = await transaction(db, async (conn) => {
         const keys = Object.keys(COLUMNS) as (keyof MethodInput)[];
-        const r = await exec(conn, `INSERT INTO payment_methods (${keys.map((k) => COLUMNS[k]).join(", ")}, updated_by) VALUES (${keys.map(() => "?").join(", ")}, ?)`, [
-          ...keys.map((k) => (typeof method[k] === "boolean" ? (method[k] ? 1 : 0) : method[k])), staff.id,
+        // The person who chooses where clients pay cannot alone approve the deposits paid there.
+        const r = await exec(conn, `INSERT INTO payment_methods (${keys.map((k) => COLUMNS[k]).join(", ")}, updated_by, details_set_by) VALUES (${keys.map(() => "?").join(", ")}, ?, ?)`, [
+          ...keys.map((k) => (typeof method[k] === "boolean" ? (method[k] ? 1 : 0) : method[k])), staff.id, method.direction === "deposit" ? staff.id : null,
         ]);
         await writeAudit(conn, ctx(req), { action: "payment_method.created", entityType: "payment_method", entityId: r.insertId, after: method });
         return loadMethod(conn, r.insertId);
@@ -436,14 +454,18 @@ export function staffMoneyRouter(deps: AppDeps): Router {
         }
         // A QR code of the old address would send clients' money there.
         const qrRemoved = changed.includes("walletAddress") && row.qr_token !== null;
-        await exec(conn, `UPDATE payment_methods SET ${changed.map((k) => `${COLUMNS[k]} = ?`).join(", ")}${qrRemoved ? ", qr_mime = NULL, qr_bytes = NULL, qr_token = NULL" : ""}, updated_by = ? WHERE id = ?`, [
-          ...changed.map((k) => (typeof method[k] === "boolean" ? (method[k] ? 1 : 0) : method[k])), staff.id, methodId,
-        ]);
+        const accountChanged = changed.some((k) => (ACCOUNT_FIELDS as readonly string[]).includes(k));
+        const setsDetails = row.direction === "deposit" && accountChanged;
+        await exec(
+          conn,
+          `UPDATE payment_methods SET ${changed.map((k) => `${COLUMNS[k]} = ?`).join(", ")}${qrRemoved ? ", qr_mime = NULL, qr_bytes = NULL, qr_token = NULL" : ""}${setsDetails ? ", details_set_by = ?" : ""}, updated_by = ? WHERE id = ?`,
+          [...changed.map((k) => (typeof method[k] === "boolean" ? (method[k] ? 1 : 0) : method[k])), ...(setsDetails ? [staff.id] : []), staff.id, methodId],
+        );
         await writeAudit(conn, ctx(req), {
           action: "payment_method.updated", entityType: "payment_method", entityId: methodId,
           before: Object.fromEntries(changed.map((k) => [k, current[k]])),
           after: Object.fromEntries(changed.map((k) => [k, method[k]])),
-          meta: { direction: row.direction, kind: row.kind, name: method.name, accountChanged: changed.some((k) => (ACCOUNT_FIELDS as readonly string[]).includes(k)), ...(qrRemoved ? { qrRemoved } : {}) },
+          meta: { direction: row.direction, kind: row.kind, name: method.name, accountChanged, ...(qrRemoved ? { qrRemoved } : {}) },
         });
         return loadMethod(conn, methodId);
       });
@@ -479,8 +501,8 @@ export function staffMoneyRouter(deps: AppDeps): Router {
       const updated = await transaction(db, async (conn) => {
         const row = await loadMethod(conn, methodId, true);
         if (row.direction !== "deposit" || row.kind !== "crypto") throw badRequest("Only crypto deposit methods have a QR code.");
-        if (!row.wallet_address || !qrNamesAddress(text, row.wallet_address, row.network === "bep20")) {
-          throw badRequest(`This QR code does not hold the method's wallet address (${row.wallet_address || "none saved"}). Upload the QR code of that address.`);
+        if (!row.wallet_address || !row.network || !qrPaysOnly(text, row.wallet_address, row.network)) {
+          throw badRequest(`This QR code does not pay the method's wallet address (${row.wallet_address || "none saved"}) alone. Upload the QR code of that address.`);
         }
         const before = await one<{ qr_bytes: Buffer | null }>(conn, "SELECT qr_bytes FROM payment_methods WHERE id = ?", [methodId]);
         await exec(conn, "UPDATE payment_methods SET qr_mime = 'image/png', qr_bytes = ?, qr_token = ?, updated_by = ? WHERE id = ?", [png, token, staff.id, methodId]);

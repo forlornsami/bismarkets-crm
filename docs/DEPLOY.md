@@ -193,6 +193,11 @@ server {
     proxy_read_timeout 90s;
     proxy_pass http://127.0.0.1:3000;
   }
+  # QR code pictures: the link itself is the secret, so it stays out of the access log.
+  location ~* ^/+api/+(payout|payment)-qr/ {
+    access_log off;
+    proxy_pass http://127.0.0.1:3000;
+  }
 }
 ```
 
@@ -208,6 +213,10 @@ KYC uploads get a longer `proxy_read_timeout`: photos are converted before they
 are stored, and a two-sided HEIC upload can take up to two minutes when the
 server is busy. With nginx's default of 60 s the client would see a `504` while
 the CRM still stores the document.
+
+A QR code picture's link (`/api/payout-qr/…`, `/api/payment-qr/…`) is all that
+protects it, so nginx does not log those requests, and the CRM logs them with
+the token replaced by `:token`.
 
 With nginx on the same host, `CRM_TRUSTED_PROXIES=127.0.0.1`. If Cloudflare is
 in front, use nginx's `real_ip` module with Cloudflare's published ranges so
