@@ -14,7 +14,11 @@ import {
   UserCog,
   UserRound,
   Users,
+  FileText,
   Mail,
+  MailCheck,
+  AtSign,
+  Send,
   Wallet,
   type LucideIcon,
 } from "lucide-react";
@@ -59,12 +63,21 @@ const NAV: { title: string; items: NavItem[] }[] = [
     ],
   },
   {
+    title: "Communication",
+    items: [
+      { href: "/messages/new", label: "Send email", icon: Send, permission: "comms.send" },
+      { href: "/messages", label: "Sent emails", icon: MailCheck, permission: "comms.view" },
+      { href: "/messages/templates", label: "Email templates", icon: FileText, permission: "comms.view" },
+      { href: "/emails", label: "Email outbox", icon: Mail, permission: "comms.view" },
+    ],
+  },
+  {
     title: "Administration",
     items: [
       { href: "/staff", label: "Staff", icon: UserCog, permission: "staff.view" },
       { href: "/roles", label: "Roles", icon: Shield, permission: "role.view" },
       { href: "/audit", label: "Audit log", icon: ScrollText, permission: "audit.view" },
-      { href: "/emails", label: "Email outbox", icon: Mail, permission: "comms.view" },
+      { href: "/settings/email", label: "Email settings", icon: AtSign, permission: "settings.view" },
       { href: "/settings/branding", label: "Branding", icon: Palette, permission: "settings.view" },
     ],
   },
@@ -99,7 +112,8 @@ export function Layout({ children, onSignedOut }: { children: ReactNode; onSigne
     }
   };
 
-  const current = ALL_ITEMS.find((i) => isActive(i.href, location)) ?? (location.startsWith("/account") ? { label: "My account" } : null);
+  // The most specific match wins, so /messages/new lights up "Send email" rather than "Sent emails".
+  const current = ALL_ITEMS.filter((i) => isActive(i.href, location)).sort((a, b) => b.href.length - a.href.length)[0] ?? (location.startsWith("/account") ? { label: "My account" } : null);
   const section = NAV.find((s) => s.items.some((i) => i === current));
 
   return (
@@ -127,7 +141,7 @@ export function Layout({ children, onSignedOut }: { children: ReactNode; onSigne
                       <span className="nav-pill">Soon</span>
                     </span>
                   ) : (
-                    <Link key={n.href} href={n.href} className={isActive(n.href, location) ? "nav-link active" : "nav-link"} title={collapsed ? n.label : undefined} aria-current={isActive(n.href, location) ? "page" : undefined}>
+                    <Link key={n.href} href={n.href} className={n === current ? "nav-link active" : "nav-link"} title={collapsed ? n.label : undefined} aria-current={n === current ? "page" : undefined}>
                       <Icon size={18} />
                       <span className="nav-label">{n.label}</span>
                       {n.badge === "kyc" && kycWaiting > 0 && (

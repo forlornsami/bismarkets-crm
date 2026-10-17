@@ -19,6 +19,10 @@ import { staffBrandingRouter } from "./routes/staff/branding";
 import { staffClientsRouter } from "./routes/staff/clients";
 import { staffEmailsRouter } from "./routes/staff/emails";
 import { staffKycRouter } from "./routes/staff/kyc";
+import { staffMailRouter } from "./routes/staff/mail";
+import { staffMessagesRouter } from "./routes/staff/messages";
+import { emailUnsubscribeRouter } from "./routes/unsubscribe";
+import type { TransportFactory } from "./lib/mailer";
 import { staffRolesRouter } from "./routes/staff/roles";
 import { staffUsersRouter } from "./routes/staff/users";
 import { staffSession } from "./staff/session";
@@ -29,6 +33,8 @@ export interface AppDeps {
   log: Logger;
   /** Injected so tests never call external services. */
   fetch: typeof fetch;
+  /** SMTP transport factory; tests pass a fake so no email leaves the machine. */
+  mailTransport?: TransportFactory;
 }
 
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
@@ -90,6 +96,9 @@ export function createApp(deps: AppDeps): Express {
     }
   });
 
+  // Unsubscribe links in marketing emails (public; the link carries a signed token).
+  app.use("/email/unsubscribe", emailUnsubscribeRouter(deps));
+
   // ---- Staff API and admin panel: network allowlist, same-origin only. ----
   const allowList = buildAllowList(config.staffAllowedIps);
   const staffNetwork = (req: Request, _res: Response, next: NextFunction) => {
@@ -115,6 +124,8 @@ export function createApp(deps: AppDeps): Express {
   staff.use("/clients", staffClientsRouter(deps));
   staff.use("/emails", staffEmailsRouter(deps));
   staff.use("/kyc", staffKycRouter(deps));
+  staff.use("/mail-settings", staffMailRouter(deps));
+  staff.use("/messages", staffMessagesRouter(deps));
   app.use("/api/staff", staff);
 
   // ---- Client API: what the client portal and app call, with Bearer tokens. ----

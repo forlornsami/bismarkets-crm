@@ -63,6 +63,7 @@ export function staffClientsRouter(deps: AppDeps): Router {
     statusReason: r.status_reason,
     kycStatus: r.kyc_status,
     kycApprovedAt: r.kyc_approved_at?.toISOString() ?? null,
+    marketingOptOutAt: r.marketing_opt_out_at?.toISOString() ?? null,
     importantNotice: r.important_notice,
     country: r.country,
     city: r.city,

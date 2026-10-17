@@ -572,3 +572,42 @@ body:has(.review) .toasts { right: auto; left: 20px; }
 @media (max-width: 1100px) { body:has(.review) .toasts { left: auto; right: 20px; } }
 .kyc-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
 .review-person { display: flex; align-items: center; gap: 12px; margin: 10px 0 4px; }
+
+/* ---------- Email ---------- */
+.tabs { display: inline-flex; flex-wrap: wrap; gap: 4px; padding: 3px; border-radius: var(--radius); background: var(--surface-sunken); border: 1px solid var(--border); }
+.tabs button { display: inline-flex; align-items: center; gap: 6px; padding: 7px 12px; border: none; border-radius: calc(var(--radius) - 3px); background: none; color: var(--muted); font: inherit; font-size: 13px; cursor: pointer; }
+.tabs button:hover { color: var(--text); }
+.tabs button[aria-selected="true"] { background: var(--surface); color: var(--text); box-shadow: var(--shadow-sm); font-weight: 550; }
+.check-row { display: flex; flex-wrap: wrap; gap: 4px 18px; }
+.check-list-box { max-height: 260px; overflow-y: auto; padding: 6px 12px; margin-bottom: 14px; border: 1px solid var(--border); border-radius: var(--radius); }
+.chips-spaced { margin-top: 8px; }
+.chips .chip svg { vertical-align: -2px; margin-left: 2px; }
+.picker { position: relative; margin-bottom: 14px; }
+.picker-list { list-style: none; margin: 6px 0 0; padding: 4px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
+.picker-list li { padding: 0; }
+.picker-list li.muted { display: flex; gap: 8px; align-items: center; padding: 10px; }
+.picker-list button { display: flex; width: 100%; align-items: center; gap: 10px; padding: 8px 10px; border: none; border-radius: var(--radius-sm); background: none; font: inherit; color: inherit; text-align: left; cursor: pointer; }
+.picker-list button:hover { background: var(--surface-sunken); }
+.picker-list button span, .recipient-card > div { display: flex; flex-direction: column; min-width: 0; }
+.recipient-card { display: flex; align-items: center; gap: 12px; padding: 10px 12px; margin-bottom: 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-sunken); }
+.recipient-card > div { flex: 1; }
+.recipient-card .muted, .picker-list .muted { font-size: 12.5px; }
+.divider { border: none; border-top: 1px solid var(--border); margin: 6px 0 18px; }
+.compose-body { width: 100%; resize: vertical; min-height: 200px; font: inherit; line-height: 1.55; }
+.placeholder-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 12.5px; }
+.preview-panel { align-self: start; position: sticky; top: 16px; }
+.recipient-sample { list-style: none; margin: 0 0 16px; padding: 0; display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
+.email-preview { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: #fff; color: #0f172a; }
+.email-preview-head { padding: 12px 16px; border-bottom: 1px solid #e2e8f0; font-size: 13px; line-height: 1.7; background: #f8fafc; }
+.email-preview-head .muted { display: inline-block; width: 60px; color: #64748b; }
+.email-preview-body { padding: 18px 16px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; line-height: 1.6; }
+.email-preview-foot { padding: 10px 16px; border-top: 1px solid #e2e8f0; font-size: 12px; color: #64748b; text-decoration: underline; }
+.stack-tight { display: flex; flex-direction: column; gap: 2px; }
+.stack-tight .muted { font-size: 12.5px; }
+.section-title { font-size: 16px; margin: 22px 0 12px; }
+.template-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
+.template-grid .panel { margin-bottom: 0; display: flex; flex-direction: column; }
+.template-body { flex: 1; margin: 0; white-space: pre-wrap; color: var(--text-2); font-size: 13px; max-height: 140px; overflow: hidden; mask-image: linear-gradient(to bottom, #000 70%, transparent); }
+.template-card .actions { align-items: center; justify-content: flex-end; flex-wrap: nowrap; }
+.template-card .actions .muted { margin-right: auto; font-size: 12px; }
+fieldset.flush { border: none; padding: 0; margin: 0; min-width: 0; }

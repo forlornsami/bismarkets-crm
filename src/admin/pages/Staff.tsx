@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, KeyRound, LogOut, MonitorSmartphone, Pencil, Power, ShieldOff, Unlock, UserPlus } from "lucide-react";
+import { ArrowLeft, KeyRound, LogOut, Mail, MonitorSmartphone, Pencil, Power, ShieldOff, Unlock, UserPlus } from "lucide-react";
 import { useState } from "react";
 import { Link, useLocation } from "wouter";
 import { AvatarEditor } from "../components/AvatarEditor";
@@ -224,16 +224,22 @@ export function StaffDetail({ id }: { id: string }) {
         badge={<StatusBadge s={s} />}
         description={`${s.role.name} · ${s.email}`}
         actions={
-          can("staff.edit") &&
-          !edit && (
-            <button
-              type="button"
-              className="button"
-              onClick={() => setEdit({ name: s.name, roleId: String(s.role.id), countries: s.scope.countries.join(", "), desks: s.scope.desks.join(", ") })}
-            >
-              <Pencil size={15} /> Edit details
-            </button>
-          )
+          <>
+            {can("comms.send", "comms.bulk") && s.status === "active" && (
+              <Link href={`/messages/new?staff=${s.id}`} className="button">
+                <Mail size={15} /> Send email
+              </Link>
+            )}
+            {can("staff.edit") && !edit && (
+              <button
+                type="button"
+                className="button"
+                onClick={() => setEdit({ name: s.name, roleId: String(s.role.id), countries: s.scope.countries.join(", "), desks: s.scope.desks.join(", ") })}
+              >
+                <Pencil size={15} /> Edit details
+              </button>
+            )}
+          </>
         }
       />
       <div className="columns">

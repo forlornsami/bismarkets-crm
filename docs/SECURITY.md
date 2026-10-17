@@ -149,12 +149,40 @@ push notifications and devices are signed out.
   than 408 or 429 is a permanent failure and is logged.
 - With `CRM_SUPPORT_EVENTS_URL` unset, events are queued and sent once it is set.
 
-## Email outbox
+## Email
 
-No mail provider is connected yet, so every email is held in the outbox. The
-readable copy has codes and links blanked; the full text is stored encrypted.
-On a non-production server the outbox shows the full text so sign-up can be
-tested end to end. Production shows only the blanked copy.
+**Mail provider.** Settings > Email holds the SMTP server. Reading it needs
+`settings.view`; saving, sending a test or switching sending on or off needs
+`settings.manage` and a fresh 2FA code, and each is audited. The password is
+encrypted with the data key, never returned by the API and never written to
+the audit log. Encrypted connections need TLS 1.2 or newer and a valid certificate, and
+production refuses an unencrypted server. Changing the server, login or
+sender address switches sending off until a test email gets through.
+
+**Outbox.** Everything that sends email writes an outbox row in the same
+transaction as the change, so an email goes out only if the change commits.
+While sending is off, rows are held. The readable copy has codes and links
+blanked; the full text is stored encrypted. Outside production the outbox
+shows the full text so sign-up can be tested end to end. The sender claims
+due rows with a lease (safe across processes and crashes), retries with
+backoff up to 8 times, and marks a message failed at once on a permanent
+5xx answer. Switching sending on releases held emails only when asked, and
+only those from the last 24 hours, since older codes have expired.
+
+**Staff emails.** `comms.send` lets staff email one client; groups of
+clients and staff need `comms.bulk` and a fresh 2FA code. Staff without
+`client.view_all` can only reach their own clients. The send must confirm
+the recipient count the preview showed, so a list that changed is never sent
+blind. Subjects must be one line (no header injection), only known
+placeholders are filled in, and message text is escaped when turned into
+HTML. At most 20,000 recipients per email; each send is audited.
+
+**News and offers.** Marketing emails go only to verified, open accounts that
+have not unsubscribed, and carry an unsubscribe link plus one-click
+`List-Unsubscribe` headers. The link is signed per client (HMAC derived from
+the data key); opening it shows a button rather than unsubscribing, so mail
+scanners that follow links do not opt anyone out. Unsubscribing cancels
+waiting marketing emails and is audited. Account emails are unaffected.
 
 ## KYC documents
 

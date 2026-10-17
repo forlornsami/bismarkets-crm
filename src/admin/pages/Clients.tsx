@@ -17,6 +17,7 @@ import {
   UserX,
   CalendarPlus,
   History,
+  Mail,
 } from "lucide-react";
 import { useState } from "react";
 import { Link, useLocation } from "wouter";
@@ -25,10 +26,12 @@ import { Avatar, Badge, Dialog, EmptyState, ErrorText, Field, PageHeader, Spinne
 import { api, formatDate, qs, type Page } from "../lib/api";
 import { useCan, useSession } from "../lib/session";
 import { COUNTRIES } from "../../shared/countries";
+import { OutboxGrid } from "./Emails";
 import { ClientKyc, KycStatusBadge } from "./Kyc";
 
 export interface Client {
   id: number;
+  marketingOptOutAt: string | null;
   name: string;
   firstName: string;
   lastName: string;
@@ -437,6 +440,11 @@ export function ClientDetail({ id }: { id: string }) {
                 <ExternalLink size={15} /> Log in as client
               </button>
             )}
+            {can("comms.send") && (
+              <Link href={`/messages/new?client=${d.id}`} className="button">
+                <Mail size={15} /> Send email
+              </Link>
+            )}
             {can("client.edit") && (
               <button type="button" className="button" onClick={() => setEditing(true)}>
                 <Pencil size={15} /> Edit details
@@ -528,6 +536,8 @@ export function ClientDetail({ id }: { id: string }) {
             </dd>
             <dt>Signed in now</dt>
             <dd>{d.activeSessions ?? 0} session(s)</dd>
+            <dt>News and offers</dt>
+            <dd>{d.marketingOptOutAt ? `Unsubscribed ${formatDate(d.marketingOptOutAt)}` : "Subscribed"}</dd>
             <dt>Referral code</dt>
             <dd className="mono">{d.referralCode}</dd>
             <dt>Referred by</dt>
@@ -622,6 +632,12 @@ export function ClientDetail({ id }: { id: string }) {
         <Sessions id={id} />
       </div>
       <ActivityPanel id={id} />
+      {can("comms.view") && (
+        <>
+          <h2 className="section-title">Emails to this client</h2>
+          <OutboxGrid clientId={d.id} emptyText="No emails to this client yet." />
+        </>
+      )}
 
       {editing && <EditClientDialog c={d} onClose={() => setEditing(false)} onSaved={refresh} />}
       <StatusDialog c={d} target={statusDialog} onClose={() => setStatusDialog(null)} onDone={refresh} />

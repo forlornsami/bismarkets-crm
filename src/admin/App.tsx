@@ -9,6 +9,8 @@ import { useFavicon, useLogo } from "./lib/branding";
 import { SessionProvider, useCan } from "./lib/session";
 import { ClientDetail, ClientsList } from "./pages/Clients";
 import { Emails } from "./pages/Emails";
+import { EmailSettings } from "./pages/EmailSettings";
+import { ComposeEmail, EmailTemplates, SentEmailDetail, SentEmails } from "./pages/Messages";
 import { KycReview, KycWorkbench } from "./pages/Kyc";
 import { Account } from "./pages/Account";
 import { AuditLog } from "./pages/Audit";
@@ -136,6 +138,33 @@ export function App() {
           <Route path="/emails">
             <Guarded permission="comms.view">
               <Emails />
+            </Guarded>
+          </Route>
+          <Route path="/messages">
+            <Guarded permission="comms.view">
+              <SentEmails />
+            </Guarded>
+          </Route>
+          <Route path="/messages/new">
+            <Guarded permission="comms.send">
+              <ComposeEmail />
+            </Guarded>
+          </Route>
+          <Route path="/messages/templates">
+            <Guarded permission="comms.view">
+              <EmailTemplates />
+            </Guarded>
+          </Route>
+          <Route path="/messages/:id">
+            {(params) => (
+              <Guarded permission="comms.view">
+                <SentEmailDetail id={params.id} />
+              </Guarded>
+            )}
+          </Route>
+          <Route path="/settings/email">
+            <Guarded permission="settings.view">
+              <EmailSettings />
             </Guarded>
           </Route>
           <Route path="/roles">

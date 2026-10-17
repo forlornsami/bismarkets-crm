@@ -6,6 +6,7 @@ import { pictureVersion } from "../lib/pictures";
 
 export interface ClientRow {
   id: number;
+  marketing_opt_out_at: Date | null;
   email: string;
   first_name: string;
   last_name: string;
@@ -39,7 +40,7 @@ export interface ClientRow {
   picture_sha: string | null;
 }
 
-export const SELECT_CLIENT = `SELECT c.id, c.email, c.first_name, c.last_name, c.password_hash, c.status, c.status_reason, c.kyc_status, c.kyc_approved_at, c.important_notice,
+export const SELECT_CLIENT = `SELECT c.id, c.email, c.first_name, c.last_name, c.password_hash, c.status, c.status_reason, c.kyc_status, c.kyc_approved_at, c.marketing_opt_out_at, c.important_notice,
   c.email_verified_at, c.phone, c.phone_code, c.country, c.city, c.address, c.zipcode,
   DATE_FORMAT(c.dob, '%Y-%m-%d') AS dob, c.gender, c.bio, c.business_name, c.referral_code, c.referred_by, c.source,
   c.assigned_staff_id, c.failed_login_count, c.locked_until, c.last_login_at, c.last_login_ip, c.created_at, c.updated_at,

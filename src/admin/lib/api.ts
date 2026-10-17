@@ -58,6 +58,7 @@ export const api = {
   get: <T>(url: string) => send<T>("GET", url),
   post: <T>(url: string, body: unknown = {}) => send<T>("POST", url, body),
   patch: <T>(url: string, body: unknown) => send<T>("PATCH", url, body),
+  put: <T>(url: string, body: unknown) => send<T>("PUT", url, body),
   del: <T>(url: string) => send<T>("DELETE", url),
   upload: <T>(url: string, file: Blob) => send<T>("PUT", url, file),
   /** Multipart form, for document uploads. */

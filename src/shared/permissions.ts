@@ -141,7 +141,8 @@ export const PERMISSION_GROUPS = {
     label: "Communication",
     permissions: {
       "comms.view": "View message templates and history",
-      "comms.send": "Send messages to clients",
+      "comms.send": "Send emails to one client at a time",
+      "comms.bulk": "Send emails to groups of clients or to staff",
       "comms.templates": "Edit message templates",
     },
   },

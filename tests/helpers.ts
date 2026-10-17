@@ -1,7 +1,7 @@
 import type { Express } from "express";
 import pino from "pino";
 import request from "supertest";
-import { createApp } from "../src/server/app";
+import { createApp, type AppDeps } from "../src/server/app";
 import { loadConfig, type Config } from "../src/server/config";
 import { createDb, exec, one, rows, type Db } from "../src/server/lib/db";
 import { hashPassword } from "../src/server/lib/passwords";
@@ -43,11 +43,11 @@ export interface TestEnv {
   app: Express;
 }
 
-export async function setup(overrides: Record<string, string> = {}): Promise<TestEnv> {
+export async function setup(overrides: Record<string, string> = {}, deps: Partial<Pick<AppDeps, "mailTransport">> = {}): Promise<TestEnv> {
   const config = testConfig(overrides);
   const db = createDb(TEST_DB_URL);
   await resetDatabase(db);
-  const app = createApp({ db, config, log: pino({ level: "silent" }), fetch: (async () => new Response("", { status: 503 })) as typeof fetch });
+  const app = createApp({ db, config, log: pino({ level: "silent" }), fetch: (async () => new Response("", { status: 503 })) as typeof fetch, ...deps });
   return { db, config, app };
 }
 
