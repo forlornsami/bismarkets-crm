@@ -8,16 +8,18 @@ import { one, transaction, type Conn, type Db } from "../lib/db";
 import { AMOUNT_MESSAGES, formatMinor, parseAmount, toMajor } from "../money/amounts";
 import { holdAccount, InsufficientFunds, lockWallet, postLedger, walletAccount } from "../money/ledger";
 import { loadMoneySettings } from "../money/settings";
-import { clientAccountByLogin, loadAccount, writeSnapshot, type AccountRow } from "./accounts";
+import { clientAccountByLogin, loadAccount, withAccountLock, writeSnapshot, type AccountRow } from "./accounts";
 import { accountNotFound, callMt5, mt5Unavailable } from "./errors";
 import { GatewayError, type Mt5Gateway } from "./gateway";
-import { insertBalanceOp, loadOp, type BalanceOpRow, type OpStatus } from "./operations";
+import { insertBalanceOp, loadOp, runBalanceOp, type BalanceOpRow, type OpStatus } from "./operations";
 import { loadMt5Settings, serverEnabled } from "./settings";
 
 // Transfers between a client's wallet and their live MT5 accounts. A
 // transfer is a balance operation (operations.ts): checked and written here
 // ('sending') before MT5 is asked, sent once, and settled by its answer, or
-// later by the resolver when the answer was lost.
+// later by the resolver when the answer was lost. From the account's figures
+// in MT5 to that answer, it takes the account's turn as staff changes do, so
+// neither goes ahead on figures the other has just changed.
 //
 // Wallet to MT5 takes the money out of the wallet into `hold` in the same
 // transaction that writes the operation, so two transfers can never spend the
@@ -54,7 +56,14 @@ const TYPES: Record<TransferPurpose, { type: 1 | 2; label: string }> = {
 const dollars = (cents: number) => `$${formatMinor(cents)}`;
 
 /** Pending until MT5 has answered for certain; a client never sees "unknown". */
-export const transferStatus = (status: OpStatus) => (status === "completed" ? "completed" : status === "failed" ? "rejected" : "pending");
+export const transferStatus = (status: OpStatus) => (status === "completed" ? "completed" : status === "failed" || status === "cancelled" ? "rejected" : "pending");
+
+/**
+ * Whether an operation is one of the client's own transfers. Staff balance and
+ * credit changes and demo money are not: GET /api/transfers lists these two
+ * purposes only, and presentTransfer refuses anything else.
+ */
+export const isClientTransfer = (purpose: string): purpose is TransferPurpose => (TRANSFER_PURPOSES as readonly string[]).includes(purpose);
 
 /**
  * One row of GET /api/transfers, and the `data` of a transfer's answer.
@@ -62,7 +71,9 @@ export const transferStatus = (status: OpStatus) => (status === "completed" ? "c
  * once rejected, and is never MT5's own words.
  */
 export function presentTransfer(op: BalanceOpRow) {
-  const t = TYPES[op.purpose as TransferPurpose];
+  // A staff change listed here would show the client an internal reference and a staff decision: fail loudly instead.
+  if (!isClientTransfer(op.purpose)) throw new Error(`MT5 operation ${op.id} (${op.purpose}) is not a client transfer`);
+  const t = TYPES[op.purpose];
   const status = transferStatus(op.status);
   return {
     id: op.reference,
@@ -145,17 +156,15 @@ export interface TransferRequest {
   audit: AuditContext;
 }
 
-/**
- * Checks a transfer and writes it ('sending'; for wallet to MT5 with the
- * money held), ready for runBalanceOp. Throws the client's refusal when it
- * may not go ahead. The same request again within 30 seconds writes nothing:
- * the first one comes back with `repeat`.
- */
-export async function startTransfer(
-  deps: { db: Db; mt5: Mt5Gateway | null; log: Pick<Logger, "warn" | "error"> },
-  r: TransferRequest,
-): Promise<{ opId: number; repeat: boolean }> {
-  const { db, mt5, log } = deps;
+/** A transfer as far as it can be checked without MT5: the account it is for, and the amount. */
+interface CheckedTransfer {
+  account: AccountRow;
+  cents: number;
+  mt5: Mt5Gateway;
+}
+
+/** The checks that need neither MT5's figures nor the account's turn. Throws the client's refusal. */
+async function checkTransfer(db: Db, mt5: Mt5Gateway | null, r: TransferRequest): Promise<CheckedTransfer> {
   const toMt5 = r.purpose === "wallet_to_mt5";
   // Frozen, closed and unverified clients cannot move money (checked again with the client row locked).
   await assertClientMayMoveMoney(db, r.clientId);
@@ -165,9 +174,29 @@ export async function startTransfer(
   const [money, rules] = await Promise.all([loadMoneySettings(db), loadMt5Settings(db)]);
   if (cents < money.min_transfer_cents) throw fieldError("amount", `The minimum transfer is ${dollars(money.min_transfer_cents)}.`);
   if (cents > rules.maxTransferCents) throw fieldError("amount", `The maximum transfer is ${dollars(rules.maxTransferCents)}.`);
-  const found = await transferAccount(db, r.clientId, r.account);
-  assertUsable(found, toMt5);
-  if (!mt5 || !(await serverEnabled(db, found.server_code))) throw mt5Unavailable();
+  const account = await transferAccount(db, r.clientId, r.account);
+  assertUsable(account, toMt5);
+  if (!mt5 || !(await serverEnabled(db, account.server_code))) throw mt5Unavailable();
+  return { account, cents, mt5 };
+}
+
+/** Another operation on the account still on its way to MT5, or not known to have settled. */
+const openOpOn = (conn: Conn, accountId: number) =>
+  one(conn, "SELECT id FROM mt5_balance_ops WHERE mt5_account_id = ? AND status IN ('sending', 'unknown') LIMIT 1", [accountId]);
+
+/**
+ * Writes a checked transfer ('sending'; for wallet to MT5 with the money
+ * held), reading MT5's figures first for one out of MT5. The same request
+ * again within 30 seconds writes nothing: the first one comes back with
+ * `repeat`.
+ */
+async function writeTransfer(
+  deps: { db: Db; log: Pick<Logger, "warn" | "error"> },
+  r: TransferRequest,
+  { account: found, cents, mt5 }: CheckedTransfer,
+): Promise<{ opId: number; repeat: boolean }> {
+  const { db, log } = deps;
+  const toMt5 = r.purpose === "wallet_to_mt5";
 
   // Before MT5 is read: a repeat of a transfer that already took money out would otherwise be refused for want of it.
   const earlier = await repeatOf(db, r.clientId, r.purpose, found.id, cents);
@@ -190,9 +219,7 @@ export async function startTransfer(
     const again = await repeatOf(conn, r.clientId, r.purpose, a.id, cents);
     if (again) return { opId: again, repeat: true };
     // Every operation on this account is written under its row lock, so this sees any still open.
-    if (await one(conn, "SELECT id FROM mt5_balance_ops WHERE mt5_account_id = ? AND status IN ('sending', 'unknown') LIMIT 1", [a.id])) {
-      throw fieldError("mt5_account_id", BUSY);
-    }
+    if (await openOpOn(conn, a.id)) throw fieldError("mt5_account_id", BUSY);
     // Under the wallet lock, so two transfers at once cannot spend the same money. A 422 here: the
     // ledger's own refusal is a 409, which the app would read as "it may have happened".
     if (wallet && wallet.available_cents < cents) throw fieldError("amount", NOT_ENOUGH);
@@ -214,6 +241,52 @@ export async function startTransfer(
     });
     return { opId: op.id, repeat: false };
   });
+}
+
+/**
+ * Checks a transfer and writes it ('sending'; for wallet to MT5 with the
+ * money held), ready for runBalanceOp, but outside the account's turn:
+ * requests use makeTransfer. Throws the client's refusal when it may not go
+ * ahead. The same request again within 30 seconds writes nothing: the first
+ * one comes back with `repeat`.
+ */
+export async function startTransfer(
+  deps: { db: Db; mt5: Mt5Gateway | null; log: Pick<Logger, "warn" | "error"> },
+  r: TransferRequest,
+): Promise<{ opId: number; repeat: boolean }> {
+  return writeTransfer(deps, r, await checkTransfer(deps.db, deps.mt5, r));
+}
+
+/**
+ * A client's transfer, from its checks to MT5's answer, with MT5's figures
+ * read and the deal made on the account's turn (withAccountLock), as staff
+ * changes run: a staff change or another transfer that settles meanwhile
+ * cannot leave it checked on figures that are no longer true, nor go ahead
+ * itself on figures read before this one. `written` runs once it is written,
+ * before MT5 is asked (not for a repeat). Returns the operation as MT5's
+ * answer settled it, or a repeat's first operation once its own request has
+ * had MT5's answer. Throws the client's refusal when it may not go ahead.
+ */
+export async function makeTransfer(
+  deps: { db: Db; mt5: Mt5Gateway | null; log: Pick<Logger, "info" | "warn" | "error"> },
+  r: TransferRequest,
+  written: () => void = () => undefined,
+): Promise<BalanceOpRow> {
+  const { db } = deps;
+  const checked = await checkTransfer(db, deps.mt5, r);
+  const { account, cents } = checked;
+  // The first of a double click, already written, answers this one without waiting for the account's turn,
+  const earlier = await repeatOf(db, r.clientId, r.purpose, account.id, cents);
+  if (earlier) return settledOp(db, earlier);
+  // and an operation already on its way to MT5 refuses it at once (both are checked again on its turn).
+  if (await openOpOn(db, account.id)) throw fieldError("mt5_account_id", BUSY);
+  const started = await withAccountLock(account.id, async () => {
+    const s = await writeTransfer(deps, r, checked);
+    if (s.repeat) return { ...s, op: null };
+    written();
+    return { ...s, op: await runBalanceOp(deps, s.opId) };
+  });
+  return started.op ?? settledOp(db, started.opId);
 }
 
 /**

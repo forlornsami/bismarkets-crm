@@ -8,9 +8,10 @@ import { createClientSession } from "../src/server/clients/session";
 import { exec, one, rows, transaction } from "../src/server/lib/db";
 import { depositMethodAccount, holdAccount, lockWallet, mt5FundingAccount, postLedger, verifyLedger, walletAccount } from "../src/server/money/ledger";
 import { newReference } from "../src/server/money/references";
+import { withAccountLock } from "../src/server/mt5/accounts";
 import { insertBalanceOp, settleBalanceOp } from "../src/server/mt5/operations";
 import { checkBalanceOp, resolveMt5Once } from "../src/server/mt5/resolver";
-import { startTransfer } from "../src/server/mt5/transfers";
+import { makeTransfer, startTransfer } from "../src/server/mt5/transfers";
 import { FakeGateway } from "./fakes/gateway";
 import { createStaff, hasDb, post, setup, signIn, stepUp, type SignedIn, type TestEnv } from "./helpers";
 
@@ -568,6 +569,40 @@ describe.skipIf(!hasDb)("transfers between the wallet and MT5", () => {
     expect((await first).status).toBe(200);
     expect(await wallet(c.id)).toEqual({ available: 8_000, held: 0 });
     expect((await toMt5(c, login, 30)).status).toBe(200);
+    await clean();
+  });
+
+  it("makes a transfer on the account's turn, reading MT5's figures only once the change before it is done", async () => {
+    const c = await makeClient();
+    const { login, id } = await liveAccount(c);
+    fake.setAccount("live", login, { balanceCents: 10_000 });
+    const audit = { actor: { type: "client" as const, id: c.id, label: "test" }, ip: "", userAgent: "" };
+    const make = (amount: number, written: () => void) =>
+      makeTransfer({ db: env.db, mt5: fake, log }, { clientId: c.id, purpose: "mt5_to_wallet", account: String(login), amount, ip: "127.0.0.1", audit }, written);
+
+    // Another change has the account (a staff change between its read of the figures and its deal).
+    let release!: () => void;
+    const other = withAccountLock(id, () => new Promise<void>((resolve) => (release = resolve)));
+    const reads = fake.callsTo("accounts.get").length;
+    let writes = 0;
+    const waiting = make(80, () => writes++).catch((error: unknown) => error);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(fake.callsTo("accounts.get")).toHaveLength(reads);
+    expect(await opsOf(c.id)).toBe(0);
+    // That change took $50 out; the transfer reads MT5 after it, and $80 is more than is left.
+    fake.setAccount("live", login, { balanceCents: 5_000 });
+    release();
+    await other;
+    expect(await waiting).toMatchObject({ status: 422, fields: { amount: ["You can transfer up to $50.00 from this account."] } });
+    expect(writes).toBe(0);
+    expect(await opsOf(c.id)).toBe(0);
+
+    // On its turn, a transfer is written, then sent and settled before the next change has the account.
+    const done = await make(50, () => writes++);
+    expect(done).toMatchObject({ status: "completed", amount_cents: 5_000 });
+    expect(writes).toBe(1);
+    expect(fake.user("live", login)!.balanceCents).toBe(0);
+    expect(await wallet(c.id)).toEqual({ available: 5_000, held: 0 });
     await clean();
   });
 

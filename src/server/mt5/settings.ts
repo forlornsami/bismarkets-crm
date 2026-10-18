@@ -14,6 +14,8 @@ export interface Mt5Settings {
   demoMaxTopupCents: number;
   demoMaxBalanceCents: number;
   maxTransferCents: number;
+  /** Staff balance and credit changes at or under this run at once; above it (and always when 0) they need a second person. */
+  adjustSecondApprovalCents: number;
   updatedAt: Date;
   updatedBy: number | null;
 }
@@ -28,6 +30,7 @@ interface SettingsRow {
   demo_max_topup_cents: number;
   demo_max_balance_cents: number;
   max_transfer_cents: number;
+  adjust_second_approval_cents: number;
   updated_at: Date;
   updated_by: number | null;
 }
@@ -44,7 +47,7 @@ export async function loadMt5Settings(conn: Conn, lock?: "share" | "update"): Pr
   const r = await one<SettingsRow>(
     conn,
     `SELECT demo_server_code, demo_group, leverages, max_live_accounts, max_demo_accounts, demo_max_opening_cents, demo_max_topup_cents,
-       demo_max_balance_cents, max_transfer_cents, updated_at, updated_by
+       demo_max_balance_cents, max_transfer_cents, adjust_second_approval_cents, updated_at, updated_by
      FROM mt5_settings WHERE id = 1${lock === "share" ? " FOR SHARE" : lock === "update" ? " FOR UPDATE" : ""}`,
   );
   if (!r) throw new Error("mt5_settings is missing its row; run the migrations.");
@@ -58,6 +61,7 @@ export async function loadMt5Settings(conn: Conn, lock?: "share" | "update"): Pr
     demoMaxTopupCents: Number(r.demo_max_topup_cents),
     demoMaxBalanceCents: Number(r.demo_max_balance_cents),
     maxTransferCents: Number(r.max_transfer_cents),
+    adjustSecondApprovalCents: Number(r.adjust_second_approval_cents),
     updatedAt: r.updated_at,
     updatedBy: r.updated_by,
   };

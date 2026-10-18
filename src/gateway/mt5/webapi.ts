@@ -264,9 +264,11 @@ export const userChangePassword = (login: number, type: "main" | "investor", pas
 
 /**
  * Logins in one group (exact name: the gateway's group names cannot hold
- * the * or , of an MT5 group mask).
- * UNCONFIRMED: REST path /api/user/logins?group= (socket command USER_LOGINS)
- * and that the answer is an array of logins.
+ * the * or , of an MT5 group mask), for user.find and users.list.
+ * UNCONFIRMED: REST path /api/user/logins?group= (socket command USER_LOGINS),
+ * that the answer is an array of every login in the group in one answer (no
+ * paging on MT5's side; the gateway pages it for the CRM), and how large an
+ * answer MT5 sends for a big group.
  */
 export const userLogins = (group: string): Mt5Request => ({ write: false, method: "GET", path: "/api/user/logins", query: { group } });
 
@@ -303,20 +305,25 @@ export const positionTotal = (login: number): Mt5Request => ({ write: false, met
 export const readTotal = (reply: Reply) => int(answerObject(reply).total, "total");
 
 /**
- * A balance deal (deal action 2) of `amountCents`; negative takes money out.
- * UNCONFIRMED: REST path /api/trade/balance, GET with `login`, `type` (2),
- * `balance` (signed decimal), `comment` and `check_margin` (1 or 0) as query
- * parameters (socket command TRADE_BALANCE). Check that a negative amount is
- * a withdrawal, that check_margin=1 refuses one the free margin does not
- * cover (and with which retcode: the gateway expects 10019), the comment
- * length limit (references are 13 characters), and the answer's ticket field
- * (answer.ticket is assumed).
+ * A balance deal (deal action 2) or credit deal (action 3) of `amountCents`;
+ * negative takes money (or credit) out.
+ * UNCONFIRMED: REST path /api/trade/balance, GET with `login`, `type` (the
+ * deal action, 2 or 3), `balance` (signed decimal), `comment` and
+ * `check_margin` (1 or 0) as query parameters (socket command TRADE_BALANCE).
+ * Check that a negative amount is a withdrawal, that check_margin=1 refuses
+ * one the free margin does not cover (and with which retcode: the gateway
+ * expects 10019), the comment length limit (references are 13 characters),
+ * and the answer's ticket field (answer.ticket is assumed).
+ * UNCONFIRMED for credit (type 3): that it is the same command, that a
+ * negative amount removes credit and that MT5 refuses to take more credit
+ * than the account has, that check_margin=1 also guards a credit removal,
+ * and that the credit deal's amount is in Profit like a balance deal's.
  */
-export const tradeBalance = (b: { login: number; amountCents: number; comment: string; checkMargin: boolean }): Mt5Request => ({
+export const tradeBalance = (b: { login: number; action: typeof BALANCE_ACTION | typeof CREDIT_ACTION; amountCents: number; comment: string; checkMargin: boolean }): Mt5Request => ({
   write: true,
   method: "GET",
   path: "/api/trade/balance",
-  query: { login: String(b.login), type: "2", balance: decimalFromCents(b.amountCents), comment: b.comment, check_margin: b.checkMargin ? "1" : "0" },
+  query: { login: String(b.login), type: String(b.action), balance: decimalFromCents(b.amountCents), comment: b.comment, check_margin: b.checkMargin ? "1" : "0" },
 });
 
 /** The deal ticket of a balance operation, or null if the answer does not say. */
@@ -337,7 +344,9 @@ export function readTicket(reply: Reply): number | null {
 // UNCONFIRMED: the most deals one page returns (the gateway asks for at most
 // 1000 and carries on from what it got).
 
+/** MT5 deal actions (MetaQuotes' MTEnDealAction): what trade/balance's `type` makes. */
 export const BALANCE_ACTION = 2;
+export const CREDIT_ACTION = 3;
 
 export const dealTotal = (login: number, from: number, to: number): Mt5Request => ({
   write: false,

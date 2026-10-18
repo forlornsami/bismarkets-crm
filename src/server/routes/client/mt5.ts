@@ -14,15 +14,19 @@ import { lockWallet } from "../../money/ledger";
 import {
   activateAccount, clientAccountByLogin, clientAccounts, loadAccount, presentClientAccount, refreshFigures, withAccountLock, type AccountRow,
 } from "../../mt5/accounts";
+import { syncStaleDeals } from "../../mt5/deals";
 import {
   accountNotFound, callMt5, callMt5Again, CHANGE_FAILED, CREATE_UNCONFIRMED, mt5Unavailable, SUSPENDED, unconfirmed,
 } from "../../mt5/errors";
 import { GatewayError, type Mt5Gateway } from "../../mt5/gateway";
 import { DEMO_FAILED, insertBalanceOp, runBalanceOp } from "../../mt5/operations";
 import { presentClientPackage, SELECT_PACKAGE, packageFromDb, visiblePackage, type PackageRow } from "../../mt5/packages";
-import { MT5_PASSWORD_MESSAGE, mt5PasswordOk } from "../../mt5/passwords";
+import {
+  changeMt5Password, forgetMt5Passwords, keepMt5Password, MT5_PASSWORD_MESSAGE, mt5PasswordOk, openMt5Passwords, samePassword, type Mt5PasswordType,
+} from "../../mt5/passwords";
 import { withMt5Reference } from "../../mt5/references";
 import { loadMt5Settings, parseLeverage, serverEnabled } from "../../mt5/settings";
+import { clientTradePage, historyQuery, NO_TRADES, presentClientSummary, presentClientTrade, tradeIdSuffixes } from "../../mt5/trades";
 
 // The portal and app's MT5 endpoints: account packages, leverages, the
 // client's MT5 accounts (list, open, archive, restore, leverage, passwords),
@@ -38,6 +42,8 @@ const FUNDING_WAIT_MS = 8_000;
 
 const LEVERAGE_NOT_AVAILABLE = "This leverage is not available.";
 const SAME_PASSWORDS = "The investor password must be different from the master password.";
+const NEW_PASSWORD = "Enter a new password.";
+const PASSWORDS_OUT_OF_DATE = "Your account's passwords have changed since this page was opened. Reload the page and try again.";
 const STILL_SETTING_UP = "Your previous account is still being set up. Please check your accounts in a minute.";
 const PASSWORD_REFUSED = "MT5 did not accept this password. Choose a different one.";
 const NOT_DEMO = "Choose one of your demo accounts.";
@@ -163,13 +169,17 @@ export function clientMt5Router(deps: AppDeps): Router {
 
   // ---------- Accounts ----------
 
-  // Staff view-only sessions may look: nothing here changes the account.
+  // Staff view-only sessions may look: nothing here changes the account. The kept passwords go to the
+  // client's own session only; staff viewing as the client get them as not supplied.
   router.get(
     "/mt5-accounts",
     auth,
     handler(async (req, res) => {
-      const list = await refreshFigures(db, mt5, await clientAccounts(db, clientOf(req).id), { log });
-      const shown = list.map(presentClientAccount);
+      const client = clientOf(req);
+      const list = await refreshFigures(db, mt5, await clientAccounts(db, client.id), { log });
+      const kept = client.kind === "login" ? await openMt5Passwords(db, config, list, log) : null;
+      const shown = list.map((a) => presentClientAccount(a, kept?.get(a.id) ?? null));
+      res.setHeader("Cache-Control", "no-store");
       res.json({ success: true, real_accounts: shown.filter((a) => !a.is_demo), demo_accounts: shown.filter((a) => a.is_demo) });
     }),
   );
@@ -243,7 +253,7 @@ export function clientMt5Router(deps: AppDeps): Router {
         // Counted with the client row locked, just before the row that asks MT5: a refusal here writes nothing.
         use(creates, String(client.id), CREATES_USED);
         const packageName = demo ? "Demo" : p!.name;
-        return withMt5Reference("A", async (createRef) => {
+        const row = await withMt5Reference("A", async (createRef) => {
           const r = await exec(
             conn,
             `INSERT INTO mt5_accounts (client_id, server_code, is_demo, package_id, package_name, mt5_group, currency, leverage, create_ref, created_ip)
@@ -252,6 +262,11 @@ export function clientMt5Router(deps: AppDeps): Router {
           );
           return { id: r.insertId, createRef, server, group };
         });
+        // Kept with the row that asks MT5, so an account MT5 opens has them whoever settles it (this request or the resolver).
+        const owner = { id: row.id, client_id: client.id };
+        await keepMt5Password(conn, config, owner, "main", password, "client");
+        await keepMt5Password(conn, config, owner, "investor", investorPassword, "client");
+        return row;
       });
       const meta = { accountId: created.id, server: created.server, group: created.group, isDemo: demo, packageId: pkg?.id ?? null, leverage, createRef: created.createRef };
 
@@ -280,7 +295,11 @@ export function clientMt5Router(deps: AppDeps): Router {
         await transaction(db, async (conn) => {
           await lockClient(conn, client.id);
           const r = await exec(conn, "UPDATE mt5_accounts SET status = 'failed', failure = ? WHERE id = ? AND status = 'creating'", [failure, created.id]);
-          if (r.affectedRows === 1) await writeAudit(conn, ctx(req), { action: "mt5.account.create_failed", entityType: "client", entityId: client.id, meta: { ...meta, reason: failure } });
+          if (r.affectedRows === 1) {
+            // MT5 said no, so the account does not exist and neither do its passwords.
+            await forgetMt5Passwords(conn, created.id);
+            await writeAudit(conn, ctx(req), { action: "mt5.account.create_failed", entityType: "client", entityId: client.id, meta: { ...meta, reason: failure } });
+          }
         });
         if (error.kind === "refused" && error.code === "invalid_password") throw fieldError("password", PASSWORD_REFUSED);
         if (error.kind === "refused") throw fieldError("mt5", "We could not open the account. Please try again later.");
@@ -325,6 +344,7 @@ export function clientMt5Router(deps: AppDeps): Router {
       }
       const row = (await loadAccount(db, created.id))!;
       if (row.status !== "active") throw unconfirmed(CREATE_UNCONFIRMED);
+      // Without the passwords: the portal shows what the client typed, and both clients read the list again.
       res.json({ success: true, message: "Your account is ready.", account: presentClientAccount(row) });
     }),
   );
@@ -443,46 +463,55 @@ export function clientMt5Router(deps: AppDeps): Router {
       // A pair left empty is unchanged: the app sends "" for the password it is not changing.
       const main = { value: passwordText(body.password), confirmation: passwordText(body.password_confirmation) };
       const investor = { value: passwordText(body.investor_password), confirmation: passwordText(body.investor_password_confirmation) };
-      const changeMain = main.value !== "" || main.confirmation !== "";
-      const changeInvestor = investor.value !== "" || investor.confirmation !== "";
-      if (!changeMain && !changeInvestor) throw fieldError("password", "Enter a new password.");
-      if (changeMain && main.value !== main.confirmation) throw fieldError("password_confirmation", "The passwords do not match.");
-      if (changeInvestor && investor.value !== investor.confirmation) throw fieldError("investor_password_confirmation", "The passwords do not match.");
-      if (changeMain && !mt5PasswordOk(main.value)) throw fieldError("password", MT5_PASSWORD_MESSAGE);
-      if (changeInvestor && !mt5PasswordOk(investor.value)) throw fieldError("investor_password", MT5_PASSWORD_MESSAGE);
-      if (changeMain && changeInvestor && main.value === investor.value) throw fieldError("investor_password", SAME_PASSWORDS);
+      const sentMain = main.value !== "" || main.confirmation !== "";
+      const sentInvestor = investor.value !== "" || investor.confirmation !== "";
+      if (!sentMain && !sentInvestor) throw fieldError("password", NEW_PASSWORD);
+      if (sentMain && main.value !== main.confirmation) throw fieldError("password_confirmation", "The passwords do not match.");
+      if (sentInvestor && investor.value !== investor.confirmation) throw fieldError("investor_password_confirmation", "The passwords do not match.");
 
       await changeAccount(req, async (a) => {
+        // One password per change. The portal sends back the other one from the list it loaded, so with both
+        // sent the one equal to the kept one stays as it is (checked before the policy, which an older password
+        // may not meet). Neither equal means that list is out of date: sending both would put back a password
+        // the client or staff have since replaced. Neither front end changes both at once.
+        const kept = (await openMt5Passwords(db, config, [a], log)).get(a.id)!;
+        let type: Mt5PasswordType = sentMain ? "main" : "investor";
+        if (sentMain && sentInvestor) {
+          const keepMain = samePassword(main.value, kept.main);
+          const keepInvestor = samePassword(investor.value, kept.investor);
+          // Both as kept: there is no telling which one the client typed.
+          if (keepMain && keepInvestor) throw fieldError("password", NEW_PASSWORD);
+          if (!keepMain && !keepInvestor) {
+            if (main.value === investor.value) throw fieldError("investor_password", SAME_PASSWORDS);
+            throw fieldError("password", PASSWORDS_OUT_OF_DATE);
+          }
+          type = keepMain ? "investor" : "main";
+        }
+        // Sent alone, it goes to MT5 even when it equals the kept one: MT5 may have another (changed in MT5
+        // itself), and setting it again makes MT5 match what the panel shows.
+        const field = type === "main" ? "password" : "investor_password";
+        const password = type === "main" ? main.value : investor.value;
+        if (!mt5PasswordOk(password)) throw fieldError(field, MT5_PASSWORD_MESSAGE);
+        // The two must still differ afterwards: an investor password that is the master one would give full
+        // access to whoever it is shared with.
+        if (samePassword(password, kept[type === "main" ? "investor" : "main"])) throw fieldError(field, SAME_PASSWORDS);
         if (a.suspended_at) throw fieldError("account", SUSPENDED);
         const gateway = await gatewayFor(a.server_code);
         use(passwordChanges, String(client.id), PASSWORDS_USED);
-        // Recorded without the passwords, only which ones changed.
-        const record = (changed: { main: boolean; investor: boolean }) =>
-          auditStandalone(db, ctx(req), { action: "mt5.account.password_changed", entityType: "client", entityId: client.id, meta: { accountId: a.id, login: a.login, ...changed } });
-        const refusal = (error: unknown, field: string): never => {
+        // Kept once MT5 confirms it; a lost answer leaves it not available.
+        try {
+          await changeMt5Password(db, config, { account: a, type, password, by: "client" }, () =>
+            callMt5Again(gateway, "user.password", { server: a.server_code, login: a.login!, type, password }, log),
+          );
+        } catch (error) {
           if (error instanceof GatewayError && error.kind === "refused" && error.code === "invalid_password") throw fieldError(field, PASSWORD_REFUSED);
-          return changeFailed(error);
-        };
-        if (changeMain) {
-          try {
-            await callMt5Again(gateway, "user.password", { server: a.server_code, login: a.login!, type: "main", password: main.value }, log);
-          } catch (error) {
-            refusal(error, "password");
-          }
+          changeFailed(error);
         }
-        if (changeInvestor) {
-          try {
-            await callMt5Again(gateway, "user.password", { server: a.server_code, login: a.login!, type: "investor", password: investor.value }, log);
-          } catch (error) {
-            if (!changeMain) refusal(error, "investor_password");
-            await record({ main: true, investor: false });
-            if (error instanceof GatewayError && error.kind !== "unknown") {
-              throw fieldError("investor_password", "Your master password was changed, but the investor password was not. Please try again.");
-            }
-            changeFailed(error);
-          }
-        }
-        await record({ main: changeMain, investor: changeInvestor });
+        // Recorded without the password, only which one changed.
+        await auditStandalone(db, ctx(req), {
+          action: "mt5.account.password_changed", entityType: "client", entityId: client.id,
+          meta: { accountId: a.id, login: a.login, main: type === "main", investor: type === "investor" },
+        });
         res.json({ success: true, message: "Password changed." });
       });
     }),
@@ -550,24 +579,31 @@ export function clientMt5Router(deps: AppDeps): Router {
 
   // ---------- Trade history ----------
 
-  // Built with the deals sync in a later round. Until then the live shape with nothing in it,
-  // so no page fails. Its own paging: the shared pageQuery would cut the portal's per_page=500 to 15.
+  // Closed trades from the CRM's deals cache, never live from MT5 page by page: both clients refuse a
+  // history whose total changes between pages. Only the first page syncs, so paging on cannot move the
+  // total. Staff view-only sessions may look. Its own paging: the shared pageQuery would cut the portal's
+  // per_page=500 to 15.
   router.get(
     "/trade-history",
     auth,
     handler(async (req, res) => {
-      const q = req.query as Record<string, unknown>;
-      const whole = (v: unknown) => (typeof v === "string" && /^-?\d{1,9}$/.test(v.trim()) ? Number(v) : null);
-      const page = Math.max(1, whole(q.page) ?? 1);
-      const perPage = Math.min(500, Math.max(1, whole(q.per_page) ?? 100));
-      const day = (v: unknown) => (typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : null);
-      const account = typeof q.account_id === "string" && /^\d{1,15}$/.test(q.account_id) ? q.account_id : null;
+      const q = historyQuery(req.query as Record<string, unknown>);
+      const client = clientOf(req);
+      // Live and demo; an account_id that is not one of the caller's own matches nothing.
+      const mine = await clientAccounts(db, client.id);
+      const wanted = q.login === null ? mine : mine.filter((a) => a.login === q.login);
+      if (q.page === 1 && mt5 && wanted.length) await syncStaleDeals(db, mt5, wanted.map((a) => a.id), log);
+      const { totals, items } = wanted.length
+        ? await clientTradePage(db, { clientId: client.id, accountIds: wanted.map((a) => a.id), from: q.from, to: q.to }, q.page, q.perPage)
+        : { totals: NO_TRADES, items: [] };
+      const accounts = new Map(wanted.map((a) => [a.id, a]));
+      const suffixes = tradeIdSuffixes(mine);
       res.json({
         success: true,
-        filters: { from_date: day(q.from_date), to_date: day(q.to_date), account_id: account },
-        summary: { total_trades: 0, total_profit: 0, total_volume: 0, total_commission: 0 },
-        pagination: { current_page: page, per_page: perPage, total: 0, last_page: 1 },
-        trades: [],
+        filters: q.filters,
+        summary: presentClientSummary(totals),
+        pagination: { current_page: q.page, per_page: q.perPage, total: totals.trades, last_page: Math.max(1, Math.ceil(totals.trades / q.perPage)) },
+        trades: items.map((t) => presentClientTrade(t, accounts.get(t.mt5_account_id)!, suffixes.get(t.mt5_account_id) ?? "")),
       });
     }),
   );

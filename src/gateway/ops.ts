@@ -14,9 +14,12 @@ import * as api from "./mt5/webapi";
 //   or demo groups, are touched. No operation deletes an account or changes
 //   its group.
 // - Leverage comes from GATEWAY_LEVERAGES.
-// - A balance deal carries a BIS- reference, stays under the per-operation
-//   cap, and live credits stay under a rolling 24-hour cap per server.
-// - One write at a time per login, and a balance is never sent twice for the
+// - A balance or credit deal carries a BIS- reference and stays under the
+//   per-operation cap, and money added to live accounts (balance and credit
+//   together) stays under a rolling 24-hour cap per server. Credit goes to
+//   live accounts only, and taking balance or credit out always has MT5
+//   check the margin it leaves.
+// - One write at a time per login, and a deal is never sent twice for the
 //   same reference.
 
 const DAY_MS = 86_400_000;
@@ -33,6 +36,11 @@ const FIND_OLDER = 10;
 const DEAL_PAGE = 1000;
 /** A deal search reads at most this many deals; past that it cannot prove a deal is absent. */
 const MAX_SCAN_DEALS = 20_000;
+/** users.list lists groups of up to this many logins; a larger one is refused rather than read whole for every page. */
+const MAX_LIST_LOGINS = 100_000;
+/** A group's logins are kept this long after a listing's first page, so its later pages cost no MT5 read. */
+const LIST_TTL_MS = 60_000;
+const LIST_CACHE_MAX = 8;
 /** A write is sent only with this much of the CRM's patience left, so its answer can still arrive. */
 const WRITE_MIN_MS = 3_000;
 
@@ -92,12 +100,14 @@ export const OP_SCHEMAS: { [K in OpName]: z.ZodType<Ops[K]["req"], z.ZodTypeDef,
       comment: reference,
       checkMargin: z.boolean(),
       notBefore: isoTime,
+      type: z.enum(["balance", "credit"]).optional(),
     })
     .strict(),
   "deal.find": z.object({ server, login, comment: reference, from: isoTime }).strict(),
   "deals.page": z
     .object({ server, login, from: isoTime, to: isoTime, offset: z.number().int().min(0).max(10_000_000), limit: z.number().int().min(1).max(1000) })
     .strict(),
+  "users.list": z.object({ server, group, after: login.optional(), limit: z.number().int().min(1).max(1000) }).strict(),
 };
 
 // ---- Bounded memory ----
@@ -127,11 +137,43 @@ export class GroupCache {
   }
 }
 
+/** One group's logins, lowest first, for a minute, at most 8 groups (the oldest goes first). */
+export class LoginLists {
+  private entries = new Map<string, { logins: number[]; expires: number }>();
+
+  get(key: string, now = Date.now()): number[] | null {
+    const entry = this.entries.get(key);
+    if (!entry) return null;
+    if (entry.expires > now) return entry.logins;
+    this.entries.delete(key);
+    return null;
+  }
+
+  set(key: string, logins: number[], now = Date.now()) {
+    this.entries.delete(key);
+    this.entries.set(key, { logins, expires: now + LIST_TTL_MS });
+    if (this.entries.size > LIST_CACHE_MAX) this.entries.delete(this.entries.keys().next().value!);
+  }
+}
+
+/** Where the first login above `after` is in an ascending list. */
+function firstAbove(sorted: number[], after: number): number {
+  let lo = 0;
+  let hi = sorted.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (sorted[mid]! <= after) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
 /**
- * Credits to live accounts in the last 24 hours on one server, kept in
- * one-minute buckets: at most 1,441 numbers whatever the traffic. A minute
- * counts until all of it is a day old, so the sum can only be too high,
- * never too low. It lives in memory: a restart starts a new day.
+ * Money added to live accounts in the last 24 hours on one server, balance
+ * and credit deals together, kept in one-minute buckets: at most 1,441
+ * numbers whatever the traffic. A minute counts until all of it is a day
+ * old, so the sum can only be too high, never too low. It lives in memory: a
+ * restart starts a new day.
  */
 export class DailyCredits {
   private buckets = new Map<number, number>();
@@ -217,6 +259,7 @@ type WriteFields = Record<string, string | number | boolean | undefined>;
 export class Gateway {
   private servers = new Map<string, ServerRuntime>();
   private groups = new GroupCache();
+  private lists = new LoginLists();
   private locks = new KeyedMutex();
 
   constructor(
@@ -368,14 +411,18 @@ export class Gateway {
 
     balance: async (req, ctx) => {
       const s = this.server(req.server);
-      const fields = { op: "balance", login: req.login, amountCents: req.amountCents, comment: req.comment, checkMargin: req.checkMargin };
+      const type = req.type ?? "balance";
+      const action = type === "credit" ? api.CREDIT_ACTION : api.BALANCE_ACTION;
+      const fields = { op: "balance", type, login: req.login, amountCents: req.amountCents, comment: req.comment, checkMargin: req.checkMargin };
       return this.write(s, `login:${req.login}`, ctx, fields, async (log) => {
         const notBefore = Date.parse(req.notBefore);
         const now = Date.now();
         if (notBefore > now + DAY_MS || notBefore < now - 30 * DAY_MS) throw policy("notBefore must be within the last 30 days.");
-        // Money only leaves an account if MT5 checks the margin it leaves behind.
+        // Money (or credit) only leaves an account if MT5 checks the margin it leaves behind.
         if (req.amountCents < 0 && !req.checkMargin) throw policy("Taking money out of an account must check its margin.");
         const { kind } = await this.groupOf(s, req.login, ctx);
+        // Credit is the broker's money lent to a live client; the CRM has no use for it on a demo account.
+        if (type === "credit" && kind !== "live") throw policy("Credit is only for live accounts.");
         // Look for this reference first, under the same lock as the send: if
         // MT5 already has the deal, it happened, and nothing is sent again.
         // This comes before the caps, so a repeat is answered as done even
@@ -383,21 +430,23 @@ export class Gateway {
         const existing = await this.findDeal(s, req.login, req.comment, notBefore - DAY_MS, now + DAY_MS, ctx);
         if (existing) {
           log.ticket = existing.ticket;
-          if (existing.action === api.BALANCE_ACTION && existing.profitCents === req.amountCents) {
+          if (existing.action === action && existing.profitCents === req.amountCents) {
             log.duplicate = true;
             return { ticket: existing.ticket, duplicate: true };
           }
           // Something with this reference is there but it is not this
-          // operation. Neither "done" nor "failed" is safe to say.
-          throw unknownOutcome("mt5_error", `MT5 already has deal ${existing.ticket} with this comment, but not as this balance operation; staff must check it.`);
+          // operation (another amount, or a balance deal where credit was
+          // asked for). Neither "done" nor "failed" is safe to say.
+          throw unknownOutcome("mt5_error", `MT5 already has deal ${existing.ticket} with this comment, but not as this ${type} operation; staff must check it.`);
         }
         const cap = kind === "demo" ? this.config.demoMaxOpCents : this.config.maxOpCents;
         if (Math.abs(req.amountCents) > cap) throw refused("over_limit", `The amount is over the gateway's ${kind} limit for one operation.`);
+        // Balance and credit added to live accounts share one day's limit.
         const release = kind === "live" && req.amountCents > 0 ? s.credits.reserve(req.amountCents, this.config.dailyCreditCents) : () => undefined;
-        if (!release) throw refused("over_limit", `Credits to live accounts on server ${s.config.code} would pass the gateway's 24-hour limit.`);
+        if (!release) throw refused("over_limit", `Money added to live accounts on server ${s.config.code} would pass the gateway's 24-hour limit.`);
         let reply: api.Reply;
         try {
-          reply = await this.send(s, api.tradeBalance(req), ctx);
+          reply = await this.send(s, api.tradeBalance({ login: req.login, action, amountCents: req.amountCents, comment: req.comment, checkMargin: req.checkMargin }), ctx);
         } catch (error) {
           // Only money that may have reached MT5 counts toward the day.
           if (error instanceof OpError && error.kind !== "unknown") release();
@@ -407,9 +456,9 @@ export class Gateway {
         if (ticket === null) {
           // Done, but the answer has no ticket: find the deal it made.
           const made = await this.findDeal(s, req.login, req.comment, notBefore - DAY_MS, Date.now() + DAY_MS, ctx).catch(() => null);
-          if (made && made.action === api.BALANCE_ACTION && made.profitCents === req.amountCents) ticket = made.ticket;
+          if (made && made.action === action && made.profitCents === req.amountCents) ticket = made.ticket;
         }
-        if (ticket === null) throw unknownOutcome("mt5_error", "MT5 accepted the balance operation but its deal could not be found.");
+        if (ticket === null) throw unknownOutcome("mt5_error", `MT5 accepted the ${type} operation but its deal could not be found.`);
         log.ticket = ticket;
         return { ticket, duplicate: false };
       });
@@ -442,6 +491,25 @@ export class Gateway {
       if (req.offset >= total) return { total, deals: [] };
       const page = await this.read(s, api.dealPage(req.login, a, b, req.offset, req.limit), ctx);
       return { total, deals: readOr(() => api.readDeals(page, tz)).slice(0, req.limit) };
+    },
+
+    "users.list": async (req, ctx) => {
+      const s = this.server(req.server);
+      // Only the server's own live and demo groups: the CRM has no business listing any other.
+      this.kindOf(s, req.group);
+      const key = `${s.config.code}|${req.group}`;
+      // A listing's first page reads MT5 afresh; the pages after it read that same list, so logins do not shift between pages.
+      let logins = req.after === undefined ? null : this.lists.get(key);
+      if (!logins) {
+        const reply = await this.read(s, api.userLogins(req.group), ctx);
+        logins = [...new Set(readOr(() => api.readLogins(reply)))].sort((x, y) => x - y);
+        if (logins.length > MAX_LIST_LOGINS) {
+          throw refused("limit_reached", `Group "${req.group}" has ${logins.length} accounts, more than the gateway lists (${MAX_LIST_LOGINS}).`);
+        }
+        this.lists.set(key, logins);
+      }
+      const start = req.after === undefined ? 0 : firstAbove(logins, req.after);
+      return { total: logins.length, logins: logins.slice(start, start + req.limit) };
     },
   };
 
@@ -503,8 +571,8 @@ export class Gateway {
 
   /**
    * The deal on this login with exactly this comment between two UTC times,
-   * preferring a balance deal, or null. Every deal in the window is read; a
-   * window too large to read in full is `unavailable`, never "not found".
+   * preferring a balance or credit deal, or null. Every deal in the window is
+   * read; a window too large to read in full is `unavailable`, never "not found".
    */
   private async findDeal(s: ServerRuntime, login: number, comment: string, fromMs: number, toMs: number, ctx: OpContext): Promise<Mt5Deal | null> {
     const tz = s.config.tzOffsetMinutes;
@@ -520,7 +588,7 @@ export class Gateway {
       if (deals.length === 0) throw unavailable("mt5_error", "MT5's deal pages ended before its total; the search is not complete.");
       for (const deal of deals) {
         if (deal.comment !== comment || deal.login !== login) continue;
-        if (deal.action === api.BALANCE_ACTION) return deal;
+        if (deal.action === api.BALANCE_ACTION || deal.action === api.CREDIT_ACTION) return deal;
         found ??= deal;
       }
       offset += deals.length;

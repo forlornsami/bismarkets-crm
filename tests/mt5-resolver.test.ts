@@ -155,9 +155,10 @@ describe.skipIf(!hasDb)("MT5 resolver", () => {
     );
     expect(audit).toMatchObject({ actor_type: "system", actor_label: "MT5 resolver", meta_json: { login: made.login, foundBy: "resolver", server: "live" } });
 
-    // The client now sees it, and may open another.
+    // The client now sees it, with the passwords MT5 opened it with, and may open another.
     const list = await api().get("/api/mt5-accounts").set(bearer(c));
-    expect(list.body.real_accounts).toEqual([expect.objectContaining({ login: String(made.login), status: "active", archived: false })]);
+    expect(list.body.real_accounts).toEqual([expect.objectContaining({ login: String(made.login), status: "active", archived: false, password: MASTER, investor_password: INVESTOR })]);
+    expect(made.passwords).toEqual({ main: MASTER, investor: INVESTOR });
     expect((await create(c, realBody)).status).toBe(200);
     // Settled once: a second pass finds nothing to do.
     expect(await resolve()).toEqual({ ops: 0, accounts: 0 });
@@ -169,6 +170,9 @@ describe.skipIf(!hasDb)("MT5 resolver", () => {
     expect((await create(c, realBody)).status).toBe(409);
     const id = await lastAccount(c.id);
     const creates = fake.callsTo("user.create").length;
+    const kept = () => rows(env.db, "SELECT type FROM mt5_account_passwords WHERE account_id = ? ORDER BY type", [id]);
+    // Kept while MT5 may still have made it.
+    expect(await kept()).toEqual([{ type: "main" }, { type: "investor" }]);
 
     for (const [checks, wait] of [[1, 2], [2, 4], [3, 8]] as const) {
       await due("mt5_accounts", id);
@@ -182,6 +186,8 @@ describe.skipIf(!hasDb)("MT5 resolver", () => {
     expect(await resolve()).toEqual({ ops: 0, accounts: 1 });
     expect(await accountOf(id)).toMatchObject({ status: "failed", failure: "not_found", checks: 4, next_check_at: null, login: null });
     expect(fake.callsTo("user.create")).toHaveLength(creates);
+    // Never opened: its passwords are gone.
+    expect(await kept()).toEqual([]);
     expect(await one(env.db, "SELECT actor_type, JSON_EXTRACT(meta_json, '$.reason') AS reason FROM audit_log WHERE action = 'mt5.account.create_failed' AND entity_id = ?", [String(c.id)])).toEqual({
       actor_type: "system", reason: "not_found",
     });

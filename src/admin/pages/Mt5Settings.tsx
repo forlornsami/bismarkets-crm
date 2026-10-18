@@ -1,7 +1,7 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, Radio, Server, SlidersHorizontal } from "lucide-react";
 import { useEffect, useState, type ReactNode } from "react";
-import { minorText, parseAmountText, textProblem } from "../components/money";
+import { minorText, money, parseAmountText, textProblem } from "../components/money";
 import { DecisionError } from "../components/ReviewWorkbench";
 import { Badge, Dialog, EmptyState, ErrorText, Field, PageHeader, Spinner, useFeedback } from "../components/ui";
 import { ApiError, api, formatDate } from "../lib/api";
@@ -11,7 +11,9 @@ import { useCan } from "../lib/session";
 // The MT5 servers the gateway serves and the rules for clients' MT5 accounts.
 // The CRM knows each server by its gateway code, with a label and an on/off
 // switch; its address and manager login live only in the gateway. Every
-// change asks for a 2FA code and is recorded in the audit log.
+// change asks for a 2FA code and is recorded in the audit log. The rules
+// include the amount up to which a staff balance or credit change runs on one
+// person's word; 0 (the default) means every change needs a second person.
 
 /** The same rules the server and the gateway use. */
 const SERVER_CODE = /^[a-z0-9_-]{1,16}$/;
@@ -291,7 +293,7 @@ function ServerDialog({ server, onClose }: { server?: Mt5Server; onClose: () => 
 
 type AmountKey = "demoMaxOpeningCents" | "demoMaxTopupCents" | "demoMaxBalanceCents" | "maxTransferCents";
 type CountKey = "maxLiveAccounts" | "maxDemoAccounts";
-type RulesForm = Record<AmountKey | CountKey, string> & { leverages: string; demoServerCode: string; demoGroup: string };
+type RulesForm = Record<AmountKey | CountKey, string> & { leverages: string; demoServerCode: string; demoGroup: string; adjustSecondApprovalCents: string };
 
 const AMOUNTS: { key: AmountKey; label: string; help: string }[] = [
   { key: "demoMaxOpeningCents", label: "Largest demo starting balance", help: "The most a client can choose as the starting balance of a new demo account." },
@@ -314,7 +316,15 @@ const formOf = (s: Rules): RulesForm => ({
   demoMaxTopupCents: minorText(s.demoMaxTopupCents),
   demoMaxBalanceCents: minorText(s.demoMaxBalanceCents),
   maxTransferCents: minorText(s.maxTransferCents),
+  adjustSecondApprovalCents: minorText(s.adjustSecondApprovalCents),
 });
+
+/** Like parseAmountText, but 0 is allowed: it means every staff change needs a second person. */
+function thresholdOf(text: string): { minor: number; problem?: undefined } | { minor?: undefined; problem: string } {
+  if (/^\s*0+(\.0*)?\s*$/.test(text)) return { minor: 0 };
+  if (!text.trim()) return { problem: "Enter the amount, or 0 for a second person on every change." };
+  return parseAmountText(text);
+}
 
 /** "2000, 1000, 1:500" → [2000, 1000, 500], in the order given, without repeats. */
 function leveragesOf(text: string): { list: number[]; problem?: undefined } | { list?: undefined; problem: string } {
@@ -383,6 +393,9 @@ function RulesCard({ servers }: { servers: Mt5Server[] }) {
       if (r.minor !== s[a.key]) body[a.key] = r.minor;
     }
   }
+  const threshold = thresholdOf(form.adjustSecondApprovalCents);
+  if (threshold.problem !== undefined) problems.adjustSecondApprovalCents = threshold.problem;
+  else if (threshold.minor !== s.adjustSecondApprovalCents) body.adjustSecondApprovalCents = threshold.minor;
   const opening = cents.demoMaxOpeningCents;
   const most = cents.demoMaxBalanceCents;
   if (opening !== undefined && most !== undefined && most < opening) problems.demoMaxBalanceCents = "This must be at least the largest demo starting balance.";
@@ -460,6 +473,33 @@ function RulesCard({ servers }: { servers: Mt5Server[] }) {
               <input className="input" inputMode="decimal" value={form[a.key]} disabled={!editable} onChange={(e) => setForm({ ...form, [a.key]: e.target.value })} maxLength={16} />
             </Field>
           ))}
+        </div>
+        <h3>Staff balance and credit changes</h3>
+        <div className="form-grid form-grid-single">
+          <Field
+            label="Runs without a second person up to (USD)"
+            hint={hint(
+              "adjustSecondApprovalCents",
+              <>
+                A staff change at or under this amount runs at once on one person's word, as long as what that person ran alone in the last 24 hours stays within it. Larger ones wait for a
+                second person's approval. 0 means every change needs a second person.
+                {threshold.minor !== undefined && (
+                  <span className="block">
+                    {threshold.minor === 0 ? "Now: every change needs a second person." : `Now: one person alone can change balances and credit by up to ${money(threshold.minor)} in 24 hours.`}
+                  </span>
+                )}
+              </>,
+            )}
+          >
+            <input
+              className="input"
+              inputMode="decimal"
+              value={form.adjustSecondApprovalCents}
+              disabled={!editable}
+              onChange={(e) => setForm({ ...form, adjustSecondApprovalCents: e.target.value })}
+              maxLength={16}
+            />
+          </Field>
         </div>
         {editable && (
           <>

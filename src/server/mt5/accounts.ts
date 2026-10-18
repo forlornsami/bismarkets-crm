@@ -2,6 +2,7 @@ import type { Mt5Account } from "../../gateway/protocol";
 import { exec, one, rows, type Conn, type Db } from "../lib/db";
 import { toMajor } from "../money/amounts";
 import { GatewayError, type Mt5Gateway } from "./gateway";
+import type { Mt5Passwords } from "./passwords";
 import { enabledServers } from "./settings";
 
 // A client's MT5 accounts as the CRM keeps them: the row, the lookups the
@@ -115,9 +116,12 @@ export async function clientAccounts(conn: Conn, clientId: number): Promise<Acco
  * One row of GET /api/mt5-accounts, as both front ends parse it. The login is
  * the id everywhere, as text. A staff switch-off is "suspended"; the client's
  * own archive stays "active" with archived true ("archived" as a status
- * makes the portal refuse the whole list). Never a password.
+ * makes the portal refuse the whole list). `passwords` only for the client's
+ * own session: otherwise both are null, which the portal shows as "not
+ * available" and the app as "Not supplied by server" ("" would show blank in
+ * the app).
  */
-export function presentClientAccount(a: AccountRow) {
+export function presentClientAccount(a: AccountRow, passwords: Mt5Passwords | null = null) {
   const login = String(a.login);
   const suspended = a.suspended_at !== null;
   const leverage = String(a.leverage);
@@ -148,6 +152,8 @@ export function presentClientAccount(a: AccountRow) {
         : { login, balance, equity, credit, margin: major(a.margin_cents), free_margin: major(a.margin_free_cents), leverage, currency: a.currency },
     server: MT5_SERVER_NAME,
     created_at: (a.mt5_registered_at ?? a.created_at).toISOString(),
+    password: passwords?.main ?? null,
+    investor_password: passwords?.investor ?? null,
   };
 }
 

@@ -1,9 +1,10 @@
 import { useQuery } from "@tanstack/react-query";
-import { ArrowRight, BadgeCheck, Check, Clock, KeyRound, Mail, Network, ShieldCheck, UserPlus, Users, UserCog } from "lucide-react";
+import { ArrowRight, BadgeCheck, Check, Clock, KeyRound, Mail, Network, Scale, ShieldCheck, UserPlus, Users, UserCog } from "lucide-react";
 import { Link } from "wouter";
 import { PageHeader } from "../components/ui";
 import { useKycSummary } from "./Kyc";
-import { api, type Page, type StaffMember } from "../lib/api";
+import { api, formatDate, type Page, type StaffMember } from "../lib/api";
+import { useReconSummary, type ReconSummary } from "../lib/mt5";
 import { useCan, useSession } from "../lib/session";
 
 const greeting = () => {
@@ -38,13 +39,16 @@ export function Dashboard() {
   });
   const kyc = useKycSummary(can("kyc.view"));
   const kycWaiting = kyc.data?.pending;
+  const reconciles = can("wallet.reconcile") || can("wallet.view");
+  const recon = useReconSummary(reconciles);
+  const critical = recon.data?.open.critical;
   const show = (n: number | undefined) => (n === undefined ? "–" : n.toLocaleString());
 
   return (
     <>
       <PageHeader title={`${greeting()}, ${session.staff.name.split(" ")[0]}`} description="What needs attention today, and shortcuts to the work you do most." />
       <QuickActions />
-      {(can("staff.view") || can("client.view") || can("kyc.view")) && (
+      {(can("staff.view") || can("client.view") || can("kyc.view") || reconciles) && (
         <div className="tiles">
           {can("kyc.view") && (
             <Link href="/kyc" className="tile tile-button">
@@ -55,6 +59,18 @@ export function Dashboard() {
                 <div className="tile-label">KYC waiting for review</div>
                 <div className="tile-value">{show(kycWaiting)}</div>
                 <div className="tile-foot">{kyc.error ? "Could not load" : kycWaiting === undefined ? "Checking the queue" : kycWaiting ? "Open the queue to review" : "Nothing waiting"}</div>
+              </div>
+            </Link>
+          )}
+          {reconciles && (
+            <Link href="/reconciliation?severity=critical" className="tile tile-button">
+              <span className={critical === undefined ? "tile-icon" : critical ? "tile-icon bad" : "tile-icon good"}>
+                <Scale size={20} />
+              </span>
+              <div>
+                <div className="tile-label">Open critical MT5 issues</div>
+                <div className="tile-value">{show(critical)}</div>
+                <div className="tile-foot">{recon.error ? "Could not load" : reconFoot(recon.data)}</div>
               </div>
             </Link>
           )}
@@ -167,6 +183,15 @@ export function Dashboard() {
       </div>
     </>
   );
+}
+
+/** Under the open critical count: what to do, or when MT5 was last checked against the CRM. */
+function reconFoot(s: ReconSummary | undefined) {
+  if (!s) return "Checking";
+  if (s.open.critical) return "MT5 and the CRM disagree: open the list";
+  if (s.running) return "A reconciliation run is going now";
+  if (!s.lastRun?.finishedAt) return "No reconciliation run yet";
+  return s.lastRun.status === "failed" ? "The last reconciliation run failed" : `Last checked ${formatDate(s.lastRun.finishedAt)}`;
 }
 
 /** The everyday jobs, one tap away (big buttons, so they work on a phone too). */

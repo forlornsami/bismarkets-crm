@@ -55,6 +55,8 @@ const schema = z.object({
   // change is refused as "temporarily unavailable".
   CRM_MT5_GATEWAY_URL: z.string().url().optional().or(z.literal("").transform(() => undefined)),
   CRM_MT5_GATEWAY_SECRET: z.string().optional().default(""),
+  // The UTC hour from which the nightly MT5 reconciliation runs (once a day, in one process).
+  CRM_MT5_RECONCILE_HOUR_UTC: z.coerce.number().int().min(0).max(23).default(2),
   CRM_LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
 });
 
@@ -84,6 +86,8 @@ export type Config = {
   supportEvents: { url: string | null; secret: string; environment: "staging" | "production" };
   /** Where the MT5 gateway listens and the secret both sides sign with, or null when MT5 is off. */
   mt5Gateway: { url: string; secret: string } | null;
+  /** The UTC hour (0–23) from which each day's MT5 reconciliation runs. */
+  mt5ReconcileHourUtc: number;
 };
 
 /** In production the gateway is on this machine (plain HTTP on loopback) or reached over HTTPS. */
@@ -155,5 +159,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       environment: c.CRM_SUPPORT_EVENTS_ENVIRONMENT,
     },
     mt5Gateway: c.CRM_MT5_GATEWAY_URL ? { url: c.CRM_MT5_GATEWAY_URL.replace(/\/+$/, ""), secret: c.CRM_MT5_GATEWAY_SECRET } : null,
+    mt5ReconcileHourUtc: c.CRM_MT5_RECONCILE_HOUR_UTC,
   };
 }

@@ -1,8 +1,8 @@
 import sharp from "sharp";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { exec, one, transaction } from "../src/server/lib/db";
+import { exec, one, rows, transaction } from "../src/server/lib/db";
 import { formatMinor, fromUsdCents, parseAmount, toMajor, toUsdCents } from "../src/server/money/amounts";
-import { depositMethodAccount, holdAccount, InsufficientFunds, lockWallet, postLedger, verifyLedger, walletAccount, walletOf } from "../src/server/money/ledger";
+import { depositMethodAccount, holdAccount, InsufficientFunds, lockWallet, postLedger, verifyLedger, verifyLedgerProblems, walletAccount, walletOf } from "../src/server/money/ledger";
 import { compareNames } from "../src/server/money/names";
 import { editorIn, prepareProof, ProofProblem, proofType } from "../src/server/money/proofs";
 import { bankReferenceKey, newReference } from "../src/server/money/references";
@@ -174,5 +174,48 @@ describe.skipIf(!hasDb)("ledger", () => {
     const s = await loadMoneySettings(env.db);
     expect(s).toMatchObject({ min_deposit_cents: 5000, min_withdrawal_cents: 5000, usd_to_pkr: "280.000000", deposit_second_approval_cents: 500_000, withdrawal_second_approval_cents: 100_000, first_withdrawal_second_approval: true });
     expect(await one(env.db, "SELECT permission FROM role_permissions rp JOIN roles r ON r.id = rp.role_id WHERE r.slug = 'finance_agent' AND permission = 'deposit.proof'")).toBeDefined();
+  });
+
+  it("names each problem by what it is about and the check that found it, never by an amount, so the name stays while the amounts move", async () => {
+    // A transaction with no entries, and one with an entry marked for a client on a broker account and an entry
+    // not in USD, both for deposits that do not exist. They stay (the ledger is append-only), so this test is last.
+    const add = (sourceId: number) =>
+      exec(env.db, "INSERT INTO ledger_transactions (kind, source_type, source_id, client_id, memo) VALUES ('deposit', 'deposit', ?, ?, 'test')", [sourceId, clientId]);
+    const entry = (transactionId: number, client: number | null, currency: string, cents: number) =>
+      exec(env.db, "INSERT INTO ledger_entries (transaction_id, account, client_id, currency, amount_cents) VALUES (?, ?, ?, ?, ?)", [
+        transactionId, depositMethodAccount(methodId), client, currency, cents,
+      ]);
+    const empty = (await add(98)).insertId;
+    const marked = (await add(99)).insertId;
+    const wrongClient = (await entry(marked, clientId, "USD", 7)).insertId;
+    const wrongCurrency = (await entry(marked, null, "PKR", -7)).insertId;
+    const orphans = (await rows<{ id: number }>(env.db, "SELECT id FROM ledger_transactions WHERE source_id IN (1, 2)")).map((t) => Number(t.id));
+
+    const moveCache = (available: number, held: number) =>
+      exec(env.db, "UPDATE wallets SET available_cents = available_cents + ?, held_cents = held_cents + ? WHERE client_id = ?", [available, held, clientId]);
+    await moveCache(1, 2);
+    const once = await verifyLedgerProblems(env.db);
+    await moveCache(5, 7);
+    const again = await verifyLedgerProblems(env.db);
+    await moveCache(-6, -9);
+
+    const subjects = (problems: { subject: string }[]) => problems.map((p) => p.subject).sort();
+    expect(subjects(once)).toEqual(
+      [
+        `wallet:${clientId}:available`, `wallet:${clientId}:held`, `transaction:${empty}:balance`, `entry:${wrongClient}:client`, `entry:${wrongCurrency}:currency`,
+        ...[...orphans, empty, marked].map((id) => `transaction:${id}:source`),
+      ].sort(),
+    );
+    // The texts follow the amounts; the subjects do not, and no two problems share one.
+    expect(again.find((p) => p.subject === `wallet:${clientId}:available`)?.text).toMatch(/wallet shows 6006 cents but the ledger adds up to 6000/);
+    expect(subjects(again)).toEqual(subjects(once));
+    expect(new Set(subjects(once)).size).toBe(once.length);
+    // entity:id:check, with digits only in the id, and the id is the one the text names first, so it is not an amount.
+    const names: Record<string, string> = { transaction: "Ledger transaction", wallet: "Client", deposit: "Deposit", withdrawal: "Withdrawal", mt5_op: "MT5 operation", entry: "Ledger entry" };
+    for (const p of [...once, ...again]) {
+      const [, entity, id] = /^(transaction|wallet|deposit|withdrawal|mt5_op|entry):([A-Za-z0-9-]+):[a-z_]+$/.exec(p.subject) ?? [];
+      expect(entity, p.subject).toBeDefined();
+      expect(p.text, p.subject).toMatch(new RegExp(`^${names[entity!]} ${id}\\b`));
+    }
   });
 });

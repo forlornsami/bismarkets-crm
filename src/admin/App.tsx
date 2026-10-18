@@ -36,6 +36,8 @@ const Packages = lazy(() => import("./pages/Packages").then((m) => ({ default: m
 const Mt5Settings = lazy(() => import("./pages/Mt5Settings").then((m) => ({ default: m.Mt5Settings })));
 const TransfersList = lazy(() => import("./pages/Transfers").then((m) => ({ default: m.TransfersList })));
 const TransferDetail = lazy(() => import("./pages/Transfers").then((m) => ({ default: m.TransferDetail })));
+const Reconciliation = lazy(() => import("./pages/Reconciliation").then((m) => ({ default: m.Reconciliation })));
+const ReconIssueDetail = lazy(() => import("./pages/Reconciliation").then((m) => ({ default: m.ReconIssueDetail })));
 
 const Loading = ({ children }: { children: React.ReactNode }) => (
   <Suspense
@@ -233,6 +235,23 @@ export function App() {
               <Guarded permission="wallet.view">
                 <Loading>
                   <TransferDetail key={params.id} id={params.id} />
+                </Loading>
+              </Guarded>
+            )}
+          </Route>
+          {/* The server lets either permission see runs and issues; starting a run and resolving take wallet.reconcile. */}
+          <Route path="/reconciliation">
+            <Guarded anyOf={["wallet.reconcile", "wallet.view"]}>
+              <Loading>
+                <Reconciliation />
+              </Loading>
+            </Guarded>
+          </Route>
+          <Route path="/reconciliation/issues/:id">
+            {(params) => (
+              <Guarded anyOf={["wallet.reconcile", "wallet.view"]}>
+                <Loading>
+                  <ReconIssueDetail key={params.id} id={params.id} />
                 </Loading>
               </Guarded>
             )}

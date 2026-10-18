@@ -21,7 +21,7 @@ import { generate } from "selfsigned";
 //   const server = createGatewayServer(config, { pingIntervalMs: 0 });
 //   server.listen(0, "127.0.0.1");
 //   fake.addUser({ group: "real\\standard", balanceCents: 10_000 });
-//   fake.faults.next("/api/trade/balance", { drop: "after" }); // the next balance's answer is lost
+//   fake.faults.next("/api/trade/balance", { drop: "after" }); // the next balance or credit's answer is lost
 //   ...
 //   expect(fake.state.unauthenticated).toBe(0);
 //   await fake.close();
@@ -304,13 +304,17 @@ export async function startFakeMt5(opts: FakeMt5Options = {}): Promise<FakeMt5> 
       case "/api/trade/balance": {
         if (!user) return { status: 200, json: NOT_FOUND };
         const amount = cents(q.get("balance"));
-        if (q.get("type") !== "2" || amount === null || amount === 0) return { status: 200, json: { retcode: "3 Invalid parameters" } };
+        // Type 2 is a balance deal, 3 a credit deal.
+        const credit = q.get("type") === "3";
+        if ((q.get("type") !== "2" && !credit) || amount === null || amount === 0) return { status: 200, json: { retcode: "3 Invalid parameters" } };
         const free = user.balanceCents + user.creditCents + user.profitCents - user.marginCents;
-        if (q.get("check_margin") === "1" && amount < 0 && (user.balanceCents + amount < 0 || free + amount < 0)) {
+        const left = (credit ? user.creditCents : user.balanceCents) + amount;
+        if (q.get("check_margin") === "1" && amount < 0 && (left < 0 || free + amount < 0)) {
           return { status: 200, json: { retcode: "10019 Not enough money" } };
         }
-        user.balanceCents += amount;
-        const deal = addDeal({ login: user.login, action: 2, profitCents: amount, comment: q.get("comment") ?? "" });
+        if (credit) user.creditCents += amount;
+        else user.balanceCents += amount;
+        const deal = addDeal({ login: user.login, action: credit ? 3 : 2, profitCents: amount, comment: q.get("comment") ?? "" });
         return ok({ answer: { ticket: String(deal.ticket) } });
       }
       case "/api/deal/get_total":

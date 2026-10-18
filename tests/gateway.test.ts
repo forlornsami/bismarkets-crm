@@ -30,7 +30,7 @@ const sink = { write: (line: string) => void logLines.push(line) };
 const fakes: FakeMt5[] = [];
 
 let refSeq = 0;
-const ref = (letter: "A" | "T" | "D") => `BIS-${letter}${String(++refSeq).padStart(8, "0")}`;
+const ref = (letter: "A" | "T" | "D" | "S") => `BIS-${letter}${String(++refSeq).padStart(8, "0")}`;
 const nowIso = () => new Date().toISOString();
 
 function gatewayEnv(fake: FakeMt5, overrides: Record<string, string> = {}) {
@@ -346,6 +346,65 @@ describe("MT5 gateway", () => {
     });
   });
 
+  describe("users.list: a group's logins, for reconciliation", () => {
+    const inGroup = (group: string) => [...fake.state.users.values()].filter((u) => u.group === group).map((u) => u.login).sort((x, y) => x - y);
+
+    it("lists an allowed live or demo group lowest first, a page at a time, reading MT5 once per listing", async () => {
+      for (let i = 0; i < 3; i++) fake.addUser({ group: PRO });
+      fake.addUser({ group: DEMO });
+      const all = inGroup(PRO);
+      expect(all.length).toBeGreaterThanOrEqual(3);
+      let before = fake.state.requests.length;
+      const first = await gw.call("users.list", { server: "live", group: PRO, limit: 2 });
+      expect(first).toEqual({ total: all.length, logins: all.slice(0, 2) });
+      expect(pathsSince(fake, before).filter((p) => p === "/api/user/logins")).toHaveLength(1);
+      // The pages after the first read the same list, so an account opened meanwhile cannot shift them.
+      fake.addUser({ group: PRO, login: all[0]! + 1_000_000 });
+      before = fake.state.requests.length;
+      let after = first.logins.at(-1)!;
+      const rest: number[] = [];
+      for (;;) {
+        const page = await gw.call("users.list", { server: "live", group: PRO, after, limit: 2 });
+        expect(page.total).toBe(all.length);
+        rest.push(...page.logins);
+        if (page.logins.length < 2) break;
+        after = page.logins.at(-1)!;
+      }
+      expect(rest).toEqual(all.slice(2));
+      expect(pathsSince(fake, before).filter((p) => p === "/api/user/logins")).toEqual([]);
+      // A new listing reads MT5 again and sees it.
+      expect((await gw.call("users.list", { server: "live", group: PRO, limit: 1000 })).logins).toEqual(inGroup(PRO));
+      expect((await gw.call("users.list", { server: "live", group: DEMO, limit: 1000 })).logins).toEqual(inGroup(DEMO));
+    });
+
+    it("refuses a group the gateway does not allow before asking MT5, and a page size or cursor out of range", async () => {
+      fake.addUser({ group: VIP });
+      const before = fake.state.requests.length;
+      expect(await failure(gw.call("users.list", { server: "live", group: VIP, limit: 10 }))).toMatchObject({ kind: "refused", code: "group_not_allowed" });
+      expect(await failure(gw.call("users.list", { server: "other", group: PRO, limit: 10 }))).toMatchObject({ kind: "bad_request" });
+      const bodies = [
+        { server: "live", group: "real\\*", limit: 10 },
+        ...[0, 1001, 2.5].map((limit) => ({ server: "live", group: PRO, limit })),
+        { server: "live", group: PRO, after: 0, limit: 10 },
+        { server: "live", group: PRO, limit: 10, offset: 5 },
+      ];
+      for (const body of bodies) expect((await rawPost(g.url, "/v1/users.list", JSON.stringify(body))).status, JSON.stringify(body)).toBe(400);
+      expect(pathsSince(fake, before).filter((p) => p === "/api/user/logins")).toEqual([]);
+    });
+
+    it("refuses a group with more accounts than it lists, rather than read it whole for every page", async () => {
+      const big = await newFake();
+      const other = await startGateway(big);
+      try {
+        for (let i = 0; i < 100_001; i++) big.addUser({ group: STANDARD });
+        expect(await failure(other.gw.call("users.list", { server: "live", group: STANDARD, limit: 1000 }))).toMatchObject({ kind: "refused", code: "limit_reached" });
+        expect((await other.gw.call("users.list", { server: "live", group: PRO, limit: 10 })).total).toBe(0);
+      } finally {
+        await other.close();
+      }
+    }, 60_000);
+  });
+
   describe("balance: idempotent by reference, and honest about lost answers", () => {
     it("sends a reference once: a repeat returns the first deal's ticket", async () => {
       const u = fake.addUser({ group: STANDARD });
@@ -461,6 +520,71 @@ describe("MT5 gateway", () => {
       const create = { server: "live", group: STANDARD, leverage: 2000, name: "N", email: "n@client.test", country: "", comment: ref("A"), password: MAIN, investorPassword: INVESTOR };
       expect(await failure(gw.call("user.create", create))).toMatchObject({ kind: "refused", code: "login_exists" });
       expect(fake.state.users.get(u.login)!.balanceCents).toBe(0);
+    });
+  });
+
+  describe("credit: MT5 deal action 3, under the same rules as balance", () => {
+    const credit = (login: number, amountCents: number, comment = ref("S"), checkMargin = amountCents < 0) =>
+      gw.call("balance", { server: "live", login, amountCents, comment, checkMargin, notBefore: nowIso(), type: "credit" });
+
+    it("adds and removes credit as action 3 deals, leaving the balance alone, and MT5's margin check guards what comes out", async () => {
+      const u = fake.addUser({ group: STANDARD, balanceCents: 1_000 });
+      const given = ref("S");
+      expect((await credit(u.login, 5_000, given)).duplicate).toBe(false);
+      expect(fake.state.users.get(u.login)).toMatchObject({ balanceCents: 1_000, creditCents: 5_000 });
+      expect(dealsWith(fake, given)).toMatchObject([{ action: 3, profitCents: 5_000 }]);
+      const taken = ref("S");
+      await credit(u.login, -2_000, taken);
+      expect(dealsWith(fake, taken)).toMatchObject([{ action: 3, profitCents: -2_000 }]);
+      expect(fake.state.users.get(u.login)).toMatchObject({ balanceCents: 1_000, creditCents: 3_000 });
+      // More than the credit there is: MT5 refuses, though the balance would cover it.
+      expect(await failure(credit(u.login, -3_001))).toMatchObject({ kind: "refused", code: "no_money", retcode: 10019 });
+      // Credit taken out without the margin check is never sent.
+      const before = fake.state.requests.length;
+      expect(await failure(credit(u.login, -1, ref("S"), false))).toMatchObject({ kind: "bad_request", code: "policy" });
+      expect(pathsSince(fake, before)).not.toContain("/api/trade/balance");
+      // A balance deal named as such is action 2, as one without a type is.
+      const named = ref("S");
+      await gw.call("balance", { server: "live", login: u.login, amountCents: 500, comment: named, checkMargin: false, notBefore: nowIso(), type: "balance" });
+      expect(dealsWith(fake, named)).toMatchObject([{ action: 2, profitCents: 500 }]);
+      expect(fake.state.users.get(u.login)).toMatchObject({ balanceCents: 1_500, creditCents: 3_000 });
+    });
+
+    it("gives credit to live accounts only, sending nothing for a demo one", async () => {
+      const u = fake.addUser({ group: DEMO });
+      const before = fake.state.requests.length;
+      expect(await failure(credit(u.login, 1_000))).toMatchObject({ kind: "bad_request", code: "policy" });
+      expect(pathsSince(fake, before)).not.toContain("/api/trade/balance");
+      expect(fake.state.users.get(u.login)!.creditCents).toBe(0);
+    });
+
+    it("sends a reference once: a repeat returns the first credit deal, and a balance deal with the reference is unknown, not this credit", async () => {
+      const u = fake.addUser({ group: STANDARD });
+      const comment = ref("S");
+      const first = await credit(u.login, 2_500, comment);
+      expect(await credit(u.login, 2_500, comment)).toEqual({ ticket: first.ticket, duplicate: true });
+      expect(dealsWith(fake, comment)).toHaveLength(1);
+      // The same reference and amount as a balance deal is not that deal.
+      expect(await failure(gw.call("balance", { server: "live", login: u.login, amountCents: 2_500, comment, checkMargin: false, notBefore: nowIso() })))
+        .toMatchObject({ kind: "unknown", code: "mt5_error" });
+      const other = ref("S");
+      fake.addDeal({ login: u.login, action: 2, profitCents: 700, comment: other });
+      const before = fake.state.requests.length;
+      expect(await failure(credit(u.login, 700, other))).toMatchObject({ kind: "unknown", code: "mt5_error" });
+      expect(pathsSince(fake, before)).not.toContain("/api/trade/balance");
+      expect(fake.state.users.get(u.login)!.creditCents).toBe(2_500);
+    });
+
+    it("a lost answer to a credit is unknown, and the repeat and the resolver's search both find the credit deal", async () => {
+      const u = fake.addUser({ group: STANDARD });
+      const comment = ref("S");
+      fake.faults.next("/api/trade/balance", { drop: "after" });
+      expect(await failure(credit(u.login, 4_000, comment))).toMatchObject({ kind: "unknown", code: "connection" });
+      expect(dealsWith(fake, comment)).toHaveLength(1);
+      expect(await credit(u.login, 4_000, comment)).toEqual({ ticket: dealsWith(fake, comment)[0]!.ticket, duplicate: true });
+      expect(fake.state.users.get(u.login)!.creditCents).toBe(4_000);
+      const { deal } = await gw.call("deal.find", { server: "live", login: u.login, comment, from: new Date(Date.now() - 60_000).toISOString() });
+      expect(deal).toMatchObject({ action: 3, profitCents: 4_000, comment });
     });
   });
 
@@ -678,6 +802,28 @@ describe("MT5 gateway caps", () => {
     // A repeat of an operation already in MT5 is still answered as done.
     expect((await balance(live.login, 15_000, first)).duplicate).toBe(true);
     expect(fake.state.users.get(live.login)!.balanceCents).toBe(10_000);
+  });
+
+  it("counts credit with balance against the same caps; credit taken out does not count", async () => {
+    // A fresh gateway, so the daily total starts at nothing.
+    const own = await newFake();
+    const capped = await startGateway(own, { GATEWAY_MAX_OP_CENTS: "20000", GATEWAY_DAILY_CREDIT_CENTS: "30000" });
+    try {
+      const credit = (login: number, amountCents: number) =>
+        capped.gw.call("balance", { server: "live", login, amountCents, comment: ref("S"), checkMargin: amountCents < 0, notBefore: nowIso(), type: "credit" });
+      const u = own.addUser({ group: STANDARD });
+      const before = own.state.requests.length;
+      expect(await failure(credit(u.login, 20_001))).toMatchObject({ kind: "refused", code: "over_limit" });
+      expect(pathsSince(own, before)).not.toContain("/api/trade/balance");
+      await credit(u.login, 20_000);
+      await capped.gw.call("balance", { server: "live", login: u.login, amountCents: 10_000, comment: ref("S"), checkMargin: false, notBefore: nowIso() });
+      await credit(u.login, -5_000);
+      // 20,000 of credit and 10,000 of balance: the day's 30,000 is used.
+      expect(await failure(credit(u.login, 1))).toMatchObject({ kind: "refused", code: "over_limit" });
+      expect(own.state.users.get(u.login)).toMatchObject({ balanceCents: 10_000, creditCents: 15_000 });
+    } finally {
+      await capped.close();
+    }
   });
 });
 

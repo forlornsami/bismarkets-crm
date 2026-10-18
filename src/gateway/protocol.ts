@@ -24,8 +24,9 @@ export const MIN_SECRET_LENGTH = 32;
 export const SERVER_CODE = /^[a-z0-9_-]{1,16}$/;
 /**
  * The comment on every balance deal and on every MT5 user the CRM creates:
- * "BIS-", a letter for what it is (A account, T transfer, D demo funding),
- * then 8 characters. Unique, at most 31 characters (MT5's comment limit).
+ * "BIS-", a letter for what it is (A account, T transfer, D demo funding,
+ * S staff change), then 8 characters. Unique, at most 31 characters (MT5's
+ * comment limit).
  */
 export const MT5_REFERENCE = /^BIS-[A-Z][0-9A-Z]{8}$/;
 /** An MT5 group name as the broker configures it, such as "real\\standard". */
@@ -109,20 +110,30 @@ export interface Ops {
    * A balance deal of `amountCents` (negative takes money out), commented with
    * the CRM's reference. Idempotent per (login, comment): when a deal with this
    * comment already exists since `notBefore`, its ticket comes back with
-   * `duplicate: true` and nothing new is sent.
+   * `duplicate: true` and nothing new is sent. `type` "credit" makes it a
+   * credit deal instead (the broker's money lent to a live account, MT5 deal
+   * action 3), under the same rules and caps; left out, it is a balance deal.
    */
   balance: {
-    req: { server: string; login: number; amountCents: number; comment: string; checkMargin: boolean; notBefore: string };
+    req: { server: string; login: number; amountCents: number; comment: string; checkMargin: boolean; notBefore: string; type?: "balance" | "credit" };
     res: { ticket: number; duplicate: boolean };
   };
-  /** The balance deal with this comment since `from` (ISO), if MT5 has one. */
+  /** The balance or credit deal with this comment since `from` (ISO), if MT5 has one. */
   "deal.find": { req: { server: string; login: number; comment: string; from: string }; res: { deal: Mt5Deal | null } };
   /** A page of an account's deals between two ISO times, oldest first; `limit` at most 1000. */
   "deals.page": { req: { server: string; login: number; from: string; to: string; offset: number; limit: number }; res: { total: number; deals: Mt5Deal[] } };
+  /**
+   * The logins in one of the server's allowed live or demo groups, lowest
+   * first: up to `limit` (at most 1000) above `after`, and how many the group
+   * has in all. For reconciliation, to find MT5 accounts the CRM has no row
+   * for. A group with more than the gateway lists (100,000) is refused.
+   */
+  "users.list": { req: { server: string; group: string; after?: number; limit: number }; res: { total: number; logins: number[] } };
 }
 export type OpName = keyof Ops;
 export const OP_NAMES: readonly OpName[] = [
   "ping", "user.get", "accounts.get", "user.create", "user.find", "user.update", "user.password", "positions.total", "balance", "deal.find", "deals.page",
+  "users.list",
 ];
 /** Operations that change something in MT5. A lost answer to one of these is an unknown outcome, not a failure. */
 export const WRITE_OPS: ReadonlySet<OpName> = new Set<OpName>(["user.create", "user.update", "user.password", "balance"]);

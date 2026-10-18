@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, Ban, BookOpen, CheckCircle2, Hourglass, Search, ShieldAlert, X, XCircle } from "lucide-react";
+import { ArrowLeft, Ban, BookOpen, CheckCircle2, Hourglass, Search, ShieldAlert, UserCheck, X, XCircle } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { Link, useLocation } from "wouter";
 import { DataGrid, gridQuery, type Column, type GridState } from "../components/DataGrid";
@@ -8,17 +8,21 @@ import { DecisionError } from "../components/ReviewWorkbench";
 import { Dialog, Field, PageHeader, Spinner, useFeedback } from "../components/ui";
 import { ApiError, api, formatDate, qs, type Page } from "../lib/api";
 import {
-  ACCOUNTS_KEY,
-  accountKey,
+  changeAmountText,
+  ChangeDecision,
   failureText,
   GatewayOffNotice,
+  isStaffPurpose,
   OpStatusBadge,
   OPERATIONS_KEY,
   operationKey,
   PURPOSE_LABEL,
+  REASON_LABEL,
+  STAFF_PURPOSES,
   STATE_LABEL,
   typeLabel,
   useMt5Servers,
+  useOperationChanged,
   type Mt5Operation,
   type Mt5OperationPage,
   type OpLedgerTransaction,
@@ -34,16 +38,29 @@ import { useCan } from "../lib/session";
 // ten minutes old and MT5 still has no deal for it. Nobody can mark one
 // completed by hand. MT5's own error text is shown to staff here; clients
 // never see it.
+//
+// Staff balance and credit changes are listed here too, with their reason
+// and who asked for them. One that waits for a second person is approved
+// (with a 2FA code, then sent to MT5 at once) or rejected here and on the
+// account's page; the person who asked can cancel it but never approve it,
+// as the server refuses that.
 
 const STATUS_OPTIONS = [
   { value: "open", label: "Open (not settled)" },
+  { value: "awaiting_approval", label: "Awaiting approval" },
   { value: "sending", label: "Sending" },
   { value: "unknown", label: "Not confirmed" },
   { value: "completed", label: "Completed" },
   { value: "failed", label: "Failed" },
+  { value: "cancelled", label: "Cancelled" },
 ];
 const OPEN_FILTERS = ["open", "sending", "unknown"];
-const PURPOSE_OPTIONS = (Object.keys(PURPOSE_LABEL) as OpPurpose[]).map((value) => ({ value, label: PURPOSE_LABEL[value] }));
+// Transfers and demo money first, then the staff changes: all four together, then each.
+const PURPOSE_OPTIONS = [
+  ...(Object.keys(PURPOSE_LABEL) as OpPurpose[]).filter((p) => !isStaffPurpose(p)).map((value) => ({ value, label: PURPOSE_LABEL[value] })),
+  { value: "staff", label: "Staff changes (all)" },
+  ...STAFF_PURPOSES.map((value) => ({ value, label: PURPOSE_LABEL[value] })),
+];
 
 /** The server's own rule: staff may mark an operation failed once it is this old. */
 const FAIL_AFTER_MS = 10 * 60_000;
@@ -59,8 +76,12 @@ function searchState(o: Mt5Operation) {
   return `${searches(o.checks)} found nothing${next ? `, next ${next}` : ""}`;
 }
 
-/** Status, with what staff need beside it: the searches so far, the ticket, or who marked it failed. */
-function OpStatus({ o }: { o: Mt5Operation }) {
+/** Who turned a staff change down: another person rejected it, or the person who asked cancelled it. */
+const declinedBy = (o: Mt5Operation) =>
+  o.resolvedBy && o.change?.requestedBy && o.resolvedBy.id === o.change.requestedBy.id ? `Cancelled by ${o.resolvedBy.name}, who asked for it` : `Rejected by ${o.resolvedBy?.name ?? "staff"}`;
+
+/** Status, with what staff need beside it: the searches so far, the ticket, who marked it failed, or the second person's decision. */
+function OpStatus({ o, blocked }: { o: Mt5Operation; blocked: string | null }) {
   return (
     <span className="stack-tight">
       <OpStatusBadge status={o.status} />
@@ -68,11 +89,16 @@ function OpStatus({ o }: { o: Mt5Operation }) {
       {o.status === "unknown" && <small className="muted">{searchState(o)}</small>}
       {o.status === "completed" && o.ticket !== null && <small className="muted">Ticket {o.ticket}</small>}
       {o.status === "failed" && o.resolvedBy && <small className="muted">Marked by {o.resolvedBy.name}</small>}
+      {o.status === "cancelled" && <small className="muted">{declinedBy(o)}</small>}
+      {o.status === "awaiting_approval" && <ChangeDecision o={o} blocked={blocked} small />}
     </span>
   );
 }
 
-const columns: Column<Mt5Operation>[] = [
+/** A staff change's reason and who asked for it, under its kind. */
+const changeLine = (o: Mt5Operation) => (o.change ? `${REASON_LABEL[o.change.reasonCode] ?? o.change.reasonCode} · asked by ${o.change.requestedBy?.name ?? "staff"}` : null);
+
+const columnsFor = (blocked: string | null): Column<Mt5Operation>[] => [
   { key: "reference", header: "Reference", render: (o) => <strong className="mono nowrap">{o.reference}</strong> },
   {
     key: "client",
@@ -99,7 +125,17 @@ const columns: Column<Mt5Operation>[] = [
       </span>
     ),
   },
-  { key: "purpose", header: "Direction", optional: true, render: (o) => PURPOSE_LABEL[o.purpose] ?? o.purpose },
+  {
+    key: "purpose",
+    header: "Operation",
+    optional: true,
+    render: (o) => (
+      <span className="stack-tight">
+        <span>{PURPOSE_LABEL[o.purpose] ?? o.purpose}</span>
+        {o.change && <small className="muted">{changeLine(o)}</small>}
+      </span>
+    ),
+  },
   {
     key: "amount_cents",
     header: "Amount",
@@ -107,12 +143,13 @@ const columns: Column<Mt5Operation>[] = [
     render: (o) => (
       <span className="stack-tight">
         <strong className="nowrap">{money(o.amountCents)}</strong>
-        {/* Where the Direction column is left out for room. */}
+        {/* Where the Operation column is left out for room. */}
         <small className="muted tablet-only">{PURPOSE_LABEL[o.purpose] ?? o.purpose}</small>
+        {o.change && <small className="muted tablet-only">{changeLine(o)}</small>}
       </span>
     ),
   },
-  { key: "status", header: "Status", render: (o) => <OpStatus o={o} /> },
+  { key: "status", header: "Status", render: (o) => <OpStatus o={o} blocked={blocked} /> },
   { key: "created_at", header: "Created", sortable: true, optional: true, render: (o) => formatDate(o.createdAt) },
   {
     key: "failure",
@@ -123,7 +160,7 @@ const columns: Column<Mt5Operation>[] = [
   },
 ];
 
-/** Starting filters from the address: ?client=, ?account= (from an MT5 account's page) and ?status=. */
+/** Starting filters from the address: ?client=, ?account= (from an MT5 account's page), ?status= and ?purpose=. */
 function initialFilters() {
   const search = new URLSearchParams(window.location.search);
   const id = (name: string) => {
@@ -131,10 +168,12 @@ function initialFilters() {
     return v && /^\d{1,12}$/.test(v) ? v : "";
   };
   const status = search.get("status") ?? "";
+  const purpose = search.get("purpose") ?? "";
   const filters: Record<string, string> = {};
   if (id("client")) filters.clientId = id("client");
   if (id("account")) filters.accountId = id("account");
   if (STATUS_OPTIONS.some((o) => o.value === status)) filters.status = status;
+  if (PURPOSE_OPTIONS.some((o) => o.value === purpose)) filters.purpose = purpose;
   return filters;
 }
 
@@ -158,6 +197,15 @@ export function TransfersList() {
   });
   const openCount = open.data?.total ?? 0;
   const showingOpen = OPEN_FILTERS.includes(state.filters.status ?? "");
+  // Staff changes waiting for a second person, for the same client or account.
+  const awaiting = useQuery({
+    queryKey: [...OPERATIONS_KEY, "awaiting", clientId ?? "", accountId ?? ""],
+    queryFn: () => api.get<Page<Mt5Operation>>(`/api/staff/mt5/operations${qs({ status: "awaiting_approval", pageSize: 1, clientId, accountId })}`),
+    refetchInterval: 30_000,
+  });
+  const awaitingCount = awaiting.data?.total ?? 0;
+  const gatewayOff = Boolean(servers.data && !servers.data.gatewayConfigured);
+  const columns = columnsFor(gatewayOff ? "MT5 is not connected, so changes cannot be sent." : null);
   // The account filter comes from an MT5 account's page as its id; staff know the account by its login.
   const login = accountId ? list.data?.items.find((o) => String(o.accountId) === accountId)?.login : undefined;
   const drop = (key: string) => setState({ ...state, page: 1, filters: { ...state.filters, [key]: "" } });
@@ -166,9 +214,20 @@ export function TransfersList() {
     <>
       <PageHeader
         title="Transfers"
-        description="Money clients move between their wallet and their MT5 accounts, and demo balances added in MT5. When MT5's answer is lost, the operation stays open and the CRM searches MT5 for its deal until it can settle it."
+        description="Money clients move between their wallet and their MT5 accounts, demo balances added in MT5, and staff changes to MT5 balances and credit, which wait for a second person's approval. When MT5's answer is lost, the operation stays open and the CRM searches MT5 for its deal until it can settle it."
       />
-      {servers.data && !servers.data.gatewayConfigured && <GatewayOffNotice />}
+      {gatewayOff && <GatewayOffNotice />}
+      {awaitingCount > 0 && state.filters.status !== "awaiting_approval" && (
+        <div className="notice notice-page notice-row">
+          <UserCheck size={18} />
+          <p>
+            {awaitingCount === 1 ? "1 staff change is" : `${awaitingCount} staff changes are`} waiting for a second person's approval before {awaitingCount === 1 ? "it is" : "they are"} sent to MT5.
+          </p>
+          <button type="button" className="button button-small" onClick={() => setState({ ...state, page: 1, filters: { ...state.filters, status: "awaiting_approval" } })}>
+            Show {awaitingCount === 1 ? "it" : "them"}
+          </button>
+        </div>
+      )}
       {openCount > 0 && !showingOpen && (
         <div className="notice notice-warn notice-row">
           <Hourglass size={18} />
@@ -194,7 +253,7 @@ export function TransfersList() {
         searchPlaceholder="Search reference, login, client name, email or ID"
         filters={[
           { key: "status", label: "Status", options: STATUS_OPTIONS },
-          { key: "purpose", label: "Direction", options: PURPOSE_OPTIONS },
+          { key: "purpose", label: "Operation", options: PURPOSE_OPTIONS },
         ]}
         toolbar={
           <>
@@ -233,6 +292,13 @@ interface CheckAnswer extends Mt5OperationPage {
 /** What the money did, or will do, for this operation's direction and status. */
 function moneyEffect(o: Mt5Operation): string {
   const x = money(o.amountCents);
+  if (o.purpose === "staff_credit_in" || o.purpose === "staff_credit_out") return "Credit is the broker's money lent for trading: the client's wallet and the ledger are not involved.";
+  if (o.purpose === "staff_balance_in" || o.purpose === "staff_balance_out") {
+    const into = o.purpose === "staff_balance_in";
+    if (o.status === "completed") return `The ledger records ${x} ${into ? "added to" : "taken from"} the account from the broker's MT5 adjustments. The client's wallet is not involved.`;
+    if (o.status === "failed" || o.status === "cancelled") return "Nothing was written to the ledger, and the client's wallet is not involved.";
+    return "The ledger records it once MT5 has made it. The client's wallet is not involved.";
+  }
   if (o.purpose === "wallet_to_mt5") {
     if (isOpenOp(o)) return `${x} stays held in the client's wallet until then.`;
     return o.status === "completed" ? `${x} left the client's wallet.` : `${x} went back to the client's wallet.`;
@@ -249,7 +315,14 @@ function StatusNotice({ o }: { o: Mt5Operation }) {
   let warn = false;
   let icon = <Hourglass size={18} />;
   let text: ReactNode;
-  if (o.status === "sending") {
+  if (o.status === "awaiting_approval") {
+    icon = <UserCheck size={18} />;
+    const c = o.change;
+    text = `${c?.requestedBy?.name ?? "A staff member"} asked for this change on ${formatDate(o.createdAt)}. It is sent to MT5 only once a second person approves it.${c && !c.canApprove && !c.canReject ? " Approving needs the permission to make MT5 balance and credit operations." : ""}`;
+  } else if (o.status === "cancelled") {
+    icon = <XCircle size={18} />;
+    text = `${declinedBy(o)}${o.completedAt ? ` on ${formatDate(o.completedAt)}` : ""}, before it was sent to MT5.`;
+  } else if (o.status === "sending") {
     warn = o.canCheck;
     text = o.canCheck
       ? `The CRM sent this to MT5 but saved no answer (last change ${formatDate(o.updatedAt)}). It searches MT5 for the deal by its reference and settles it.`
@@ -270,7 +343,7 @@ function StatusNotice({ o }: { o: Mt5Operation }) {
       );
   } else if (o.status === "completed") {
     icon = <CheckCircle2 size={18} />;
-    text = `MT5 made the deal${o.ticket !== null ? ` (ticket ${o.ticket})` : ""}${o.completedAt ? ` on ${formatDate(o.completedAt)}` : ""}.`;
+    text = `MT5 made the deal${o.ticket !== null ? ` (ticket ${o.ticket})` : ""}${o.completedAt ? ` on ${formatDate(o.completedAt)}` : ""}.${o.change ? " The client was told in their notifications." : ""}`;
   } else {
     icon = <XCircle size={18} />;
     text = o.resolvedBy
@@ -303,23 +376,17 @@ export function TransferDetail({ id }: { id: string }) {
   const client = useQueryClient();
   const { toast } = useFeedback();
   // Reading an operation does not ask MT5, so an open one is read again while it is on screen: the resolver may settle it at any moment.
+  // A change waiting for approval is read again less often: another person may decide it.
   const page = useQuery({
     queryKey: operationKey(id),
     queryFn: () => api.get<Mt5OperationPage>(`/api/staff/mt5/operations/${id}`),
-    refetchInterval: (q) => (q.state.data && isOpenOp(q.state.data.operation) ? 20_000 : false),
+    refetchInterval: (q) => (!q.state.data ? false : isOpenOp(q.state.data.operation) ? 20_000 : q.state.data.operation.status === "awaiting_approval" ? 30_000 : false),
     retry: (count, e) => !(e instanceof ApiError && e.status < 500) && count < 1,
   });
   const servers = useMt5Servers(can("mt5.view") || can("mt5.servers"));
   const [failing, setFailing] = useState(false);
   /** After a settle (or an answer that says it was settled meanwhile): the lists, the account and the client's wallet change too. */
-  const changed = (o: Mt5Operation) => {
-    void client.invalidateQueries({ queryKey: operationKey(id) });
-    void client.invalidateQueries({ queryKey: OPERATIONS_KEY });
-    void client.invalidateQueries({ queryKey: accountKey(o.accountId) });
-    void client.invalidateQueries({ queryKey: ACCOUNTS_KEY });
-    void client.invalidateQueries({ queryKey: ["client-wallet", o.clientId] });
-    void client.invalidateQueries({ queryKey: ["client-activity", String(o.clientId)] });
-  };
+  const changed = useOperationChanged();
   const check = useMutation({
     mutationFn: () => api.post<CheckAnswer>(`/api/staff/mt5/operations/${id}/check`),
     onSuccess: (res) => {
@@ -369,6 +436,9 @@ export function TransferDetail({ id }: { id: string }) {
       {gatewayOff && <GatewayOffNotice />}
       <div className="columns columns-wide">
         <OperationPanel o={o} />
+        {o.status === "awaiting_approval" && o.change && (o.change.canApprove || o.change.canReject) && (
+          <DecidePanel o={o} blocked={gatewayOff ? "MT5 is not connected, so the change cannot be sent." : null} onDone={(res) => client.setQueryData<Mt5OperationPage>(operationKey(id), res)} />
+        )}
         {isOpenOp(o) && mayReconcile && (
           <SettlePanel o={o} blocked={gatewayOff ? "MT5 is not connected, so operations cannot be checked or marked failed." : null} checking={check.isPending} onCheck={() => check.mutate()} onFail={() => setFailing(true)} />
         )}
@@ -402,12 +472,12 @@ function OperationPanel({ o }: { o: Mt5Operation }) {
           <CopyText value={o.reference} label="reference" />
           <small className="muted block">The comment on the deal in MT5.</small>
         </dd>
-        <dt>Direction</dt>
+        <dt>Operation</dt>
         <dd>{PURPOSE_LABEL[o.purpose] ?? o.purpose}</dd>
         <dt>Amount</dt>
         <dd>
           {money(o.amountCents)}
-          <small className="muted block">MT5 balance {signedMoney(o.signedCents)}</small>
+          <small className="muted block">{o.change ? `MT5 ${changeAmountText(o)}` : `MT5 balance ${signedMoney(o.signedCents)}`}</small>
         </dd>
         <dt>Status</dt>
         <dd>
@@ -423,7 +493,8 @@ function OperationPanel({ o }: { o: Mt5Operation }) {
             </dd>
           </>
         )}
-        {o.clientMessage && o.status === "failed" && (
+        {/* Clients are told only of staff changes MT5 made, never of one that failed. */}
+        {o.clientMessage && o.status === "failed" && !o.change && (
           <>
             <dt>Told the client</dt>
             <dd>{o.clientMessage}</dd>
@@ -448,7 +519,7 @@ function OperationPanel({ o }: { o: Mt5Operation }) {
             <dd>{formatDate(o.completedAt)}</dd>
           </>
         )}
-        {o.resolvedBy && (
+        {o.resolvedBy && o.status !== "cancelled" && (
           <>
             <dt>Marked failed by</dt>
             <dd>
@@ -458,12 +529,76 @@ function OperationPanel({ o }: { o: Mt5Operation }) {
           </>
         )}
       </dl>
+      {o.change && <ChangeDetails o={o} />}
+    </section>
+  );
+}
+
+/** Why a staff change was asked for, by whom, and the second person's decision. */
+function ChangeDetails({ o }: { o: Mt5Operation }) {
+  const c = o.change!;
+  return (
+    <>
+      <h3>Staff change</h3>
+      <dl className="details">
+        <dt>Reason</dt>
+        <dd>{REASON_LABEL[c.reasonCode] ?? c.reasonCode}</dd>
+        <dt>Note</dt>
+        <dd className="pre-wrap">{c.note}</dd>
+        <dt>Asked for by</dt>
+        <dd>
+          {c.requestedBy?.name ?? "–"}
+          <small className="muted block">{formatDate(o.createdAt)}</small>
+        </dd>
+        <dt>Second person</dt>
+        <dd>
+          {c.approvedBy ? (
+            <>
+              Approved by {c.approvedBy.name}
+              {c.approvedAt && <small className="muted block">{formatDate(c.approvedAt)}</small>}
+            </>
+          ) : c.ranAtOnce ? (
+            <>
+              Not needed
+              <small className="muted block">At or under the second-approval amount in the MT5 settings, so it ran on one person's word.</small>
+            </>
+          ) : o.status === "cancelled" ? (
+            <>
+              {declinedBy(o)}
+              {o.completedAt && <small className="muted block">{formatDate(o.completedAt)}</small>}
+            </>
+          ) : (
+            <span className="muted">Not decided yet</span>
+          )}
+        </dd>
+        {c.decidedNote && (
+          <>
+            <dt>{o.status === "cancelled" ? "Why" : "Approval note"}</dt>
+            <dd className="pre-wrap">{c.decidedNote}</dd>
+          </>
+        )}
+      </dl>
+    </>
+  );
+}
+
+function DecidePanel({ o, blocked, onDone }: { o: Mt5Operation; blocked: string | null; onDone: (res: Mt5OperationPage) => void }) {
+  return (
+    <section className="panel">
+      <div className="card-head">
+        <div>
+          <h2 className="flush">Second approval</h2>
+          <p>A second person checks the change and approves it with a 2FA code; it is then sent to MT5 at once. Rejecting needs a note.</p>
+        </div>
+      </div>
+      <ChangeDecision o={o} blocked={blocked} onDone={onDone} />
     </section>
   );
 }
 
 function SettlePanel({ o, blocked, checking, onCheck, onFail }: { o: Mt5Operation; blocked: string | null; checking: boolean; onCheck: () => void; onFail: () => void }) {
-  const failFrom = new Date(new Date(o.createdAt).getTime() + FAIL_AFTER_MS).toISOString();
+  // An approved staff change was let go to MT5 when it was approved, not when it was asked for.
+  const failFrom = new Date(new Date(o.change?.approvedAt ?? o.createdAt).getTime() + FAIL_AFTER_MS).toISOString();
   return (
     <section className="panel">
       <div className="card-head">
@@ -490,7 +625,7 @@ function SettlePanel({ o, blocked, checking, onCheck, onFail }: { o: Mt5Operatio
           <small className="muted">
             {o.canFail
               ? "For an operation MT5 never made. The CRM searches MT5 once more first, and changes nothing if it finds a deal."
-              : `Possible from ${formatDate(failFrom)}, once the operation is ten minutes old: until then MT5 may still be making the deal.`}
+              : `Possible from ${formatDate(failFrom)}, ten minutes after it was sent to MT5: until then MT5 may still be making the deal.`}
           </small>
         </div>
       )}
@@ -536,12 +671,17 @@ const LEDGER_KIND: Record<string, string> = {
   transfer_out: "Sent to MT5",
   transfer_release: "Returned to the wallet",
   transfer_in: "Received from MT5",
+  mt5_adjust_in: "Added to MT5 by staff",
+  mt5_adjust_out: "Taken from MT5 by staff",
 };
 
 /** The ledger transactions an operation should have made by now (the server's ledger check uses the same rules). */
 function expectedKinds(o: Mt5Operation): string[] {
   if (o.purpose === "wallet_to_mt5") return isOpenOp(o) ? ["transfer_hold"] : o.status === "completed" ? ["transfer_hold", "transfer_out"] : ["transfer_hold", "transfer_release"];
   if (o.purpose === "mt5_to_wallet") return o.status === "completed" ? ["transfer_in"] : [];
+  // A balance change is posted once MT5 has made it; credit never is.
+  if (o.purpose === "staff_balance_in") return o.status === "completed" ? ["mt5_adjust_in"] : [];
+  if (o.purpose === "staff_balance_out") return o.status === "completed" ? ["mt5_adjust_out"] : [];
   return [];
 }
 
@@ -550,6 +690,7 @@ function ledgerAccount(account: string, o: Mt5Operation) {
   if (/^client:\d+:wallet$/.test(account)) return "Client's wallet";
   if (/^client:\d+:hold$/.test(account)) return "Held in the client's wallet";
   if (account === `mt5_funding:${o.accountId}`) return `MT5 ${o.login}`;
+  if (account === "mt5_adjustments") return "Broker's MT5 adjustments";
   return account;
 }
 
@@ -568,9 +709,13 @@ function LedgerPanel({ o, ledger }: { o: Mt5Operation; ledger: OpLedgerTransacti
         <p className="muted">
           {o.purpose === "demo_funding" || o.purpose === "demo_topup"
             ? "Demo money is not in the ledger."
-            : o.purpose === "mt5_to_wallet" && o.status !== "completed"
-              ? "Nothing is written to the ledger until MT5's deal is found."
-              : "No ledger entries."}
+            : o.purpose === "staff_credit_in" || o.purpose === "staff_credit_out"
+              ? "Credit is not in the ledger: it is the broker's money lent for trading, not the client's."
+              : o.status === "failed" || o.status === "cancelled"
+                ? "No ledger entries."
+                : (o.purpose === "mt5_to_wallet" || isStaffPurpose(o.purpose)) && o.status !== "completed"
+                  ? "Nothing is written to the ledger until MT5's deal is found."
+                  : "No ledger entries."}
         </p>
       ) : (
         <ul className="session-list">
@@ -608,6 +753,7 @@ function LedgerPanel({ o, ledger }: { o: Mt5Operation; ledger: OpLedgerTransacti
 
 /** What marking it failed does with the money, by direction. */
 function failEffect(o: Mt5Operation) {
+  if (o.change) return "No money moves: nothing was written to the ledger for it, and the client is not told.";
   if (o.purpose === "wallet_to_mt5") return `The ${money(o.amountCents)} held in ${o.clientName}'s wallet goes back to it, and the client is told the transfer did not go through.`;
   if (o.purpose === "mt5_to_wallet") return `No money moves: the client's wallet was never credited for it. The client is told the transfer did not go through.`;
   return "Demo money only: nothing moves in the client's wallet.";
@@ -618,13 +764,17 @@ interface DealFound {
   action: number;
   amountCents: number;
   expectedCents: number;
+  /** The deal this operation makes: 2 for balance, 3 for credit. */
+  expectedAction: number;
 }
 /** MT5 has a deal with the operation's reference, so it was not marked failed (the server sends the deal in `details`). */
 function dealFound(e: unknown): DealFound | null {
   if (!(e instanceof ApiError) || e.code !== "MT5_DEAL_FOUND") return null;
   const d = e.details as unknown as Partial<DealFound> | undefined;
-  return d && !Array.isArray(d) && Number.isInteger(d.amountCents) && Number.isInteger(d.expectedCents) ? (d as DealFound) : null;
+  return d && !Array.isArray(d) && [d.action, d.expectedAction, d.amountCents, d.expectedCents].every(Number.isInteger) ? (d as DealFound) : null;
 }
+/** "a balance deal (action 2)", "a credit deal (action 3)". */
+const dealKind = (action: number) => `${action === 2 ? "a balance deal" : action === 3 ? "a credit deal" : "another kind of deal"} (action ${action})`;
 
 function FailDialog({ o, onClose, onChanged, onDone }: { o: Mt5Operation; onClose: () => void; onChanged: () => void; onDone: (res: Mt5OperationPage) => void }) {
   const { toast } = useFeedback();
@@ -663,7 +813,8 @@ function FailDialog({ o, onClose, onChanged, onDone }: { o: Mt5Operation; onClos
             <ShieldAlert size={18} />
             <p>
               {save.error instanceof Error ? save.error.message : ""} MT5's deal is {signedMoney(deal.amountCents)}
-              {deal.action !== 2 ? ` and is not a balance deal (action ${deal.action})` : ""}; this operation expects {signedMoney(deal.expectedCents)}.
+              {deal.action !== deal.expectedAction ? `, ${dealKind(deal.action)}` : ""}; this operation expects {deal.action !== deal.expectedAction ? `${dealKind(deal.expectedAction)} of ` : ""}
+              {signedMoney(deal.expectedCents)}.
             </p>
           </div>
         ) : (

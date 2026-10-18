@@ -1,38 +1,54 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, Ban, Gauge, KeyRound, Receipt, RefreshCw, ServerCog, ServerOff, ShieldAlert, ShieldCheck, Wallet, X } from "lucide-react";
+import { ArrowLeft, Ban, CandlestickChart, Gauge, HandCoins, KeyRound, Receipt, RefreshCw, ServerCog, ServerOff, ShieldAlert, ShieldCheck, UserCheck, Wallet, X } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { Link, useLocation } from "wouter";
 import { DataGrid, gridQuery, type Column, type GridState } from "../components/DataGrid";
-import { CopyText, money, signedMoney, textProblem } from "../components/money";
+import { CopyText, money, parseAmountText, signedMoney, textProblem } from "../components/money";
 import { DecisionError } from "../components/ReviewWorkbench";
-import { Badge, CopyBox, Dialog, EmptyState, Field, PageHeader, Spinner, useFeedback } from "../components/ui";
+import { Badge, CopyBox, Dialog, EmptyState, ErrorText, Field, PageHeader, Spinner, useFeedback } from "../components/ui";
 import { ApiError, api, formatDate, qs, type Page } from "../lib/api";
 import {
   ACCOUNTS_KEY,
   accountKey,
   BalanceCell,
+  changeAmountText,
+  ChangeDecision,
   failureText,
   GatewayOffNotice,
   isOpen,
   leverageText,
   Mt5StateBadge,
+  OPERATIONS_KEY,
   OpStatusBadge,
   opSignedCents,
   PURPOSE_LABEL,
+  REASON_LABEL,
+  tradesKey,
   typeLabel,
   useMt5Servers,
   useMt5Settings,
+  useOperationChanged,
+  type DealSync,
+  type DealSyncAnswer,
   type Mt5AccountItem,
   type Mt5AccountPage,
   type Mt5Live,
+  type Mt5Operation,
+  type Mt5OperationPage,
+  type Mt5Trade,
+  type Mt5TradePage,
+  type ReasonCode,
 } from "../lib/mt5";
 import { useCan } from "../lib/session";
 
 // Clients' MT5 accounts: a list across every client this staff member may
-// see, and one account's page with what MT5 says about it now and the
-// changes staff can make (leverage, suspend and reactivate, a new password).
-// Every change asks for a 2FA code and is recorded in the audit log. MT5's
-// own error text is shown to staff here; clients never see it.
+// see, and one account's page with what MT5 says about it now, its closed
+// trades (from the CRM's copy of its MT5 deals, with "Sync now") and the
+// changes staff can make (leverage, suspend and reactivate, a new password,
+// and balance or credit changes, which wait for a second person's approval
+// unless the MT5 settings let small ones run at once). Every change asks for
+// a 2FA code and is recorded in the audit log. MT5's own error text is shown
+// to staff here; clients never see it.
 
 const STATUS_OPTIONS = [
   { value: "active", label: "Active" },
@@ -150,7 +166,7 @@ export function Mt5AccountsList() {
 
 // ---------------- One account ----------------
 
-type Change = "leverage" | "suspend" | "reactivate" | "password-main" | "password-investor";
+type Change = "leverage" | "suspend" | "reactivate" | "password-main" | "password-investor" | "adjust";
 
 const CLIENT_STATUS: Record<string, ReactNode> = { frozen: <Badge tone="info">Frozen</Badge>, closed: <Badge tone="bad">Closed</Badge> };
 
@@ -213,6 +229,8 @@ export function Mt5AccountDetail({ id }: { id: string }) {
         : null;
   const mayEdit = can("mt5.edit");
   const mayPassword = can("mt5.password");
+  // Balance and credit changes are for live accounts only; demo money has its own top-ups.
+  const mayAdjust = can("mt5.balance.adjust") && !a.isDemo;
   const clientPanel = (
     <section className="panel">
       <div className="card-head">
@@ -264,18 +282,29 @@ export function Mt5AccountDetail({ id }: { id: string }) {
       {isOpen(a) && (
         <div className="columns columns-wide">
           {clientPanel}
-          {(mayEdit || mayPassword) && (
+          {(mayEdit || mayPassword || mayAdjust) && (
             <section className="panel">
               <div className="card-head">
                 <div>
                   <h2 className="flush">Changes</h2>
-                  <p>Each change is made in MT5 straight away, asks for your 2FA code and is recorded in the audit log.</p>
+                  <p>
+                    Each change asks for your 2FA code and is recorded in the audit log. Leverage, passwords and suspensions are made in MT5 straight away; a balance or credit change waits for
+                    a second person's approval unless the MT5 settings let small ones run at once.
+                  </p>
                 </div>
               </div>
               {blocked ? (
                 <p className="muted">{blocked}</p>
               ) : (
                 <div className="stack">
+                  {mayAdjust &&
+                    (a.clientStatus === "closed" ? (
+                      <small className="muted">This client's account is closed, so their MT5 balance and credit cannot change.</small>
+                    ) : (
+                      <button type="button" className="button" onClick={() => setChange("adjust")}>
+                        <HandCoins size={16} /> Change balance or credit
+                      </button>
+                    ))}
                   {mayEdit && (
                     <button type="button" className="button" onClick={() => setChange("leverage")}>
                       <Gauge size={16} /> Change leverage
@@ -307,12 +336,15 @@ export function Mt5AccountDetail({ id }: { id: string }) {
           )}
         </div>
       )}
+      {isOpen(a) && !a.isDemo && can("wallet.view") && <PendingChanges a={a} blocked={blocked} />}
+      {isOpen(a) && <ClosedTrades a={a} blocked={blocked} />}
       {(isOpen(a) || d.operations.length > 0) && <Operations d={d} />}
       {change === "leverage" && <LeverageDialog a={a} onClose={() => setChange(null)} onChanged={changed} />}
       {(change === "suspend" || change === "reactivate") && <SuspendDialog a={a} mode={change} onClose={() => setChange(null)} onChanged={changed} />}
       {(change === "password-main" || change === "password-investor") && (
         <PasswordDialog a={a} type={change === "password-main" ? "main" : "investor"} onClose={() => setChange(null)} onChanged={changed} />
       )}
+      {change === "adjust" && <AdjustDialog a={a} live={d.live} onClose={() => setChange(null)} />}
     </>
   );
 }
@@ -481,7 +513,7 @@ function Operations({ d }: { d: Mt5AccountPage }) {
           <h2 className="flush">
             <Receipt size={18} /> Balance operations
           </h2>
-          <small className="muted">The latest 20 balance changes the CRM asked MT5 to make on this account.</small>
+          <small className="muted">The latest 20 balance and credit operations the CRM asked MT5 to make on this account.</small>
         </div>
         {transfers && d.operations.length > 0 && (
           <div className="grid-toolbar-end">
@@ -533,7 +565,7 @@ function Operations({ d }: { d: Mt5AccountPage }) {
               <tr>
                 <td colSpan={5} className="empty">
                   <EmptyState icon={<Receipt size={32} />} title="No balance operations yet">
-                    Transfers and demo top-ups for this account appear here.
+                    Transfers, demo top-ups and staff balance and credit changes for this account appear here.
                   </EmptyState>
                 </td>
               </tr>
@@ -542,6 +574,243 @@ function Operations({ d }: { d: Mt5AccountPage }) {
         </table>
       </div>
     </section>
+  );
+}
+
+// ---------------- Staff changes waiting for approval ----------------
+
+/** This account's staff balance and credit changes that wait for a second person, with Approve and Reject. */
+function PendingChanges({ a, blocked }: { a: Mt5AccountItem; blocked: string | null }) {
+  // Another person may decide one at any moment, so the list is read again while it is on screen.
+  const list = useQuery({
+    queryKey: [...OPERATIONS_KEY, "account-awaiting", String(a.id)],
+    queryFn: () => api.get<Page<Mt5Operation>>(`/api/staff/mt5/operations${qs({ accountId: a.id, status: "awaiting_approval", sort: "created_at", dir: "asc", pageSize: 50 })}`),
+    refetchInterval: 30_000,
+  });
+  const items = list.data?.items ?? [];
+  if (list.error) return <ErrorText error={list.error} />;
+  if (!items.length) return null;
+  const more = (list.data?.total ?? 0) - items.length;
+  return (
+    <section className="grid" style={{ marginBottom: 18 }}>
+      <div className="grid-toolbar">
+        <div>
+          <h2 className="flush">
+            <UserCheck size={18} /> Waiting for approval
+          </h2>
+          <small className="muted">Staff changes to this account's balance or credit. Each is sent to MT5 only once a second person approves it.</small>
+        </div>
+        {more > 0 && (
+          <div className="grid-toolbar-end">
+            <Link href={`/transfers?account=${a.id}&status=awaiting_approval`}>All {list.data!.total} on the Transfers page</Link>
+          </div>
+        )}
+      </div>
+      <div className="grid-scroll">
+        <table className="table">
+          <thead>
+            <tr>
+              <th>Change</th>
+              <th>Reason</th>
+              <th>Asked for by</th>
+              <th>Decision</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((o) => (
+              <tr key={o.id}>
+                <td data-label="Change">
+                  <span className="stack-tight">
+                    <strong className="nowrap">{changeAmountText(o)}</strong>
+                    <small className="muted mono">
+                      <Link href={`/transfers/${o.id}`}>{o.reference}</Link>
+                    </small>
+                  </span>
+                </td>
+                <td data-label="Reason">
+                  <span className="stack-tight">
+                    <span>{o.change ? (REASON_LABEL[o.change.reasonCode] ?? o.change.reasonCode) : "–"}</span>
+                    {o.change && <small className="muted pre-wrap">{o.change.note}</small>}
+                  </span>
+                </td>
+                <td data-label="Asked for by">
+                  <span className="stack-tight">
+                    <span>{o.change?.requestedBy?.name ?? "–"}</span>
+                    <small className="muted">{formatDate(o.createdAt)}</small>
+                  </span>
+                </td>
+                <td data-label="Decision">
+                  <ChangeDecision o={o} blocked={blocked} small />
+                  {o.change && !o.change.canApprove && !o.change.canReject && <small className="muted">Needs someone allowed to make MT5 balance and credit operations.</small>}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+// ---------------- Closed trades ----------------
+
+/** 0.5 → "0.50", 1.2345 → "1.2345": at least two decimals, as MT5 shows lots. */
+const lotsText = (lots: number) => lots.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+
+/** A signed amount, red when it is a loss. */
+const Pnl = ({ cents, currency, strong }: { cents: number; currency: string; strong?: boolean }) => {
+  const text = cents === 0 ? money(0, currency) : signedMoney(cents, currency);
+  const cls = `nowrap${cents < 0 ? " error-text" : ""}`;
+  return strong ? <strong className={cls}>{text}</strong> : <span className={cls}>{text}</span>;
+};
+
+const tradeColumns = (currency: string): Column<Mt5Trade>[] => [
+  {
+    key: "trade",
+    header: "Trade",
+    render: (t) => (
+      <span className="stack-tight">
+        <strong>
+          {t.symbol || "–"} <span className={t.side === "buy" ? "trade-side buy" : "trade-side sell"}>{t.side === "buy" ? "Buy" : "Sell"}</span>
+        </strong>
+        <small className="muted mono nowrap">
+          Position {t.positionId}
+          {t.reversalTicket ? ` · after reversal ${t.reversalTicket}` : ""}
+        </small>
+      </span>
+    ),
+  },
+  { key: "lots", header: "Lots", render: (t) => <span className="nowrap">{lotsText(t.lots)}</span> },
+  {
+    key: "price",
+    header: "Open and close price",
+    render: (t) => (
+      <span className="mono nowrap trade-price">
+        <span>{t.openPrice}</span> <span>→ {t.closePrice}</span>
+      </span>
+    ),
+  },
+  {
+    key: "closed_at",
+    header: "Closed",
+    render: (t) => (
+      <span className="stack-tight trade-when">
+        <span>{formatDate(t.closedAt)}</span>
+        <small className="muted">Opened {formatDate(t.openedAt)}</small>
+      </span>
+    ),
+  },
+  { key: "profit", header: "Profit", render: (t) => <Pnl cents={t.profitCents} currency={currency} /> },
+  { key: "commission", header: "Commission", optional: true, render: (t) => <Pnl cents={t.commissionCents} currency={currency} /> },
+  { key: "swap", header: "Swap", optional: true, render: (t) => <Pnl cents={t.swapCents} currency={currency} /> },
+  {
+    key: "net",
+    header: "Net",
+    render: (t) => (
+      <span className="stack-tight">
+        <Pnl cents={t.netCents} currency={currency} strong />
+        {t.feeCents !== 0 && <small className="muted">Fees {signedMoney(t.feeCents, currency)}</small>}
+      </span>
+    ),
+  },
+];
+
+/** How far the CRM's copy of the account's deals reaches, in a sentence. */
+function SyncLine({ s }: { s: DealSync }) {
+  if (s.running)
+    return (
+      <>
+        <Spinner size={12} /> Reading this account's deals from MT5 now…
+      </>
+    );
+  if (!s.syncedAt) return <>Not read from MT5 yet. The CRM reads every open account's deals on its own, at least once a day.</>;
+  const until = s.syncedUntil ? ` Trades closed up to ${formatDate(s.syncedUntil)} are here.` : "";
+  if (s.error)
+    return (
+      <span className="error-text">
+        The last sync ({formatDate(s.syncedAt)}) did not finish: {s.error.replace(/\.?$/, ".")}
+        {until}
+      </span>
+    );
+  if (s.partial) return <>Part of the history is read so far ({formatDate(s.syncedAt)}).{until} The rest is read on the next syncs.</>;
+  return <>Synced from MT5 {formatDate(s.syncedAt)}.{until}</>;
+}
+
+/** What "Sync now" found, for the toast. */
+function syncMessage(res: DealSyncAnswer): [string, "good" | "bad"] {
+  const r = res.result;
+  const found = r.newDeals === 1 ? "1 new deal" : `${r.newDeals.toLocaleString()} new deals`;
+  if (r.outcome === "failed") return [`The sync stopped: ${(r.error?.message ?? "MT5 could not be read").replace(/\.?$/, ".")}${r.newDeals ? ` ${found} were saved before that.` : ""}`, "bad"];
+  if (r.outcome === "skipped") return ["This account cannot be synced now: it is not open in MT5, or its server is switched off.", "bad"];
+  if (r.outcome === "partial") return [`Read ${found}, but not the whole history yet. Sync again, or let the CRM's own sync read the rest.`, "good"];
+  return [r.newDeals ? `Synced: ${found} from MT5.` : "Synced: MT5 has nothing new for this account.", "good"];
+}
+
+/** The account's fully closed positions, newest close first, from the CRM's copy of its MT5 deals. */
+function ClosedTrades({ a, blocked }: { a: Mt5AccountItem; blocked: string | null }) {
+  const client = useQueryClient();
+  const { toast } = useFeedback();
+  const [state, setState] = useState<GridState>({ page: 1, pageSize: 25, filters: {} });
+  const trades = useQuery({
+    queryKey: [...tradesKey(a.id), state.page, state.pageSize],
+    queryFn: () => api.get<Mt5TradePage>(`/api/staff/mt5/accounts/${a.id}/trades${qs({ page: state.page, pageSize: state.pageSize })}`),
+    placeholderData: (prev) => prev,
+    // A sync running elsewhere (the CRM's own, or a colleague's Sync now) is followed until it ends.
+    refetchInterval: (q) => (q.state.data?.sync.running ? 5_000 : false),
+  });
+  const sync = useMutation({
+    mutationFn: () => api.post<DealSyncAnswer>(`/api/staff/mt5/accounts/${a.id}/sync-deals`),
+    onSuccess: (res) => {
+      toast(...syncMessage(res));
+      void client.invalidateQueries({ queryKey: tradesKey(a.id) });
+    },
+    onError: (e) => toast(e instanceof Error ? e.message : "MT5 could not be read.", "bad"),
+  });
+  const d = trades.data;
+  const t = d?.totals;
+  const busy = sync.isPending || Boolean(d?.sync.running);
+  return (
+    <div style={{ marginBottom: 18 }}>
+      <DataGrid
+        columns={tradeColumns(a.currency)}
+        rows={d?.items}
+        total={d?.total ?? 0}
+        pages={d?.pages ?? 1}
+        state={state}
+        onChange={setState}
+        rowKey={(x) => x.id}
+        loading={trades.isLoading}
+        error={trades.error}
+        toolbar={
+          <div className="trades-bar">
+            <div className="trades-bar-text">
+              <h2 className="flush">
+                <CandlestickChart size={18} /> Closed trades
+              </h2>
+              <small className="muted">{d ? <SyncLine s={d.sync} /> : "Positions closed in MT5, from the CRM's copy of this account's deals."}</small>
+              {t && t.trades > 0 && (
+                <small className="trade-totals">
+                  {t.trades.toLocaleString()} {t.trades === 1 ? "trade" : "trades"} · {lotsText(t.lots)} lots · Profit <Pnl cents={t.profitCents} currency={a.currency} /> · Commission{" "}
+                  <Pnl cents={t.commissionCents} currency={a.currency} /> · Swap <Pnl cents={t.swapCents} currency={a.currency} /> · Net <Pnl cents={t.netCents} currency={a.currency} strong />
+                </small>
+              )}
+            </div>
+            <span className="stack-tight trades-bar-end">
+              <button type="button" className="button button-small" title="Read this account's new deals from MT5 now" disabled={busy || Boolean(blocked)} onClick={() => sync.mutate()}>
+                {busy ? <Spinner /> : <RefreshCw size={14} />} Sync now
+              </button>
+              {blocked && <small className="muted">{blocked}</small>}
+            </span>
+          </div>
+        }
+        emptyTitle="No closed trades yet"
+        emptyText={
+          d && !d.sync.syncedAt
+            ? "The CRM has not read this account's deals from MT5 yet. Sync now reads them."
+            : "A trade appears here once its position is fully closed in MT5 and the CRM has read its deals."
+        }
+      />
+    </div>
   );
 }
 
@@ -706,7 +975,7 @@ function PasswordDialog({ a, type, onClose, onChanged }: { a: Mt5AccountItem; ty
           <CopyBox value={made.password} />
           <div className="notice notice-warn" style={{ marginTop: 14 }}>
             <KeyRound size={18} />
-            <p>This is the only time it is shown: the CRM does not keep it. Give it to the client over a secure channel, never by email or chat. The client was told in their notifications.</p>
+            <p>Staff are shown it only this once. The client can see it with the account's details in their portal and app, and was told in their notifications. Never send it by email or chat.</p>
           </div>
           <div className="actions">
             <button type="button" className="button button-primary" onClick={onClose}>
@@ -739,6 +1008,139 @@ function PasswordDialog({ a, type, onClose, onChanged }: { a: Mt5AccountItem; ty
           <p className="muted tight">You'll be asked for your 2FA code.</p>
         </form>
       )}
+    </Dialog>
+  );
+}
+
+// ---------------- Balance and credit ----------------
+
+type AdjustKind = "balance_in" | "balance_out" | "credit_in" | "credit_out";
+
+const ADJUST_KINDS: { value: AdjustKind; label: string; help: string }[] = [
+  { value: "balance_in", label: "Add to the balance", help: "The client's own money: they can trade it and withdraw it." },
+  { value: "balance_out", label: "Take from the balance", help: "At most what the account could withdraw now: its balance, less its credit and the margin its open trades use." },
+  { value: "credit_in", label: "Add credit", help: "The broker's money lent for trading: it adds to equity and free margin, and cannot be withdrawn." },
+  { value: "credit_out", label: "Take credit away", help: "At most the credit the account has now. MT5 refuses it if the open trades need that margin." },
+];
+
+const REASON_OPTIONS = Object.entries(REASON_LABEL) as [ReasonCode, string][];
+
+/** What the client could take out now, by the transfer rule: never the credit, never the margin open trades use. */
+const withdrawable = (f: { balanceCents: number; equityCents: number; creditCents: number; marginCents: number }) =>
+  Math.max(0, Math.min(f.balanceCents, f.equityCents - f.creditCents - f.marginCents));
+
+function AdjustDialog({ a, live, onClose }: { a: Mt5AccountItem; live: Mt5Live | null; onClose: () => void }) {
+  const { toast } = useFeedback();
+  const changed = useOperationChanged();
+  const settings = useMt5Settings();
+  const [kind, setKind] = useState<AdjustKind>("balance_in");
+  const [amount, setAmount] = useState("");
+  const [reasonCode, setReasonCode] = useState<ReasonCode | "">("");
+  const [note, setNote] = useState("");
+  const [tried, setTried] = useState(false);
+  const cur = a.currency;
+  // MT5's figures as this page last read them; the server reads them again when the change is asked for and when it is approved.
+  const f = live?.figures ?? (a.balanceCents !== null && a.equityCents !== null ? { balanceCents: a.balanceCents, creditCents: a.creditCents ?? 0, equityCents: a.equityCents, marginCents: a.marginCents ?? 0 } : null);
+  const parsed = parseAmountText(amount);
+  const max = settings.data?.maxTransferCents;
+  const problems = {
+    amount: parsed.problem ?? (max !== undefined && parsed.minor > max ? `One change can be at most ${money(max, cur)}, the transfer limit in the MT5 settings.` : null),
+    reason: reasonCode ? null : "Choose the reason.",
+    note: note.trim().length < 10 ? "Write why (at least 10 characters)." : textProblem(note, "note", 10, 500),
+  };
+  const ok = !problems.amount && !problems.reason && !problems.note;
+  const threshold = settings.data?.adjustSecondApprovalCents ?? 0;
+  const cents = parsed.minor ?? 0;
+  const second = threshold === 0 || cents > threshold;
+  const save = useMutation({
+    mutationFn: () => api.post<Mt5OperationPage>(`/api/staff/mt5/accounts/${a.id}/adjustments`, { kind, amountCents: cents, reasonCode, note: note.trim() }),
+    onSuccess: (res) => {
+      const o = res.operation;
+      toast(
+        o.status === "awaiting_approval"
+          ? `${o.reference} is waiting for a second person's approval. It is sent to MT5 once someone else approves it.`
+          : o.status === "completed"
+            ? `MT5 made the change: ${changeAmountText(o)}${o.ticket !== null ? ` (ticket ${o.ticket})` : ""}.`
+            : `${o.reference} was sent, but MT5 did not confirm it yet. The CRM searches MT5 for its deal and settles it.`,
+      );
+      changed(o);
+      onClose();
+    },
+    // MT5 refused it (the change is saved as failed) or the account changed meanwhile: read the account again.
+    onError: (e) => e instanceof ApiError && e.status !== 403 && changed({ accountId: a.id, clientId: a.clientId }),
+  });
+  const help = ADJUST_KINDS.find((k) => k.value === kind)!.help;
+  const limitHint =
+    kind === "balance_out" && f
+      ? `About ${money(withdrawable(f), cur)} could be taken now, by the figures on this page.`
+      : kind === "credit_out" && f
+        ? `The account has ${money(f.creditCents, cur)} of credit, by the figures on this page.`
+        : max !== undefined
+          ? `At most ${money(max, cur)} in one change.`
+          : null;
+  const show = (key: keyof typeof problems, text: ReactNode) => (tried && problems[key] ? <span className="error-text">{problems[key]}</span> : text);
+  return (
+    <Dialog open title={`Change the balance or credit of ${a.login}`} onClose={onClose}>
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          setTried(true);
+          if (ok) save.mutate();
+        }}
+      >
+        {f && (
+          <p className="muted">
+            Now: balance {money(f.balanceCents, cur)}, credit {money(f.creditCents, cur)}, equity {money(f.equityCents, cur)}.
+          </p>
+        )}
+        <fieldset className="flush adjust-kinds">
+          <legend className="field-label">Change</legend>
+          {ADJUST_KINDS.map((k) => (
+            <label key={k.value} className="check">
+              <input type="radio" name="adjust-kind" value={k.value} checked={kind === k.value} onChange={() => setKind(k.value)} />
+              <span>{k.label}</span>
+            </label>
+          ))}
+          <small className="field-hint block">{help}</small>
+        </fieldset>
+        <Field label={`Amount (${cur})`} hint={show("amount", limitHint)}>
+          <input className="input" inputMode="decimal" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="100.00" maxLength={16} autoFocus />
+        </Field>
+        <Field label="Reason" hint={show("reason", null)}>
+          <select className="input" value={reasonCode} onChange={(e) => setReasonCode(e.target.value as ReasonCode)}>
+            <option value="">Choose…</option>
+            {REASON_OPTIONS.map(([value, label]) => (
+              <option key={value} value={value}>
+                {label}
+              </option>
+            ))}
+          </select>
+        </Field>
+        <Field label="Note" hint={show("note", "Why, for the second person and the audit log. The client does not see it.")}>
+          <textarea className="input" rows={3} value={note} onChange={(e) => setNote(e.target.value)} maxLength={500} />
+        </Field>
+        <div className="notice notice-page">
+          <UserCheck size={18} />
+          <p>
+            {threshold === 0
+              ? "Another person must approve this change before it is sent to MT5."
+              : second
+                ? `Over ${money(threshold, cur)}: another person must approve this change before it is sent to MT5.`
+                : `Up to ${money(threshold, cur)} runs at once on your word, as long as what you ran alone in the last 24 hours stays within ${money(threshold, cur)}. Otherwise it waits for another person's approval.`}{" "}
+            The client is told once MT5 has made it.
+          </p>
+        </div>
+        <DecisionError error={save.error} />
+        <div className="actions">
+          <button type="button" className="button" onClick={onClose}>
+            Cancel
+          </button>
+          <button type="submit" className="button button-primary" disabled={save.isPending || (tried && !ok) || settings.isLoading}>
+            {save.isPending && <Spinner />} {second ? "Ask for approval" : "Make the change"}
+          </button>
+        </div>
+        <p className="muted tight">You'll be asked for your 2FA code.</p>
+      </form>
     </Dialog>
   );
 }

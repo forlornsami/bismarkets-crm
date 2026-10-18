@@ -28,7 +28,10 @@ import { staffMailRouter } from "./routes/staff/mail";
 import { staffMessagesRouter } from "./routes/staff/messages";
 import { staffMoneyRouter } from "./routes/staff/money";
 import { staffMt5Router } from "./routes/staff/mt5";
+import { staffMt5AdjustmentsRouter } from "./routes/staff/mt5-adjustments";
 import { staffMt5OperationsRouter } from "./routes/staff/mt5-operations";
+import { staffMt5ReconciliationRouter } from "./routes/staff/mt5-reconciliation";
+import { staffMt5HistoryRouter } from "./routes/staff/mt5-history";
 import { staffPackagesRouter } from "./routes/staff/packages";
 import { staffWithdrawalsRouter } from "./routes/staff/withdrawals";
 import { emailUnsubscribeRouter } from "./routes/unsubscribe";
@@ -144,6 +147,11 @@ export function createApp(deps: AppDeps): Express {
   staff.use("/money", staffMoneyRouter(deps));
   // Ahead of /mt5, so that router never sees these paths.
   staff.use("/mt5/operations", staffMt5OperationsRouter(deps));
+  staff.use("/mt5/reconciliation", staffMt5ReconciliationRouter(deps));
+  // Only /accounts/:id/trades and /sync-deals; every other /accounts path falls through to /mt5.
+  staff.use("/mt5/accounts", staffMt5HistoryRouter(deps));
+  // Only POST /accounts/:id/adjustments; the rest falls through likewise.
+  staff.use("/mt5/accounts", staffMt5AdjustmentsRouter(deps));
   staff.use("/mt5", staffMt5Router(deps));
   staff.use("/packages", staffPackagesRouter(deps));
   app.use("/api/staff", staff);

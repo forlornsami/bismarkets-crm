@@ -43,6 +43,7 @@ describe.skipIf(!hasDb)("staff MT5 API", () => {
   }
   const bearer = (c: Client) => ({ Authorization: `Bearer ${c.token}` });
   const clientCreate = (c: Client, body: Record<string, unknown>) => request(env.app).post("/api/mt5-accounts").set(bearer(c)).send(body);
+  const clientList = (c: Client) => request(env.app).get("/api/mt5-accounts").set(bearer(c));
   const get = (s: SignedIn, url: string) => s.agent.get(url);
   /** A newly signed-in staff member, with no 2FA confirmation yet. */
   const fresh = async (role: string) => {
@@ -155,7 +156,7 @@ describe.skipIf(!hasDb)("staff MT5 API", () => {
     expect(shown.status).toBe(200);
     expect(shown.body).toEqual({
       demoServerCode: "demo", demoGroup: "demo\\usd", leverages: [2000, 500], maxLiveAccounts: expect.any(Number), maxDemoAccounts: expect.any(Number),
-      demoMaxOpeningCents: 10_000_000, demoMaxTopupCents: 1_000_000, demoMaxBalanceCents: 100_000_000, maxTransferCents: expect.any(Number),
+      demoMaxOpeningCents: 10_000_000, demoMaxTopupCents: 1_000_000, demoMaxBalanceCents: 100_000_000, maxTransferCents: expect.any(Number), adjustSecondApprovalCents: 0,
       gatewayConfigured: true, updatedAt: expect.stringMatching(ISO), updatedBy: null,
     });
     expect((await patch(dealer, "/api/staff/mt5/settings", { leverages: [100] })).status).toBe(403);
@@ -378,6 +379,8 @@ describe.skipIf(!hasDb)("staff MT5 API", () => {
     lostThen("user.password", { kind: "refused", code: "invalid_password" });
     unconfirmed(await post(dealer, `/api/staff/mt5/accounts/${id}/password`, { type: "main" }));
     expect(user().passwords.main).not.toBe(MASTER);
+    // MT5 may have either password now: the client's list says not available rather than show the old one.
+    expect((await clientList(c)).body.real_accounts[0]).toMatchObject({ login: String(login), password: null, investor_password: INVESTOR });
   });
 
   it("suspends and reactivates an account with a reason; the client sees 'suspended' and cannot undo it", async () => {
@@ -419,7 +422,7 @@ describe.skipIf(!hasDb)("staff MT5 API", () => {
     expect((await get(support, "/api/staff/mt5/accounts?status=unknown")).body.items.map((a: { id: number }) => a.id)).toContain(id);
   });
 
-  it("resets a password, shows it once and keeps it nowhere", async () => {
+  it("resets a password, shows it to staff once and keeps it only for the client", async () => {
     expect((await post(support, `/api/staff/mt5/accounts/${acct.real}/password`, { type: "main" })).status).toBe(403);
     await stepUp(env, dealer);
     expect((await post(dealer, `/api/staff/mt5/accounts/${acct.real}/password`, { type: "both" })).status).toBe(400);
@@ -438,11 +441,26 @@ describe.skipIf(!hasDb)("staff MT5 API", () => {
     const everywhere = JSON.stringify(await rows(env.db, "SELECT * FROM audit_log")) + JSON.stringify(await rows(env.db, "SELECT * FROM client_notifications")) + JSON.stringify(fake.calls);
     expect(everywhere).not.toContain(password);
 
+    // Kept sealed for the client, who sees it in their own list from now on; the staff pages never show it.
+    const kept = await one<{ set_by: string; sealed: Buffer }>(env.db, "SELECT set_by, sealed FROM mt5_account_passwords WHERE account_id = ? AND type = 'investor'", [acct.real]);
+    expect(kept!.set_by).toBe("staff");
+    expect(kept!.sealed.toString("latin1")).not.toContain(password);
+    const mine = await request(env.app).get("/api/mt5-accounts").set(bearer(realClient));
+    expect(mine.body.real_accounts[0]).toMatchObject({ login: String(acct.realLogin), password: MASTER, investor_password: password });
+    const staffViews = [await get(dealer, `/api/staff/mt5/accounts/${acct.real}`), await get(dealer, "/api/staff/mt5/accounts?pageSize=100")];
+    for (const view of staffViews) {
+      expect(view.status).toBe(200);
+      expect(JSON.stringify(view.body)).not.toContain(password);
+      expect(JSON.stringify(view.body)).not.toContain(MASTER);
+    }
+
     fake.failNext("user.password", { kind: "refused", code: "invalid_password", message: "3006 Invalid account password" });
     const refused = await post(dealer, `/api/staff/mt5/accounts/${acct.real}/password`, { type: "main" });
     expect(refused.status).toBe(422);
     expect(refused.body.error).toMatchObject({ code: "MT5_REFUSED", message: expect.stringContaining("3006"), details: { kind: "refused", code: "invalid_password" } });
     expect(JSON.stringify(refused.body)).not.toMatch(/"password"/);
+    // MT5 said no, so the client's master password is still the one kept.
+    expect((await request(env.app).get("/api/mt5-accounts").set(bearer(realClient))).body.real_accounts[0]).toMatchObject({ password: MASTER, investor_password: password });
   });
 
   it("answers 422 when MT5 is off or the account's server is switched off", async () => {

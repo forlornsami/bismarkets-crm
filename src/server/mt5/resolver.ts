@@ -6,14 +6,17 @@ import { exec, rows, transaction, type Conn, type Db } from "../lib/db";
 import { activateAccount, loadAccount, withAccountLock } from "./accounts";
 import { callMt5 } from "./errors";
 import { GatewayError, type Mt5Gateway } from "./gateway";
-import { loadOp, PURPOSES, settleBalanceOp, signedCents, type BalanceOpRow } from "./operations";
+import { dealAction, loadOp, PURPOSES, sentAt, settleBalanceOp, signedCents, type BalanceOpRow } from "./operations";
+import { forgetMt5Passwords } from "./passwords";
 
 // Settles what a lost answer left open: balance operations that are unknown
 // (or stuck 'sending' because the process stopped mid-call) and accounts that
 // are unknown (or stuck 'creating'). It only ever searches MT5: a deal by its
 // reference, an account by its create reference. It never sends a balance
 // operation or a create again. Found means done; not found three times, and
-// at least ten minutes after the request, means it did not happen.
+// at least ten minutes after the operation was let go to MT5 (its request,
+// or a staff change's approval), means it did not happen. A staff change
+// waiting for approval, or rejected, was never sent and is never looked at.
 
 type Log = Pick<Logger, "info" | "warn" | "error">;
 
@@ -26,7 +29,7 @@ const RETRY_UNREACHABLE_MS = 60_000;
 /** A deal that does not match, or a search MT5 refuses: staff must look; checked again hourly meanwhile. */
 const RECHECK_ODD_MS = 3_600_000;
 const GIVE_UP_CHECKS = 3;
-/** How old a request must be before it may be settled as never made (by the resolver or by staff). */
+/** How long after it was let go to MT5 an operation may be settled as never made (by the resolver or by staff). */
 export const GIVE_UP_AGE_MS = 10 * 60_000;
 /** 2, 4, 8, then every 10 minutes. */
 const backoffMs = (checks: number) => Math.min(2 ** checks, 10) * 60_000;
@@ -62,9 +65,11 @@ const rescheduleAccount = (db: Db, id: number, failure: string | null, checks: n
 export type CheckResult = "completed" | "failed" | "unknown" | "skipped";
 
 const isOpen = (op: BalanceOpRow) => op.status === "sending" || op.status === "unknown";
-/** The deal MT5 made for this operation: a balance deal on its login for exactly its signed amount. */
-const isItsDeal = (deal: Mt5Deal, op: BalanceOpRow) => deal.action === 2 && deal.login === op.login && deal.profitCents === signedCents(op);
-const searchFrom = (row: { created_at: Date }) => new Date(row.created_at.getTime() - SEARCH_BACK_MS).toISOString();
+/** The deal MT5 made for this operation: a balance (or for credit, a credit) deal on its login for exactly its signed amount. */
+const isItsDeal = (deal: Mt5Deal, op: BalanceOpRow) => deal.action === dealAction(op) && deal.login === op.login && deal.profitCents === signedCents(op);
+const searchFrom = (from: Date) => new Date(from.getTime() - SEARCH_BACK_MS).toISOString();
+/** Old enough to be settled as never made. */
+const oldEnough = (op: BalanceOpRow) => Date.now() - sentAt(op).getTime() >= GIVE_UP_AGE_MS;
 
 /**
  * Looks for one balance operation's deal in MT5 and settles it when the
@@ -99,7 +104,7 @@ export async function checkBalanceOpDetailed(
     }
     let deal: Mt5Deal | null;
     try {
-      ({ deal } = await callMt5(gateway, "deal.find", { server: op.server_code, login: op.login, comment: op.reference, from: searchFrom(op) }, log));
+      ({ deal } = await callMt5(gateway, "deal.find", { server: op.server_code, login: op.login, comment: op.reference, from: searchFrom(sentAt(op)) }, log));
     } catch (error) {
       const e = error as GatewayError;
       if (e.kind === "refused" || e.kind === "bad_request") {
@@ -119,7 +124,7 @@ export async function checkBalanceOpDetailed(
         return { result: now ? ("completed" as const) : ("skipped" as const), error: null };
       }
       log.error(
-        { opId: op.id, reference: op.reference, ticket: deal.ticket, action: deal.action, amountCents: deal.profitCents, expected: signedCents(op) },
+        { opId: op.id, reference: op.reference, ticket: deal.ticket, action: deal.action, amountCents: deal.profitCents, expected: signedCents(op), expectedAction: dealAction(op) },
         "An MT5 deal carries this operation's reference but does not match it; staff must check it",
       );
       await rescheduleOp(db, op.id, "mismatch", op.checks, RECHECK_ODD_MS);
@@ -131,7 +136,7 @@ export async function checkBalanceOpDetailed(
       return { result: "unknown" as const, error: null };
     }
     const checks = op.checks + 1;
-    if (checks >= GIVE_UP_CHECKS && Date.now() - op.created_at.getTime() >= GIVE_UP_AGE_MS) {
+    if (checks >= GIVE_UP_CHECKS && oldEnough(op)) {
       const { settled: now } = await settleBalanceOp(db, op.id, { status: "failed", failure: "not_found", clientMessage: PURPOSES[op.purpose].notFoundMessage });
       log.warn({ opId: op.id, reference: op.reference, checks }, "MT5 balance operation was never made; settled as failed");
       return { result: now ? ("failed" as const) : ("skipped" as const), error: null };
@@ -147,16 +152,16 @@ export const checkBalanceOp = async (db: Db, gateway: Mt5Gateway | null, opId: n
 
 export type StaffFailOutcome =
   | { done: true; op: BalanceOpRow }
-  /** settled: something else settled it first; too_new: under ten minutes old; found: MT5 has a deal with its reference. */
+  /** settled: something else settled it first; too_new: let go to MT5 under ten minutes ago; found: MT5 has a deal with its reference. */
   | { done: false; reason: "settled" | "too_new" | "found"; op: BalanceOpRow; deal: Mt5Deal | null };
 
 /**
  * Staff "mark failed": the same settle as the resolver giving up, but now and
  * on a person's word, for an operation still open at least ten minutes after
- * the request whose deal a search made now does not find. Nobody can mark one
- * completed: only a deal found in MT5 does that. A search MT5 cannot answer
- * throws its GatewayError and changes nothing. `audit` runs in the settling
- * transaction.
+ * it was let go to MT5, whose deal a search made now does not find. Nobody
+ * can mark one completed: only a deal found in MT5 does that. A search MT5
+ * cannot answer throws its GatewayError and changes nothing. `audit` runs in
+ * the settling transaction.
  */
 export async function failBalanceOpByStaff(
   db: Db,
@@ -171,8 +176,8 @@ export async function failBalanceOpByStaff(
   return withAccountLock(first.mt5_account_id, async (): Promise<StaffFailOutcome> => {
     const op = (await loadOp(db, opId))!;
     if (!isOpen(op)) return { done: false, reason: "settled", op, deal: null };
-    if (Date.now() - op.created_at.getTime() < GIVE_UP_AGE_MS) return { done: false, reason: "too_new", op, deal: null };
-    const { deal } = await callMt5(gateway, "deal.find", { server: op.server_code, login: op.login, comment: op.reference, from: searchFrom(op) }, log);
+    if (!oldEnough(op)) return { done: false, reason: "too_new", op, deal: null };
+    const { deal } = await callMt5(gateway, "deal.find", { server: op.server_code, login: op.login, comment: op.reference, from: searchFrom(sentAt(op)) }, log);
     if (deal) return { done: false, reason: "found", op, deal };
     const { op: settled, settled: now } = await settleBalanceOp(
       db, op.id, { status: "failed", failure: "not_found", clientMessage: PURPOSES[op.purpose].notFoundMessage, staffId: by.staffId, note: by.note }, ["sending", "unknown"], audit,
@@ -193,7 +198,7 @@ export async function checkAccount(db: Db, gateway: Mt5Gateway | null, accountId
   }
   let login: number | null;
   try {
-    ({ login } = await callMt5(gateway, "user.find", { server: a.server_code, group: a.mt5_group, comment: a.create_ref, from: searchFrom(a) }, log));
+    ({ login } = await callMt5(gateway, "user.find", { server: a.server_code, group: a.mt5_group, comment: a.create_ref, from: searchFrom(a.created_at) }, log));
   } catch (error) {
     const e = error as GatewayError;
     if (e.kind === "refused" || e.kind === "bad_request") {
@@ -233,6 +238,8 @@ export async function checkAccount(db: Db, gateway: Mt5Gateway | null, accountId
         checks, a.id,
       ]);
       if (r.affectedRows !== 1) return false;
+      // Never opened: the passwords kept for it go too.
+      await forgetMt5Passwords(conn, a.id);
       await writeAudit(conn, SYSTEM, { action: "mt5.account.create_failed", entityType: "client", entityId: a.client_id, meta: { ...meta, reason: "not_found" } });
       return true;
     });

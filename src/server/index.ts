@@ -4,7 +4,9 @@ import { createDb } from "./lib/db";
 import { createLogger } from "./lib/logger";
 import { startSupportEventSender } from "./lib/events";
 import { smtpTransport, startEmailSender } from "./lib/mailer";
+import { startMt5DealSync } from "./mt5/deals";
 import { httpGateway } from "./mt5/gateway";
+import { startMt5Reconciliation } from "./mt5/reconcile";
 import { startMt5Resolver } from "./mt5/resolver";
 
 const config = loadConfig();
@@ -17,6 +19,8 @@ const app = createApp({ db, config, log, fetch, mt5 });
 const stopEvents = startSupportEventSender(db, config, fetch, log);
 const stopEmails = startEmailSender(db, config, smtpTransport, log);
 const stopMt5 = startMt5Resolver(db, mt5, log);
+const stopDeals = startMt5DealSync(db, mt5, log);
+const stopRecon = startMt5Reconciliation(db, mt5, log, config.mt5ReconcileHourUtc);
 const server = app.listen(config.port, () => log.info({ port: config.port }, "CRM listening"));
 
 function shutdown(signal: string) {
@@ -24,6 +28,8 @@ function shutdown(signal: string) {
   stopEvents();
   stopEmails();
   stopMt5();
+  stopDeals();
+  stopRecon();
   server.close(() => {
     db.end().finally(() => process.exit(0));
   });

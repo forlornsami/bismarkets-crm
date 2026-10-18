@@ -142,7 +142,7 @@ describe.skipIf(!hasDb)("client MT5 API", () => {
 
   // ---------- Opening accounts ----------
 
-  it("opens a real account and the very next list shows it, with strict types and no password", async () => {
+  it("opens a real account and the very next list shows it, with strict types and its kept passwords", async () => {
     const c = await makeClient({ first: "Zara", last: "Khan" });
     await fund(c.id, 50_000);
     expect((await list(c)).body).toEqual({ success: true, real_accounts: [], demo_accounts: [] });
@@ -156,12 +156,13 @@ describe.skipIf(!hasDb)("client MT5 API", () => {
       id: login, account_id: login, login, is_demo: false, type: "real", status: "active", archived: false, package_name: "Classic", package_id: pkg.classic,
       currency: "USD", currency_type: "usd", leverage: "2000", balance: 0, equity: 0, credit: 0,
       mt5: { login, balance: 0, equity: 0, credit: 0, margin: 0, free_margin: 0, leverage: "2000", currency: "USD" },
-      server: "BISMarkets-Trade", created_at: expect.stringMatching(ISO),
+      server: "BISMarkets-Trade", created_at: expect.stringMatching(ISO), password: null, investor_password: null,
     };
+    // The opening answer does not send the passwords back (the portal shows what was typed); the list does.
     expect(res.body).toEqual({ success: true, message: "Your account is ready.", account: shown });
 
     const next = await list(c);
-    expect(next.body).toEqual({ success: true, real_accounts: [shown], demo_accounts: [] });
+    expect(next.body).toEqual({ success: true, real_accounts: [{ ...shown, password: MASTER, investor_password: INVESTOR }], demo_accounts: [] });
 
     // In MT5: the right group, leverage, name, the CRM's reference as the comment, and the passwords as typed.
     const row = (await accountRow(login))!;
@@ -472,7 +473,7 @@ describe.skipIf(!hasDb)("client MT5 API", () => {
     expect(user().leverage).toBe(500);
     expect((await accountRow(login))!.leverage).toBe(2000);
 
-    // Passwords: the master one, the investor one alone, and the investor one after the master one went through.
+    // Passwords: the master one, and the investor one. Neither is recorded as changed, since neither was confirmed.
     const pairs = (main: string, investor: string) => ({ password: main, password_confirmation: main, investor_password: investor, investor_password_confirmation: investor });
     lostThen("user.password", { kind: "unavailable" });
     expect(await change("password", pairs("Lost-Main-11!", ""))).toMatchObject(unconfirmed);
@@ -480,11 +481,8 @@ describe.skipIf(!hasDb)("client MT5 API", () => {
     lostThen("user.password", { kind: "refused", code: "invalid_password" });
     expect(await change("password", pairs("", "Lost-Inv-12!"))).toMatchObject(unconfirmed);
     expect(user().passwords.investor).toBe("Lost-Inv-12!");
-    lostThen("user.password", { kind: "unavailable" }, (r) => r.type === "investor");
-    expect(await change("password", pairs("Lost-Main-13!", "Lost-Inv-13!"))).toMatchObject(unconfirmed);
-    expect(user().passwords).toEqual({ main: "Lost-Main-13!", investor: "Lost-Inv-13!" });
     const audits = await rows<{ meta_json: { main: boolean; investor: boolean } }>(env.db, "SELECT meta_json FROM audit_log WHERE action = 'mt5.account.password_changed' AND entity_id = ?", [String(c.id)]);
-    expect(audits.map((a) => [a.meta_json.main, a.meta_json.investor])).toEqual([[true, false]]);
+    expect(audits).toEqual([]);
   });
 
   it("asks MT5 on a restore or a leverage the row already shows, so what a lost answer changed can be put right", async () => {
@@ -558,40 +556,38 @@ describe.skipIf(!hasDb)("client MT5 API", () => {
     expect(inv.status).toBe(200);
     expect(inv.body).toEqual({ success: true, message: "Password changed." });
     expect(fake.user("live", Number(login))!.passwords).toEqual({ main: MASTER, investor: "New-Inv-12!" });
-    expect((await change(pairs("New-Main-12!", "Other-Inv-3?"))).status).toBe(200);
-    expect(fake.user("live", Number(login))!.passwords).toEqual({ main: "New-Main-12!", investor: "Other-Inv-3?" });
+    // The portal's body when only the master one changes: the investor one sent back as the list shows it.
+    expect((await change(pairs("New-Main-12!", "New-Inv-12!"))).status).toBe(200);
+    expect(fake.user("live", Number(login))!.passwords).toEqual({ main: "New-Main-12!", investor: "New-Inv-12!" });
 
-    // MT5 turns the master password down: nothing else is sent.
+    // Both new at once, as a page with an out-of-date list sends: refused before MT5 is asked.
     const sentBefore = fake.callsTo("user.password").length;
     const sentSince = () => fake.callsTo("user.password").slice(sentBefore).map((x) => x.req.type);
+    expect((await change(pairs("Third-Main-4!", "Third-Inv-4!"))).body.errors).toEqual({
+      password: ["Your account's passwords have changed since this page was opened. Reload the page and try again."],
+    });
+    expect(sentSince()).toEqual([]);
+
+    // MT5 turns a password down.
     fake.failNext("user.password", { kind: "refused", code: "invalid_password" });
-    const weak = await change(pairs("Third-Main-4!", "Third-Inv-4!"));
-    expect(weak.status).toBe(422);
-    expect(weak.body.errors).toEqual({ password: ["MT5 did not accept this password. Choose a different one."] });
-    expect(sentSince()).toEqual(["main"]);
+    expect((await change(pairs("Third-Main-4!", ""))).body.errors).toEqual({ password: ["MT5 did not accept this password. Choose a different one."] });
     fake.failNext("user.password", { kind: "refused", code: "invalid_password" });
     expect((await change(pairs("", "Third-Inv-4!"))).body.errors).toEqual({ investor_password: ["MT5 did not accept this password. Choose a different one."] });
     fake.failNext("user.password", { kind: "refused", code: "mt5_error" });
     expect((await change(pairs("Third-Main-4!", ""))).body.errors).toEqual({ mt5: ["We could not make this change. Please try again later."] });
-
-    // The investor password fails after the master one went through: the client is told exactly that.
-    const mainOk = fake.callsTo("user.password").length;
-    fake.failNext("user.password", { kind: "refused", code: "invalid_password" }, 1, (r) => r.type === "investor");
-    const res = await change(pairs("Fourth-Main-5!", "Fourth-Inv-5!"));
-    expect(res.status).toBe(422);
-    expect(res.body.errors).toEqual({ investor_password: ["Your master password was changed, but the investor password was not. Please try again."] });
-    expect(fake.callsTo("user.password").slice(mainOk).map((x) => x.req.type)).toEqual(["main", "investor"]);
-    expect(fake.user("live", Number(login))!.passwords).toEqual({ main: "Fourth-Main-5!", investor: "Other-Inv-3?" });
+    expect(sentSince()).toEqual(["main", "investor", "main"]);
+    expect(fake.user("live", Number(login))!.passwords).toEqual({ main: "New-Main-12!", investor: "New-Inv-12!" });
     // Lost twice over: 409, after one more try.
-    fake.failNext("user.password", { kind: "unknown-before" }, 2, (r) => r.type === "investor");
-    const lost = await change(pairs("Fifth-Main-6!", "Fifth-Inv-6!"));
+    fake.failNext("user.password", { kind: "unknown-before" }, 2);
+    const lost = await change(pairs("", "Fifth-Inv-6!"));
     expect(lost.status).toBe(409);
     expect(lost.body).toEqual({ message: UNCONFIRMED });
+    expect(sentSince()).toEqual(["main", "investor", "main", "investor", "investor"]);
 
     const audits = await rows<{ meta_json: { main: boolean; investor: boolean } }>(env.db, "SELECT meta_json FROM audit_log WHERE action = 'mt5.account.password_changed' AND entity_id = ? ORDER BY id", [String(c.id)]);
-    expect(audits.map((a) => [a.meta_json.main, a.meta_json.investor])).toEqual([[false, true], [true, true], [true, false], [true, false]]);
+    expect(audits.map((a) => [a.meta_json.main, a.meta_json.investor])).toEqual([[false, true], [true, false]]);
     const everything = JSON.stringify(await rows(env.db, "SELECT * FROM audit_log")) + JSON.stringify(fake.calls);
-    for (const p of ["New-Inv-12!", "New-Main-12!", "Other-Inv-3?", "Third-Main-4!", "Fourth-Main-5!", "Fourth-Inv-5!", "Fifth-Main-6!"]) expect(everything).not.toContain(p);
+    for (const p of ["New-Inv-12!", "New-Main-12!", "Third-Main-4!", "Third-Inv-4!", "Fifth-Inv-6!"]) expect(everything).not.toContain(p);
   });
 
   it("limits password changes to 10 an hour", async () => {

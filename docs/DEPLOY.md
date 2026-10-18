@@ -414,7 +414,25 @@ in the MT5 Manager terminal:
 6. A deal's time in the CRM matches the terminal once the UTC offset is applied
    (`GATEWAY_SERVER_X_TZ_OFFSET_MINUTES`).
 7. `user/logins?group=` lists the group's accounts (the CRM uses it to find an
-   account whose creation answer was lost).
+   account whose creation answer was lost, and the nightly check uses it to
+   find MT5 accounts in a package group that no client is linked to).
+8. A staff credit change in and out, approved by a second person: one credit
+   deal each (action 3) with comment `BIS-S…`, the credit shown in the terminal,
+   and a credit removal larger than the free margin refused (`trade/balance`
+   with `type=3`, a negative amount, `check_margin`; the deal's amount in
+   `Profit`). A staff balance change gives a balance deal (action 2) the same way.
+9. Closed trades in the CRM (staff account page, and the portal's trade
+   history) match the terminal's history for a full close, a partial close and,
+   on a netting group, a reversal (`deal/get_page`: how many deals one page
+   returns, `Entry`, `PositionID`, `TimeMsc`). The CRM shows a reversal as two
+   trades under the same position id: the part it closed, ending at the INOUT
+   deal, and, once it is closed in turn, the remainder it opened the other way,
+   from the INOUT deal's price and time. All of the INOUT deal's commission and
+   fee are on the part it closed; check that the terminal and the broker's
+   statements show them the same way.
+10. The Passwords panel in the portal and app shows the passwords the client
+   chose and, after a change or a staff reset, the new one; each signs in to the
+   MT5 terminal.
 
 **Running it.**
 
@@ -437,3 +455,14 @@ in the MT5 Manager terminal:
 - Upgrading: copy the new `gateway.mjs` as above and restart the gateway. It
   finishes the operations already sent to MT5 first; an answer lost anyway shows
   in the CRM as an unknown outcome that the resolver settles.
+  Upgrade the gateway before (or with) the CRM: an older gateway refuses fields
+  a newer CRM sends (such as a credit change's type), and those changes would
+  wait as unknown until the resolver marks them failed.
+- The nightly check (`CRM_MT5_RECONCILE_HOUR_UTC`, default 2) only reads MT5.
+  Its findings are on the staff panel's Reconciliation page, with open critical
+  ones counted on the dashboard. The first run on accounts that traded before
+  the CRM may raise many warnings (older balance deals without a `BIS-`
+  reference, MT5 accounts not linked to a client); review and resolve them once.
+- The panel's passwords come from what clients set through the portal, the app
+  or a staff reset. A password a client changes in the MT5 terminal itself is
+  not seen by the CRM.

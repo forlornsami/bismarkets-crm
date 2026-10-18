@@ -12,6 +12,7 @@ import {
   Network,
   Package,
   Palette,
+  Scale,
   ScrollText,
   ServerCog,
   Shield,
@@ -34,6 +35,7 @@ import { api } from "../lib/api";
 import { useLogo } from "../lib/branding";
 import { useCan, useSession } from "../lib/session";
 import { useDepositsForMe, useWithdrawalsForMe } from "../components/money";
+import { useReconSummary } from "../lib/mt5";
 import { useKycSummary } from "./Kyc";
 
 interface NavItem {
@@ -44,7 +46,7 @@ interface NavItem {
   /** Shown when the staff member holds any one of these. */
   anyOf?: string[];
   soon?: boolean;
-  badge?: "kyc" | "deposits" | "withdrawals";
+  badge?: "kyc" | "deposits" | "withdrawals" | "reconciliation";
 }
 
 const NAV: { title: string; items: NavItem[] }[] = [
@@ -62,6 +64,7 @@ const NAV: { title: string; items: NavItem[] }[] = [
       { href: "/deposits", label: "Deposits", icon: ArrowDownToLine, permission: "deposit.view", badge: "deposits" },
       { href: "/withdrawals", label: "Withdrawals", icon: ArrowUpFromLine, permission: "withdrawal.view", badge: "withdrawals" },
       { href: "/transfers", label: "Transfers", icon: ArrowLeftRight, permission: "wallet.view" },
+      { href: "/reconciliation", label: "Reconciliation", icon: Scale, anyOf: ["wallet.reconcile", "wallet.view"], badge: "reconciliation" },
     ],
   },
   {
@@ -112,10 +115,13 @@ export function Layout({ children, onSignedOut }: { children: ReactNode; onSigne
   // Money badges count only what this staff member can act on.
   const depositsForMe = useDepositsForMe();
   const withdrawalsForMe = useWithdrawalsForMe();
+  // Open critical reconciliation issues, for those who can resolve them.
+  const reconcileForMe = useReconSummary(can("wallet.reconcile")).data?.open.critical ?? 0;
   const counts: Record<NonNullable<NavItem["badge"]>, { n: number; title: string }> = {
     kyc: { n: kycWaiting, title: "waiting for review" },
     deposits: { n: depositsForMe, title: "deposits waiting for you" },
     withdrawals: { n: withdrawalsForMe, title: "withdrawals waiting for you" },
+    reconciliation: { n: can("wallet.reconcile") ? reconcileForMe : 0, title: "open critical reconciliation issues" },
   };
   const [location] = useLocation();
   const logo = useLogo();

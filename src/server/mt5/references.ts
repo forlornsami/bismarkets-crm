@@ -8,8 +8,8 @@ import { MT5_REFERENCE } from "../../gateway/protocol";
 // Crockford base32 without I, L, O and U, as in money/references.ts.
 const ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
-/** A account, T transfer, D demo funding or top-up. */
-export type Mt5ReferenceKind = "A" | "T" | "D";
+/** A account, T transfer, D demo funding or top-up, S staff balance or credit change. */
+export type Mt5ReferenceKind = "A" | "T" | "D" | "S";
 
 /** "BIS-A7K3M9Q2X": 13 characters, well under MT5's comment limit, and matched by the gateway's MT5_REFERENCE. */
 export function mt5Reference(kind: Mt5ReferenceKind): string {

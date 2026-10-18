@@ -8,8 +8,8 @@ import { one, rows } from "../../lib/db";
 import { handler } from "../../lib/http";
 import { RateLimiter } from "../../lib/rateLimit";
 import { mt5Unavailable } from "../../mt5/errors";
-import { opFromDb, runBalanceOp, SELECT_OP, TO_MT5_FAILED, type BalanceOpRow } from "../../mt5/operations";
-import { presentTransfer, settledOp, startTransfer, type TransferPurpose } from "../../mt5/transfers";
+import { opFromDb, SELECT_OP, TO_MT5_FAILED, type BalanceOpRow } from "../../mt5/operations";
+import { makeTransfer, presentTransfer, type TransferPurpose } from "../../mt5/transfers";
 
 // The portal and app's transfers between the wallet and MT5 accounts, and
 // their history. Answers: 200 when MT5 made the deal, 202 when its answer was
@@ -71,13 +71,12 @@ export function clientTransfersRouter(deps: AppDeps): Router {
     handler(async (req, res) => {
       const client = clientOf(req);
       const body = bodyOf(req);
-      const started = await startTransfer(
+      const op = await makeTransfer(
         { db, mt5, log },
         { clientId: client.id, purpose, account: body.mt5_account_id, amount: body.amount, ip: req.clientIp, audit: auditContext(req, clientActor(client)) },
+        () => transfers.take(String(client.id)),
       );
-      if (started.repeat) return answer(res, await settledOp(db, started.opId));
-      transfers.take(String(client.id));
-      answer(res, await runBalanceOp({ db, mt5, log }, started.opId));
+      answer(res, op);
     });
 
   router.post("/transfer/wallet-to-mt5", auth, noImpersonation, gate, transfer("wallet_to_mt5"));

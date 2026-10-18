@@ -3,9 +3,10 @@ import { GatewayError, type Mt5Gateway } from "../../src/server/mt5/gateway";
 
 // An in-memory MT5 gateway for tests: every operation, with the same rules
 // as the real gateway (server and group allow-lists, the leverage list, the
-// BIS- comment format, a balance deal that is never made twice for one
-// comment, no_money when check_margin would leave the account short), plus
-// faults on demand and helpers to look inside.
+// BIS- comment format, a balance or credit deal that is never made twice for
+// one comment, credit for live accounts only, the per-operation cap, money out
+// only with check_margin, no_money when check_margin would leave the account
+// short), plus faults on demand and helpers to look inside.
 
 export type Fault =
   | { kind: "refused"; code: GatewayError["code"]; message?: string }
@@ -53,10 +54,12 @@ export class FakeGateway implements Mt5Gateway {
   readonly calls: FakeCall[] = [];
   /** Per-operation cap for one balance deal, in cents, like GATEWAY_MAX_OP_CENTS. */
   maxOpCents = 10_000_000;
+  /** The most logins users.list lists for one group, like the real gateway's 100,000. */
+  maxListLogins = 100_000;
   /** Every call answers "unavailable" while true (the gateway is down). */
   down = false;
   private faults = new Map<OpName, { fault: Fault; when?: (req: Record<string, unknown>) => boolean }[]>();
-  private pauses = new Map<OpName, { reached: () => void; released: Promise<void> }[]>();
+  private pauses = new Map<OpName, { reached: () => void; released: Promise<void>; answered: boolean }[]>();
   private nextLogin = 500_001;
   private nextTicket = 9_000_001;
 
@@ -82,14 +85,17 @@ export class FakeGateway implements Mt5Gateway {
   /**
    * Holds the next call of `op` until `release()`. `reached` resolves when
    * the call arrives, so a test can line up a second request behind it.
+   * With `answered`, MT5 has already done it and the answer is held on its
+   * way back, so a test can change things between what MT5 said and what
+   * the caller does with it.
    */
-  pause(op: OpName) {
+  pause(op: OpName, opts: { answered?: boolean } = {}) {
     let reached!: () => void;
     let release!: () => void;
     const arrived = new Promise<void>((resolve) => (reached = resolve));
     const released = new Promise<void>((resolve) => (release = resolve));
     const list = this.pauses.get(op) ?? [];
-    list.push({ reached, released });
+    list.push({ reached, released, answered: opts.answered ?? false });
     this.pauses.set(op, list);
     return { reached: arrived, release };
   }
@@ -146,7 +152,7 @@ export class FakeGateway implements Mt5Gateway {
     const body = req as Record<string, unknown>;
     this.calls.push({ op, req: Object.fromEntries(Object.entries(body).map(([k, v]) => [k, /password/i.test(k) ? "***" : v])) });
     const pause = this.pauses.get(op)?.shift();
-    if (pause) {
+    if (pause && !pause.answered) {
       pause.reached();
       await pause.released;
     }
@@ -159,6 +165,10 @@ export class FakeGateway implements Mt5Gateway {
     if (fault?.kind === "bad_request") throw new GatewayError("bad_request", "bad_request", "The gateway refused the request.");
     if (fault?.kind === "unknown-before") throw new GatewayError("unknown", "timeout", "MT5 did not answer in time.");
     const result = this.apply(op, body) as Ops[K]["res"];
+    if (pause?.answered) {
+      pause.reached();
+      await pause.released;
+    }
     if (fault?.kind === "unknown-after") throw new GatewayError("unknown", "timeout", "MT5 did not answer in time.");
     return structuredClone(result);
   }
@@ -226,24 +236,35 @@ export class FakeGateway implements Mt5Gateway {
         const u = this.allowedUser(server, r.login);
         const amount = Number(r.amountCents);
         const comment = String(r.comment);
+        if (r.type !== undefined && r.type !== "balance" && r.type !== "credit") this.badRequest();
+        const credit = r.type === "credit";
+        const action = credit ? 3 : 2;
         if (!MT5_REFERENCE.test(comment) || !Number.isSafeInteger(amount) || amount === 0) this.badRequest();
+        if (amount < 0 && !r.checkMargin) this.badRequest();
+        // Credit goes to live accounts only.
+        if (credit && !this.servers.get(server)!.groups.includes(u.group)) this.badRequest();
+        // Never twice for one comment: a repeat answers the first deal, and another deal with the comment is an unknown outcome.
+        const earlier = this.deals.find((d) => d.server === server && d.login === u.login && d.comment === comment && (d.action === 2 || d.action === 3));
+        if (earlier && earlier.action === action && earlier.profitCents === amount) return { ticket: earlier.ticket, duplicate: true };
+        if (earlier) throw new GatewayError("unknown", "mt5_error", "MT5 already has a deal with this comment, but not as this operation.");
         if (Math.abs(amount) > this.maxOpCents) throw new GatewayError("refused", "over_limit", "Above the gateway's per-operation cap.");
-        // Never twice for one comment: a repeat answers the first deal.
-        const earlier = this.deals.find((d) => d.server === server && d.login === u.login && d.action === 2 && d.comment === comment);
-        if (earlier) return { ticket: earlier.ticket, duplicate: true };
         if (r.checkMargin && amount < 0) {
           const f = this.figures(u);
-          if (u.balanceCents + amount < 0 || f.marginFreeCents + amount < 0) throw new GatewayError("refused", "no_money", "10019 Not enough money");
+          const left = (credit ? u.creditCents : u.balanceCents) + amount;
+          if (left < 0 || f.marginFreeCents + amount < 0) throw new GatewayError("refused", "no_money", "10019 Not enough money");
         }
-        u.balanceCents += amount;
-        const deal = this.makeDeal(server, u.login, amount, comment, 2);
+        if (credit) u.creditCents += amount;
+        else u.balanceCents += amount;
+        const deal = this.makeDeal(server, u.login, amount, comment, action);
         this.deals.push(deal);
         return { ticket: deal.ticket, duplicate: false };
       }
       case "deal.find": {
         const u = this.allowedUser(server, r.login);
         const from = Date.parse(String(r.from));
-        const deal = this.deals.find((d) => d.server === server && d.login === u.login && d.comment === r.comment && Date.parse(d.timeUtc) >= from);
+        // A balance or credit deal first, as the real gateway prefers them.
+        const matches = this.deals.filter((d) => d.server === server && d.login === u.login && d.comment === r.comment && Date.parse(d.timeUtc) >= from);
+        const deal = matches.find((d) => d.action === 2 || d.action === 3) ?? matches[0];
         return { deal: deal ? this.publicDeal(deal) : null };
       }
       case "deals.page": {
@@ -253,6 +274,16 @@ export class FakeGateway implements Mt5Gateway {
         const offset = Number(r.offset ?? 0);
         const limit = Math.min(1000, Number(r.limit ?? 1000));
         return { total: list.length, deals: list.slice(offset, offset + limit).map((d) => this.publicDeal(d)) };
+      }
+      case "users.list": {
+        const group = String(r.group);
+        this.assertGroup(server, group);
+        const limit = Number(r.limit);
+        if (!Number.isInteger(limit) || limit < 1 || limit > 1000) this.badRequest();
+        const logins = [...this.users.values()].filter((u) => u.server === server && u.group === group).map((u) => u.login).sort((a, b) => a - b);
+        if (logins.length > this.maxListLogins) throw new GatewayError("refused", "limit_reached", "The group has more accounts than the gateway lists.");
+        const after = r.after === undefined ? 0 : Number(r.after);
+        return { total: logins.length, logins: logins.filter((l) => l > after).slice(0, limit) };
       }
     }
     return this.badRequest();

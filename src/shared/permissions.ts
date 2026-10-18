@@ -191,7 +191,7 @@ const viewOnly = ALL_PERMISSIONS.filter(
  * these an Admin cannot create or take over a finance account either. Rejecting stays allowed.
  */
 export const ADMIN_KEEPS_OUT_OF: readonly Permission[] = [
-  "deposit.process", "deposit.approve_large", "withdrawal.process", "withdrawal.approve", "withdrawal.pay", "wallet.adjust", "ib.payout",
+  "deposit.process", "deposit.approve_large", "withdrawal.process", "withdrawal.approve", "withdrawal.pay", "wallet.adjust", "ib.payout", "mt5.balance.adjust",
 ];
 
 // System roles are seeded by `cli seed-roles`. Super Admin always holds every
@@ -229,7 +229,7 @@ export const DEFAULT_ROLES: readonly DefaultRole[] = [
       "client.view", "client.view_all", "kyc.view",
       "deposit.view", "deposit.proof", "deposit.process", "deposit.approve_large", "deposit.reject",
       "withdrawal.view", "withdrawal.process", "withdrawal.approve", "withdrawal.reject", "withdrawal.pay",
-      "wallet.view", "wallet.adjust", "wallet.reconcile", "mt5.view", "ib.view", "ib.payout",
+      "wallet.view", "wallet.adjust", "wallet.reconcile", "mt5.view", "mt5.balance.adjust", "ib.view", "ib.payout",
       "report.view", "report.finance", "report.export", "payment.manage", "audit.view",
     ],
   },

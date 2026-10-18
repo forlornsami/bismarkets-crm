@@ -16,7 +16,7 @@ import { accountFromDb, SELECT_ACCOUNT, withAccountLock, writeSnapshot, type Acc
 import { callMt5, callMt5Again, staffMt5Error } from "../../mt5/errors";
 import { GatewayError, type Mt5Gateway } from "../../mt5/gateway";
 import { opFromDb, SELECT_OP, type BalanceOpRow } from "../../mt5/operations";
-import { generateMt5Password } from "../../mt5/passwords";
+import { changeMt5Password, generateMt5Password } from "../../mt5/passwords";
 import { loadMt5Settings, type Mt5Settings, type ServerRow } from "../../mt5/settings";
 import { requirePermission, requireStepUp, staffActor, staffOf, type StaffContext } from "../../staff/session";
 import { anyPermission } from "./money";
@@ -63,6 +63,13 @@ const settingsBody = z
     demoMaxTopupCents: limitCents.optional(),
     demoMaxBalanceCents: limitCents.optional(),
     maxTransferCents: limitCents.optional(),
+    // 0 is allowed: then every staff balance or credit change needs a second person.
+    adjustSecondApprovalCents: z
+      .number({ invalid_type_error: "Enter the amount in cents, as a whole number" })
+      .int("Enter the amount in cents, as a whole number")
+      .min(0, "The amount cannot be below zero")
+      .max(MAX_AMOUNT_MINOR, "This amount is too large")
+      .optional(),
   })
   .strict();
 type SettingsBody = z.infer<typeof settingsBody>;
@@ -70,6 +77,7 @@ type SettingKey = keyof SettingsBody;
 const SETTING_COLUMNS: Record<SettingKey, string> = {
   demoServerCode: "demo_server_code", demoGroup: "demo_group", leverages: "leverages", maxLiveAccounts: "max_live_accounts", maxDemoAccounts: "max_demo_accounts",
   demoMaxOpeningCents: "demo_max_opening_cents", demoMaxTopupCents: "demo_max_topup_cents", demoMaxBalanceCents: "demo_max_balance_cents", maxTransferCents: "max_transfer_cents",
+  adjustSecondApprovalCents: "adjust_second_approval_cents",
 };
 
 const reasonField = plain(5, 300, "reason");
@@ -304,6 +312,7 @@ export function staffMt5Router(deps: AppDeps): Router {
       demoMaxTopupCents: s.demoMaxTopupCents,
       demoMaxBalanceCents: s.demoMaxBalanceCents,
       maxTransferCents: s.maxTransferCents,
+      adjustSecondApprovalCents: s.adjustSecondApprovalCents,
       gatewayConfigured: mt5 !== null,
       updatedAt: s.updatedAt.toISOString(),
       updatedBy: by ? { id: Number(by.id), name: by.name } : null,
@@ -330,6 +339,7 @@ export function staffMt5Router(deps: AppDeps): Router {
         const current: Required<SettingsBody> = {
           demoServerCode: s.demoServerCode, demoGroup: s.demoGroup, leverages: s.leverages, maxLiveAccounts: s.maxLiveAccounts, maxDemoAccounts: s.maxDemoAccounts,
           demoMaxOpeningCents: s.demoMaxOpeningCents, demoMaxTopupCents: s.demoMaxTopupCents, demoMaxBalanceCents: s.demoMaxBalanceCents, maxTransferCents: s.maxTransferCents,
+          adjustSecondApprovalCents: s.adjustSecondApprovalCents,
         };
         const next = { ...current, ...Object.fromEntries(Object.entries(body).filter(([, v]) => v !== undefined)) } as Required<SettingsBody>;
         next.leverages = [...new Set(next.leverages)];
@@ -552,7 +562,9 @@ export function staffMt5Router(deps: AppDeps): Router {
     }),
   );
 
-  // A new password made here, set in MT5 and shown once. It is not kept anywhere, and the audit names only which one.
+  // A new password made here, set in MT5 and shown to staff this once. It is kept sealed for the client's own
+  // portal and app, as theirs are, and never shown in this API again; the audit names only which one. A lost
+  // answer leaves that password not available to the client until it is set again.
   router.post(
     "/accounts/:id/password",
     requirePermission("mt5.password"),
@@ -561,17 +573,19 @@ export function staffMt5Router(deps: AppDeps): Router {
       const { type } = parse(passwordBody, req.body ?? {});
       const password = generateMt5Password();
       const login = await change(req, async (a, gateway) => {
-        await callMt5Again(gateway, "user.password", { server: a.server_code, login: a.login, type, password }, log);
-        await transaction(db, async (conn) => {
-          await lockClient(conn, a.client_id);
-          await writeAudit(conn, ctx(req), { action: "mt5.account.password_reset", entityType: "client", entityId: a.client_id, meta: { accountId: a.id, login: a.login, type } });
-          // The client hears of it in the bell, so a reset they did not ask for does not go unnoticed.
-          await notifyClient(conn, a.client_id, {
-            type: "security",
-            title: "Your trading account password was reset",
-            body: `Our team set a new ${type === "main" ? "master" : "investor"} password for MT5 account ${a.login}. If you did not ask for this, contact support straight away.`,
-          });
-        });
+        await changeMt5Password(
+          db, config, { account: a, type, password, by: "staff" },
+          () => callMt5Again(gateway, "user.password", { server: a.server_code, login: a.login, type, password }, log),
+          async (conn) => {
+            await writeAudit(conn, ctx(req), { action: "mt5.account.password_reset", entityType: "client", entityId: a.client_id, meta: { accountId: a.id, login: a.login, type } });
+            // The client hears of it in the bell, so a reset they did not ask for does not go unnoticed.
+            await notifyClient(conn, a.client_id, {
+              type: "security",
+              title: "Your trading account password was reset",
+              body: `Our team set a new ${type === "main" ? "master" : "investor"} password for MT5 account ${a.login}. You can see it in the account's details. If you did not ask for this, contact support straight away.`,
+            });
+          },
+        );
         return String(a.login);
       });
       res.json({ login, type, password });

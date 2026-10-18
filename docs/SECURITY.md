@@ -313,10 +313,11 @@ review that kind of request.
   Deposit methods, payout types, minimums and the rupee rate need
   `payment.manage` and 2FA. One change moves the rupee rate by at most 20%.
 - Whoever manages staff accounts does not approve or pay money: the Admin role
-  does not hold the deposit, withdrawal, wallet adjustment and IB payout
-  approval permissions (a Super Admin can add them back). Combined with the
-  rule that nobody grants or resets a role whose permissions they do not hold,
-  an Admin cannot create or take over a finance account to give both approvals.
+  does not hold the deposit, withdrawal, wallet adjustment, IB payout and MT5
+  balance and credit change permissions, which Finance Managers hold (a Super
+  Admin can add them back). Combined with the rule that nobody grants or
+  resets a role whose permissions they do not hold, an Admin cannot create or
+  take over a finance account to give both approvals.
 
 **Where clients pay.** A deposit method's account details cannot change while
 deposits paid to it wait for review (add a new method instead). A crypto
@@ -433,3 +434,33 @@ goes to the CRM for staff only; the CRM shows clients its own words.
 24-hour credit count (one number per minute per server), locks (one per
 operation in flight) and MT5 answers (8 MB each) all have fixed limits, so no
 caller can make the gateway grow without end.
+
+## Clients' MT5 passwords
+
+The owner chose to keep clients' MT5 master and investor passwords so the
+portal and app can show them again, as the old CRM did. Whoever has one can
+sign in to that trading account (the investor one can only watch), so:
+
+- They are kept only in `mt5_account_passwords`, a table of their own, so no
+  query on `mt5_accounts` can return one. Each is sealed with AES-256-GCM under
+  the data key and bound to its account, client and type: a value copied to
+  another row does not open, and shows as not available.
+- Only the client's own session sees them, in the account list. Staff viewing
+  as the client get none (the panel says not available), and they never appear
+  in the staff API, the admin, the audit log, the logs, events to Support,
+  emails or exports. Answers that carry them are not cached (`no-store`).
+  A stolen client session would reveal them; that is the trade-off accepted.
+- Staff never read a kept password. A staff reset makes a new one, shows it to
+  that staff member once and keeps it for the client; the audit names only
+  which password was reset.
+- A kept password is taken out while a change is on its way to MT5 and put back
+  only when MT5 says no or was never reached; MT5 confirming keeps the new one,
+  and a lost answer keeps none. So the panel shows what MT5 has, or nothing,
+  never a password that may be wrong. Passwords for an account that failed to
+  open are deleted.
+- One password changes per request. The pair a client is not changing comes as
+  empty or as the value kept now; an out-of-date value from a page loaded
+  before another change is refused instead of being set back.
+- Limit: a password the client changes in the MT5 terminal itself is not seen
+  by the CRM, so the panel keeps showing the old one until the next change
+  through the portal or app.

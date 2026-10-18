@@ -402,13 +402,27 @@ describe.skipIf(!hasDb)("MT5 end to end: CRM, gateway and MT5 over TLS", () => {
     expect((await accountRow("live", login))!.leverage).toBe(100);
   });
 
-  it("changes the master and investor passwords in MT5, and keeps neither", async () => {
+  it("changes the master and investor passwords in MT5, and the list shows the ones MT5 has", async () => {
     const { c, login } = await clientWithLive();
-    const both = await change(c, login, "password", {
-      password: NEW_MASTER, password_confirmation: NEW_MASTER, investor_password: NEW_INVESTOR, investor_password_confirmation: NEW_INVESTOR,
-    });
-    expect(both.status).toBe(200);
-    expect(both.body).toEqual({ success: true, message: "Password changed." });
+    expect((await list(c)).body.real_accounts[0]).toMatchObject({ password: MASTER, investor_password: INVESTOR });
+
+    // The portal's body for a new master password: the investor one sent back as the list shows it. Only the master one goes to MT5.
+    const before = sent(live, "/api/user/change_password");
+    const master = await change(c, login, "password", { password: NEW_MASTER, password_confirmation: NEW_MASTER, investor_password: INVESTOR, investor_password_confirmation: INVESTOR });
+    expect(master.status).toBe(200);
+    expect(master.body).toEqual({ success: true, message: "Password changed." });
+    expect(sent(live, "/api/user/change_password")).toBe(before + 1);
+    expect(live.state.users.get(login)).toMatchObject({ mainPassword: NEW_MASTER, investorPassword: INVESTOR });
+    expect((await list(c)).body.real_accounts[0]).toMatchObject({ password: NEW_MASTER, investor_password: INVESTOR });
+    // And for a new investor password, from the list read again.
+    expect((await change(c, login, "password", { password: NEW_MASTER, password_confirmation: NEW_MASTER, investor_password: NEW_INVESTOR, investor_password_confirmation: NEW_INVESTOR })).status).toBe(200);
+    expect(sent(live, "/api/user/change_password")).toBe(before + 2);
+    expect(live.state.users.get(login)).toMatchObject({ mainPassword: NEW_MASTER, investorPassword: NEW_INVESTOR });
+
+    // From a page that still has the first list: neither matches what is kept, so nothing goes to MT5 and the old master is not put back.
+    const stale = await change(c, login, "password", { password: MASTER, password_confirmation: MASTER, investor_password: OTHER_INVESTOR, investor_password_confirmation: OTHER_INVESTOR });
+    expect(stale.status).toBe(422);
+    expect(sent(live, "/api/user/change_password")).toBe(before + 2);
     expect(live.state.users.get(login)).toMatchObject({ mainPassword: NEW_MASTER, investorPassword: NEW_INVESTOR });
 
     // An empty pair is unchanged: only the investor password goes to MT5.
@@ -418,9 +432,12 @@ describe.skipIf(!hasDb)("MT5 end to end: CRM, gateway and MT5 over TLS", () => {
     expect(sent(live, "/api/user/change_password")).toBe(sends + 1);
     expect(live.state.users.get(login)).toMatchObject({ mainPassword: NEW_MASTER, investorPassword: OTHER_INVESTOR });
 
+    expect((await list(c)).body.real_accounts[0]).toMatchObject({ password: NEW_MASTER, investor_password: OTHER_INVESTOR });
+
     const recorded = await audits("mt5.account.password_changed", c.id);
     expect(recorded.map((a) => a.meta_json)).toEqual([
-      expect.objectContaining({ login, main: true, investor: true }),
+      expect.objectContaining({ login, main: true, investor: false }),
+      expect.objectContaining({ login, main: false, investor: true }),
       expect.objectContaining({ login, main: false, investor: true }),
     ]);
   });
@@ -483,6 +500,8 @@ describe.skipIf(!hasDb)("MT5 end to end: CRM, gateway and MT5 over TLS", () => {
     expect(reset.body).toEqual({ login: String(login), type: "investor", password: expect.stringMatching(/^[\x21-\x7e]{12}$/) });
     generated.push(reset.body.password);
     expect(live.state.users.get(login)).toMatchObject({ investorPassword: reset.body.password, mainPassword: MASTER });
+    // The client sees the new one in their own list; it is the one MT5 has.
+    expect((await list(c)).body.real_accounts[0]).toMatchObject({ password: MASTER, investor_password: reset.body.password });
 
     const back = await post(staff, `/api/staff/mt5/accounts/${id}/reactivate`, { reason: "Complaint resolved" });
     expect(back.status).toBe(200);
@@ -686,6 +705,8 @@ describe.skipIf(!hasDb)("MT5 end to end: CRM, gateway and MT5 over TLS", () => {
       expect(res.status, what).toBe(422);
       expect(res.body, what).toEqual({ message: UNAVAILABLE, errors: { mt5: [UNAVAILABLE] } });
     }
+    // The password change never reached MT5, so the kept one is still shown.
+    expect((await list(c)).body.real_accounts.find((a: { login: string }) => a.login === String(login))).toMatchObject({ password: MASTER, investor_password: INVESTOR });
     const topped = await topUp(c, demoLogin, 10);
     expect(topped.status).toBe(422);
     expect(topped.body).toEqual({ message: UNAVAILABLE, errors: { mt5: [UNAVAILABLE] } });
@@ -793,6 +814,8 @@ describe.skipIf(!hasDb)("MT5 end to end: CRM, gateway and MT5 over TLS", () => {
       await rows(env.db, "SELECT * FROM mt5_accounts"),
       await rows(env.db, "SELECT * FROM mt5_balance_ops"),
       await rows(env.db, "SELECT * FROM client_notifications"),
+      // Kept passwords are sealed: none of them reads as itself.
+      (await rows<{ sealed: Buffer }>(env.db, "SELECT * FROM mt5_account_passwords")).map((r) => r.sealed.toString("latin1")),
     ]);
     for (const secret of secrets) {
       expect(logs).not.toContain(secret);
