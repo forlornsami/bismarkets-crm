@@ -799,10 +799,14 @@ export function staffDepositsRouter(deps: AppDeps): Router {
           [r.id],
         );
         // The client's other deposits still waiting for a first approval become two-person too, as later ones do.
+        // A plain read is enough (every decision on this client's deposits holds the client lock taken above),
+        // and the update locks only those rows, not the whole waiting queue.
         const others = await rows<{ id: number }>(
-          conn, "SELECT id FROM deposits WHERE client_id = ? AND id <> ? AND status = 'pending' AND needs_second_approval = 0 FOR UPDATE", [r.client_id, r.id],
+          conn, "SELECT id FROM deposits WHERE client_id = ? AND id <> ? AND status = 'pending' AND needs_second_approval = 0", [r.client_id, r.id],
         );
-        if (others.length) await exec(conn, `UPDATE deposits SET needs_second_approval = 1 WHERE id IN (${others.map(() => "?").join(", ")})`, others.map((o) => o.id));
+        if (others.length) {
+          await exec(conn, `UPDATE deposits SET needs_second_approval = 1 WHERE id IN (${others.map(() => "?").join(", ")}) AND status = 'pending'`, others.map((o) => o.id));
+        }
         await appendNote(conn, "deposits", r.id, staff, "returned", body.note);
         await writeAudit(conn, ctx(req), {
           action: "deposit.returned", entityType: "client", entityId: r.client_id,
