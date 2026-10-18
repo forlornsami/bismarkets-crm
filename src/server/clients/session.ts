@@ -33,21 +33,24 @@ export async function createClientSession(
   return { token, expiresAt };
 }
 
-/** Ends sessions and tells the support service, so the app stops pushing to signed-out devices. */
-export async function revokeClientSessions(conn: Conn, config: Config, clientId: number, reason: string, exceptSessionId?: string) {
-  const live = await rows<{ id: string; kind: string }>(
+/**
+ * Ends sessions and tells the support service, so the app stops pushing to signed-out devices.
+ * `devicesOnly` leaves staff view-only sessions running: the client's own "sign out other devices"
+ * ends only what their device list shows. Returns how many of the ended sessions could still be
+ * used (not timed out), which is the count the device list showed.
+ */
+export async function revokeClientSessions(conn: Conn, config: Config, clientId: number, reason: string, exceptSessionId?: string, devicesOnly = false) {
+  const where = `client_id = ? AND revoked_at IS NULL${exceptSessionId ? " AND id <> ?" : ""}${devicesOnly ? " AND kind = 'login'" : ""}`;
+  const params = exceptSessionId ? [clientId, exceptSessionId] : [clientId];
+  const live = await rows<{ id: string; kind: string; usable: number }>(
     conn,
-    `SELECT id, kind FROM client_sessions WHERE client_id = ? AND revoked_at IS NULL AND expires_at > CURRENT_TIMESTAMP(3) ${exceptSessionId ? "AND id <> ?" : ""} FOR UPDATE`,
-    exceptSessionId ? [clientId, exceptSessionId] : [clientId],
+    `SELECT id, kind, (kind <> 'login' OR last_seen_at > CURRENT_TIMESTAMP(3) - INTERVAL ? SECOND) AS usable
+     FROM client_sessions WHERE ${where} AND expires_at > CURRENT_TIMESTAMP(3) FOR UPDATE`,
+    [Math.floor(config.clientIdleMs / 1000), ...params],
   );
-  await exec(
-    conn,
-    `UPDATE client_sessions SET revoked_at = CURRENT_TIMESTAMP(3), revoked_reason = ?
-     WHERE client_id = ? AND revoked_at IS NULL ${exceptSessionId ? "AND id <> ?" : ""}`,
-    exceptSessionId ? [reason, clientId, exceptSessionId] : [reason, clientId],
-  );
+  await exec(conn, `UPDATE client_sessions SET revoked_at = CURRENT_TIMESTAMP(3), revoked_reason = ? WHERE ${where}`, [reason, ...params]);
   for (const s of live) if (s.kind === "login") await queueSupportEvent(conn, config, { event: "session.revoked", clientId, sessionId: s.id });
-  return live.length;
+  return live.filter((s) => Number(s.usable) === 1).length;
 }
 
 /** Ends one session (sign-out, or the client removing a device). */

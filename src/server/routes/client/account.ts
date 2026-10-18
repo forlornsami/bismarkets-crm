@@ -148,7 +148,7 @@ export function clientAccountRouter(deps: AppDeps): Router {
     handler(async (req, res) => {
       const client = clientOf(req);
       const n = await transaction(db, async (conn) => {
-        const count = await revokeClientSessions(conn, config, client.id, "client_signed_out_others", client.sessionId);
+        const count = await revokeClientSessions(conn, config, client.id, "client_signed_out_others", client.sessionId, true);
         await writeAudit(conn, auditContext(req, clientActor(client)), { action: "client.other_devices_signed_out", entityType: "client", entityId: client.id, meta: { sessions: count } });
         return count;
       });

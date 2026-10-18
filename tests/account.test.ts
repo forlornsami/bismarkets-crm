@@ -117,7 +117,23 @@ describe.skipIf(!hasDb)("client notifications, devices and support events", () =
     expect((await api().delete("/api/sessions").set(auth)).status).toBe(403);
     // A staff view does not appear in the client's own device list.
     const own = await login("viewonly@client.test");
-    expect((await api().get("/api/sessions").set({ Authorization: `Bearer ${own}` })).body.data).toHaveLength(2);
+    const ownAuth = { Authorization: `Bearer ${own}` };
+    expect((await api().get("/api/sessions").set(ownAuth)).body.data).toHaveLength(2);
+
+    // Signing out other devices ends only the listed ones and counts only those: the staff
+    // view keeps running and a timed-out session is ended without being counted.
+    const idle = await login("viewonly@client.test");
+    await exec(env.db, "UPDATE client_sessions SET last_seen_at = CURRENT_TIMESTAMP(3) - INTERVAL 8 DAY WHERE id = SHA2(?, 256)", [idle]);
+    expect((await api().get("/api/sessions").set(ownAuth)).body.data).toHaveLength(2);
+    const out = await api().delete("/api/sessions").set(ownAuth);
+    expect(out.body).toMatchObject({ revoked: 1, message: "Signed out 1 other device." });
+    expect((await api().get("/api/user").set(auth)).status).toBe(200);
+    expect((await api().get("/api/sessions").set(ownAuth)).body.data).toHaveLength(1);
+    expect(await one(env.db, "SELECT id FROM client_sessions WHERE id = SHA2(?, 256) AND revoked_reason = 'client_signed_out_others'", [idle])).toBeTruthy();
+
+    // Staff ending the client's sessions still ends the view too.
+    await post(boss, `/api/staff/clients/${user.id}/revoke-sessions`, {});
+    expect((await api().get("/api/user").set(auth)).status).toBe(401);
   });
 
   it("tells support when an account is closed and reopened", async () => {
