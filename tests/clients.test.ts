@@ -102,6 +102,24 @@ describe.skipIf(!hasDb)("client portal API", () => {
     const after = await api().get("/api/user").set("Authorization", `Bearer ${token}`);
     expect(after.status).toBe(401);
     expect(after.body).toEqual({ message: "Unauthenticated." });
+
+    // An ended session asking for a withdrawal or new-address code gets 401 too, so the portal
+    // says the session expired instead of showing a sign-up error, and no email goes out.
+    const ended = { Authorization: `Bearer ${token}` };
+    const before = Number((await one<{ n: number }>(env.db, "SELECT COUNT(*) AS n FROM email_outbox"))!.n);
+    for (const [path, body] of [
+      ["/api/send-otp", { email: "jane@client.test", purpose: "withdrawal" }],
+      ["/api/send-otp", { email: "jane@client.test" }],
+      ["/api/send-otp", { email: "jane.new@client.test", type: "update_email" }],
+      ["/api/verify-otp", { email: "jane@client.test", verification_code: "123456", purpose: "withdrawal" }],
+      ["/api/verify-otp", { email: "jane.new@client.test", verification_code: "123456", purpose: "update_email" }],
+    ] as const) {
+      const res = await api().post(path).set(ended).send(body);
+      expect([path, res.status, res.body]).toEqual([path, 401, { message: "Unauthenticated." }]);
+    }
+    expect(Number((await one<{ n: number }>(env.db, "SELECT COUNT(*) AS n FROM email_outbox"))!.n)).toBe(before);
+    // A free address with no purpose is still a sign-up code, as without a token.
+    expect((await api().post("/api/send-otp").set(ended).send({ email: "fresh@client.test" })).status).toBe(200);
   });
 
   it("updates the profile and picture through the portal's calls", async () => {

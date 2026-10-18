@@ -572,6 +572,11 @@ describe.skipIf(!hasDb)("client money API", () => {
     expect(errorOf(await savePayout(cal, { ...trc, account_number: "0x52908400098527886E0F7030069857D2E4169EE7" }), "account_number")).toBe(
       "This is not a TRC20 address. A TRC20 address starts with T and has 34 characters.",
     );
+    await exec(env.db, "UPDATE payment_methods SET is_enabled = 1 WHERE id = ?", [m.wOff]);
+    expect(errorOf(await savePayout(cal, { ...trc, payment_method_id: String(m.wOff), method_name: "Binance Pay" }), "account_number")).toBe(
+      "This is not a Binance Pay ID. Enter the Binance Pay ID (6 to 12 digits).",
+    );
+    await exec(env.db, "UPDATE payment_methods SET is_enabled = 0 WHERE id = ?", [m.wOff]);
     // A bank account takes no picture: one sent anyway is ignored, not stored.
     const ignored = await savePayout(cal, { payment_method_id: String(m.wBank), method_name: "Spare", account_name: "Cal Moss", account_number: "11112222" }, await png("#444444", 300, 300));
     expect(ignored.status).toBe(201);

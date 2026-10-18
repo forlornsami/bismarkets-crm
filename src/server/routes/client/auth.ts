@@ -69,6 +69,14 @@ export function clientAuthRouter(deps: AppDeps): Router {
     });
   }
 
+  // A token that no longer works, sent for a code only a signed-in client can ask for, is an
+  // ended session: answer 401 like every signed-in route, so the portal and app ask the client
+  // to sign in again instead of showing a sign-up error. Sign-up sends no token and is unchanged.
+  function refuseEndedSession(req: Request, signedIn: unknown, requested?: string, addressTaken = false) {
+    if (!signedIn && bearerToken(req) && (requested === "withdrawal" || requested === "update_email" || addressTaken))
+      throw new HttpError(401, "UNAUTHENTICATED", "Unauthenticated.");
+  }
+
   function purposeFor(email: string, signedIn: { email: string } | null, requested?: string): CodePurpose {
     if (!signedIn) return "register";
     if (requested === "withdrawal" || requested === "update_email") return requested;
@@ -135,10 +143,14 @@ export function clientAuthRouter(deps: AppDeps): Router {
       const body = validate(z.object({ email: emailField, type: anyString, purpose: anyString }).passthrough(), req.body);
       const signedIn = await optionalClient(req);
       if (signedIn?.kind === "impersonation") throw new HttpError(403, "VIEW_ONLY", "This is a view-only staff session. Changes are not allowed.");
+      refuseEndedSession(req, signedIn, body.purpose ?? body.type);
       const purpose = purposeFor(body.email, signedIn, body.purpose ?? body.type);
       // A withdrawal code always goes to the client's own address, whatever the form sent.
       const email = purpose === "withdrawal" ? signedIn!.email : body.email;
-      if (purpose !== "withdrawal" && (await emailTaken(email))) throw fieldError("email", "The email has already been taken.");
+      if (purpose !== "withdrawal" && (await emailTaken(email))) {
+        refuseEndedSession(req, signedIn, undefined, true);
+        throw fieldError("email", "The email has already been taken.");
+      }
       // A signed-in client's codes are theirs alone: counted, replaced and checked per client,
       // so another client asking for codes to the same address cannot cancel or block them.
       const key = signedIn ? `${purpose}:client:${signedIn.id}` : `${purpose}:${email}`;
@@ -179,6 +191,7 @@ export function clientAuthRouter(deps: AppDeps): Router {
       const signedIn = await optionalClient(req);
       // A wrong guess counts against the client's code, so a view-only session may not make one.
       if (signedIn?.kind === "impersonation") throw new HttpError(403, "VIEW_ONLY", "This is a view-only staff session. Changes are not allowed.");
+      refuseEndedSession(req, signedIn, body.purpose ?? body.type);
       // Without a session only a sign-up code can be checked. Withdrawal and new-email codes
       // need the client's own session and only their own code counts, so a stranger who
       // knows an address cannot use up its codes with wrong guesses.

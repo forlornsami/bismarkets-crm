@@ -436,7 +436,7 @@ export const payoutFields = ({ kind, network }: { kind: "bank" | "crypto"; netwo
         // Saved under the wrong network, an address would be paid on the wrong chain.
         .refine(
           (v) => kind !== "crypto" || !network || NETWORK_ADDRESS[network].pattern.test(v),
-          network ? `This is not a ${NETWORK_LABELS[network]} ${network === "binance_pay" ? "Pay ID" : "address"}. ${NETWORK_ADDRESS[network].message}` : "",
+          network ? `This is not a ${network === "binance_pay" ? "Binance Pay ID" : `${NETWORK_LABELS[network]} address`}. ${NETWORK_ADDRESS[network].message}` : "",
         ),
     ),
     iban: optionalText().pipe(z.string().max(64, "The IBAN can be at most 64 characters.").regex(ACCOUNT_CHARS, ACCOUNT_CHARS_MESSAGE)),
