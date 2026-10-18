@@ -185,7 +185,8 @@ export function staffMt5OperationsRouter(deps: AppDeps): Router {
     }),
   );
 
-  // The resolver's next step, now: search MT5 for the deal and settle the operation if the answer is clear.
+  // The resolver's search, now: a deal found settles the operation. Finding nothing changes nothing:
+  // only the resolver's own schedule, or "mark failed" with 2FA and a note, gives the money back.
   router.post(
     "/:id/check",
     requirePermission("wallet.view", "wallet.reconcile"),
@@ -195,7 +196,7 @@ export function staffMt5OperationsRouter(deps: AppDeps): Router {
       const o = await loadVisible(db, staff, id);
       if (!isOpen(o)) throw conflict(SETTLED);
       if (inFlight(o)) throw conflict("This operation is still being sent to MT5. Check it again in a couple of minutes.");
-      const { result, error } = await checkBalanceOpDetailed(db, gateway(), o.id, log);
+      const { result, error } = await checkBalanceOpDetailed(db, gateway(), o.id, log, { mayGiveUp: false });
       await auditStandalone(db, ctx(req), {
         action: "mt5.operation.checked", entityType: "client", entityId: o.client_id,
         meta: { opId: o.id, reference: o.reference, purpose: o.purpose, login: o.login, amountCents: o.amount_cents, result, ...(error ? { kind: error.kind, code: error.code } : {}) },

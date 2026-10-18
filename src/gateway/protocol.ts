@@ -88,15 +88,19 @@ export interface Mt5Deal {
 export interface Ops {
   ping: { req: { server: string }; res: { serverTime: number | null } };
   "user.get": { req: { server: string; login: number }; res: Mt5User };
-  /** Up to 100 logins; logins MT5 does not know are listed in `missing`. */
+  /** Up to 100 logins; logins MT5 does not know, or in a group the gateway does not allow, are listed in `missing`. */
   "accounts.get": { req: { server: string; logins: number[] }; res: { accounts: Mt5Account[]; missing: number[] } };
   /** Opens an account in an allowed group. `comment` is the CRM's create reference. */
   "user.create": {
     req: { server: string; group: string; leverage: number; name: string; email: string; country: string; comment: string; password: string; investorPassword: string };
     res: { login: number };
   };
-  /** Finds the account a create with this comment made, among the group's newest accounts. */
-  "user.find": { req: { server: string; group: string; comment: string }; res: { login: number | null } };
+  /**
+   * Finds the account a create with this comment made, among the group's
+   * newest accounts. With `from` (ISO), accounts MT5 registered before then
+   * cannot be it, so the search ends once it has reached them.
+   */
+  "user.find": { req: { server: string; group: string; comment: string; from?: string }; res: { login: number | null } };
   /** Changes only what is given. `enabled` false stops sign-in; `tradeDisabled` true stops trading. */
   "user.update": { req: { server: string; login: number; leverage?: number; enabled?: boolean; tradeDisabled?: boolean }; res: Mt5User };
   "user.password": { req: { server: string; login: number; type: "main" | "investor"; password: string }; res: Record<string, never> };

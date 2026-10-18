@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { ArrowDownToLine, ArrowRight, ArrowUpFromLine, BadgeCheck, Check, Clock, KeyRound, Mail, Network, ShieldCheck, UserPlus, Users, UserCog, Wallet } from "lucide-react";
+import { ArrowRight, BadgeCheck, Check, Clock, KeyRound, Mail, Network, ShieldCheck, UserPlus, Users, UserCog } from "lucide-react";
 import { Link } from "wouter";
 import { PageHeader } from "../components/ui";
 import { useKycSummary } from "./Kyc";
@@ -11,12 +11,7 @@ const greeting = () => {
   return h < 12 ? "Good morning" : h < 18 ? "Good afternoon" : "Good evening";
 };
 
-const UPCOMING = [
-  { icon: ArrowDownToLine, label: "Deposits", phase: "Phase 3" },
-  { icon: ArrowUpFromLine, label: "Withdrawals", phase: "Phase 3" },
-  { icon: Wallet, label: "MT5 accounts", phase: "Phase 3" },
-  { icon: Network, label: "IB partners", phase: "Phase 4" },
-];
+const UPCOMING = [{ icon: Network, label: "IB partners", phase: "Phase 4" }];
 
 const useStaffCount = (filter: string, enabled: boolean) =>
   useQuery({

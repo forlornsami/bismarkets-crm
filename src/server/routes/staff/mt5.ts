@@ -489,17 +489,19 @@ export function staffMt5Router(deps: AppDeps): Router {
     handler(async (req, res) => {
       const { leverage } = parse(leverageBody, req.body ?? {});
       const kept = await change(req, async (a, gateway) => {
-        if (leverage === a.leverage) return leverage;
-        // The gateway's leverage list is the last word: it refuses anything else.
+        // The gateway's leverage list is the last word: it refuses anything else. Asked even when the row
+        // already shows this leverage, so a change whose answer was lost cannot leave MT5 at another one.
         const user = await callMt5Again(gateway, "user.update", { server: a.server_code, login: a.login, leverage }, log);
-        await transaction(db, async (conn) => {
-          await lockClient(conn, a.client_id);
-          await exec(conn, "UPDATE mt5_accounts SET leverage = ? WHERE id = ?", [user.leverage, a.id]);
-          await writeAudit(conn, ctx(req), {
-            action: "mt5.account.leverage_changed", entityType: "client", entityId: a.client_id,
-            before: { leverage: a.leverage }, after: { leverage: user.leverage }, meta: { accountId: a.id, login: a.login },
+        if (user.leverage !== a.leverage) {
+          await transaction(db, async (conn) => {
+            await lockClient(conn, a.client_id);
+            await exec(conn, "UPDATE mt5_accounts SET leverage = ? WHERE id = ?", [user.leverage, a.id]);
+            await writeAudit(conn, ctx(req), {
+              action: "mt5.account.leverage_changed", entityType: "client", entityId: a.client_id,
+              before: { leverage: a.leverage }, after: { leverage: user.leverage }, meta: { accountId: a.id, login: a.login },
+            });
           });
-        });
+        }
         return user.leverage;
       });
       if (kept !== leverage) throw new HttpError(422, "MT5_DIFFERENT", `MT5 kept the leverage at 1:${kept}.`);

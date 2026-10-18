@@ -342,6 +342,44 @@ describe.skipIf(!hasDb)("staff MT5 API", () => {
     expect((await post(dealer, `/api/staff/mt5/accounts/${acct.real}/leverage`, { leverage: 2000 })).status).toBe(200);
   });
 
+  it("answers 409, never a refusal, when the retry after a lost answer fails, and asks MT5 for the leverage the row already shows", async () => {
+    const c = await makeClient();
+    const made = await clientCreate(c, { is_demo: false, account_package_id: classic, leverage: "2000", password: MASTER, investor_password: INVESTOR });
+    const login = Number(made.body.account.login);
+    const id = Number((await one<{ id: number }>(env.db, "SELECT id FROM mt5_accounts WHERE login = ? AND server_code = 'live'", [login]))!.id);
+    const user = () => fake.user("live", login)!;
+    /** MT5 makes the change but its answer is lost; the retry straight after then fails as `then` says. */
+    const lostThen = (op: "user.update" | "user.password", then: Parameters<FakeGateway["failNext"]>[1]) => {
+      fake.failNext(op, { kind: "unknown-after" });
+      fake.failNext(op, then);
+    };
+    const unconfirmed = (res: request.Response) => {
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatchObject({ code: "MT5_UNCONFIRMED", details: { kind: "unknown" } });
+    };
+    await stepUp(env, dealer);
+
+    lostThen("user.update", { kind: "unavailable" });
+    unconfirmed(await post(dealer, `/api/staff/mt5/accounts/${id}/leverage`, { leverage: 500 }));
+    expect(user().leverage).toBe(500);
+    // The row still shows 1:2000, and asking for it puts MT5 back; nothing changed in the CRM, so nothing is recorded.
+    const recorded = (await audits("mt5.account.leverage_changed")).length;
+    const back = await post(dealer, `/api/staff/mt5/accounts/${id}/leverage`, { leverage: 2000 });
+    expect(back.status).toBe(200);
+    expect(back.body.account).toMatchObject({ id, leverage: 2000 });
+    expect(user().leverage).toBe(2000);
+    expect(await audits("mt5.account.leverage_changed")).toHaveLength(recorded);
+
+    lostThen("user.update", { kind: "refused", code: "mt5_error" });
+    unconfirmed(await post(dealer, `/api/staff/mt5/accounts/${id}/suspend`, { reason: "Chargeback under review" }));
+    expect(user().enabled).toBe(false);
+    expect((await one<{ suspended_at: Date | null }>(env.db, "SELECT suspended_at FROM mt5_accounts WHERE id = ?", [id]))!.suspended_at).toBeNull();
+
+    lostThen("user.password", { kind: "refused", code: "invalid_password" });
+    unconfirmed(await post(dealer, `/api/staff/mt5/accounts/${id}/password`, { type: "main" }));
+    expect(user().passwords.main).not.toBe(MASTER);
+  });
+
   it("suspends and reactivates an account with a reason; the client sees 'suspended' and cannot undo it", async () => {
     await stepUp(env, dealer);
     expect((await post(dealer, `/api/staff/mt5/accounts/${acct.real}/suspend`, { reason: "abc" })).status).toBe(400);

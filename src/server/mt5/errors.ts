@@ -42,7 +42,9 @@ export async function callMt5<K extends OpName>(gateway: Mt5Gateway, op: K, req:
 /**
  * For changes that are safe to repeat (rights, leverage, a password): a lost
  * answer is asked once more straight away before anyone is told "unconfirmed".
- * Never for a create or a balance operation.
+ * If that second try fails too, in any way, the first answer is still the
+ * lost one: the change may have happened, so it stays unknown, never a
+ * definite no. Never for a create or a balance operation.
  */
 export async function callMt5Again<K extends "user.update" | "user.password">(
   gateway: Mt5Gateway,
@@ -54,7 +56,11 @@ export async function callMt5Again<K extends "user.update" | "user.password">(
     return await callMt5(gateway, op, req, log);
   } catch (error) {
     if (!isUnknown(error)) throw error;
-    return callMt5(gateway, op, req, log);
+    try {
+      return await callMt5(gateway, op, req, log);
+    } catch {
+      throw error;
+    }
   }
 }
 

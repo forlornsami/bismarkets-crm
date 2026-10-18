@@ -54,6 +54,10 @@ export async function setup(overrides: Record<string, string> = {}, deps: Partia
 /** A code for the current step shifted by `offset` (−1, 0 or +1 are all accepted). */
 export const codeFor = (secret: string, offset = 0) => hotp(base32Decode(secret), currentStep() + offset);
 
+const STEP_MS = 30_000;
+/** How long a sign-in's 2FA check may take at most, for the code it was made with to still be accepted. */
+const STEP_MARGIN_MS = 5_000;
+
 export const PASSWORD = "Correct-Horse-Battery-9";
 
 export async function createStaff(db: Db, email: string, roleSlug: string, opts: { status?: string; mustChange?: boolean } = {}) {
@@ -87,6 +91,11 @@ export async function signIn(env: TestEnv, email: string, password = PASSWORD): 
   if (login.status !== 200) throw new Error(`login failed ${login.status} ${JSON.stringify(login.body)}`);
   const secret: string = login.body.secret;
   if (login.body.step !== "enroll") throw new Error("expected enrollment for a new account");
+  // The code is the previous step's (so the current and next steps stay free for later sign-ins and
+  // step-ups), which the server accepts only until the current step ends: never make it in a step's
+  // last seconds, where the check could land in the next step and find it two steps old.
+  const left = STEP_MS - (Date.now() % STEP_MS);
+  if (left < STEP_MARGIN_MS) await new Promise((resolve) => setTimeout(resolve, left + 50));
   const verify = await agent.post("/api/staff/auth/verify").set("Origin", ORIGIN).send({ challenge: login.body.challenge, code: codeFor(secret, -1) });
   if (verify.status !== 200) throw new Error(`verify failed ${verify.status} ${JSON.stringify(verify.body)}`);
   const staff = await one<{ id: number }>(env.db, "SELECT id FROM staff_users WHERE email = ?", [email]);

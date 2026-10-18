@@ -249,6 +249,8 @@ select.input { padding-right: 30px; appearance: none; background-image: url("dat
 .input:disabled { background: var(--surface-sunken); color: var(--muted); cursor: not-allowed; }
 .input-small { height: 32px; padding: 0 10px; font-size: 13px; }
 select.input-small { padding-right: 28px; }
+/* A textarea as tall as its rows; the fixed height above is for one-line fields. */
+textarea.input { height: auto; padding: 8px 12px; resize: vertical; }
 .input-icon { position: relative; display: flex; align-items: center; }
 .input-icon svg { position: absolute; left: 11px; color: var(--muted); pointer-events: none; }
 .input-icon .input { padding-left: 36px; width: 100%; }
@@ -758,8 +760,6 @@ body.no-scroll { overflow: hidden; }
 .stack-tight > .badge { align-self: flex-start; }
 /* An information notice at the top of a page, spaced like .notice-warn. */
 .notice-page { margin: 0 0 18px; }
-/* A textarea as tall as its rows (a plain .input is one line high). */
-textarea.input-area { height: auto; min-height: 38px; padding: 8px 12px; line-height: 1.45; resize: vertical; }
 /* A ledger entry on the Transfers page: the account on the left, the amount on the right. */
 .ledger-amount { margin-left: auto; font-variant-numeric: tabular-nums; }
 /* A value that must not break across lines, such as a BIS- reference or an amount. */

@@ -130,8 +130,31 @@ describe("gateway retcodes", () => {
     expect(retcodeError({ code: 1012, text: "" }, { write: true })).toMatchObject({ kind: "refused", code: "auth" });
     expect(retcodeError({ code: 9, text: "Timeout" }, { write: true })).toMatchObject({ kind: "unknown", code: "timeout" });
     expect(retcodeError({ code: 7, text: "Network" }, { write: true })).toMatchObject({ kind: "unknown", code: "connection" });
-    expect(retcodeError({ code: 9, text: "Timeout" }, { write: false })).toMatchObject({ kind: "refused", code: "mt5_error" });
+    expect(retcodeError({ code: 9, text: "Timeout" }, { write: false })).toMatchObject({ kind: "unavailable", code: "timeout", retcode: 9 });
     expect(retcodeError({ code: 10019, text: "No money" }, { write: true })).toMatchObject({ kind: "refused", code: "no_money", retcode: 10019 });
+  });
+
+  it("refuses a write only for an answer that says MT5 turned it down; any other may come after MT5 made it", () => {
+    // MT5's request codes for "executed", "on its way", "timed out", "no connection", and codes nobody listed.
+    for (const code of [1, 2, 4, 10, 17, 10001, 10002, 10003, 10008, 10009, 10010, 10011, 10012, 10031, 11000, 11001, 11002, 99999]) {
+      expect(retcodeError({ code, text: "" }, { write: true }), String(code)).toMatchObject({ kind: "unknown", retcode: code });
+    }
+    expect(retcodeError({ code: 10012, text: "Request timeout" }, { write: true })).toMatchObject({ kind: "unknown", code: "timeout" });
+    expect(retcodeError({ code: 10, text: "No connection" }, { write: true })).toMatchObject({ kind: "unknown", code: "connection" });
+    const definite: Array<[number, string]> = [
+      [3, "mt5_error"], [8, "mt5_error"], [12, "too_frequent"], [13, "not_found"], [1001, "auth"], [1012, "auth"], [2005, "auth"], [3002, "mt5_error"], [3004, "login_exists"],
+      [3006, "invalid_password"], [3007, "limit_reached"], [4001, "limit_reached"], [4005, "limit_reached"], [10006, "mt5_error"], [10013, "mt5_error"], [10017, "trade_disabled"],
+      [10019, "no_money"], [10024, "limit_reached"], [10030, "mt5_error"], [10032, "mt5_error"],
+    ];
+    for (const [code, expected] of definite) expect(retcodeError({ code, text: "" }, { write: true }), String(code)).toMatchObject({ kind: "refused", code: expected, retcode: code });
+  });
+
+  it("says unavailable, not refused, when MT5 is too busy or cut off to answer a read", () => {
+    const transient: Array<[number, string]> = [[7, "connection"], [9, "timeout"], [10, "connection"], [11, "mt5_error"], [12, "too_frequent"], [15, "mt5_error"], [1018, "mt5_error"]];
+    for (const [code, expected] of transient) expect(retcodeError({ code, text: "" }, { write: false }), String(code)).toMatchObject({ kind: "unavailable", code: expected, retcode: code });
+    for (const [code, expected] of [[13, "not_found"], [3, "mt5_error"], [8, "mt5_error"], [1012, "auth"]] as const) {
+      expect(retcodeError({ code, text: "" }, { write: false }), String(code)).toMatchObject({ kind: "refused", code: expected });
+    }
   });
 });
 

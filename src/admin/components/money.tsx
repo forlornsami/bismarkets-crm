@@ -635,6 +635,10 @@ const ENTRY_LABEL: Record<string, string> = {
   withdrawal_hold: "Withdrawal requested",
   withdrawal_paid: "Withdrawal paid",
   withdrawal_release: "Withdrawal rejected, money returned",
+  transfer_hold: "Transfer to MT5 requested",
+  transfer_release: "Transfer to MT5 failed, money returned",
+  transfer_out: "Transferred to MT5",
+  transfer_in: "Transferred from MT5",
 };
 
 /** The client's USD wallet: balance, money held for withdrawals and transfers, totals and the latest ledger entries. */
@@ -648,6 +652,7 @@ export function ClientWallet({ clientId }: { clientId: number }) {
     const label = e.reference ?? `${e.sourceType} ${e.sourceId}`;
     if (e.sourceType === "deposit" && can("deposit.view", "deposit.proof")) return <Link href={`/deposits/${e.sourceId}`}>{label}</Link>;
     if (e.sourceType === "withdrawal" && can("withdrawal.view")) return <Link href={`/withdrawals/${e.sourceId}`}>{label}</Link>;
+    if (e.sourceType === "mt5_op" && can("wallet.view")) return <Link href={`/transfers/${e.sourceId}`}>{label}</Link>;
     return label;
   };
   return (

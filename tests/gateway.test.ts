@@ -317,7 +317,6 @@ describe("MT5 gateway", () => {
       const login = u.login;
       const calls = [
         () => gw.call("user.get", { server: "live", login }),
-        () => gw.call("accounts.get", { server: "live", logins: [login] }),
         () => gw.call("positions.total", { server: "live", login }),
         () => gw.call("user.update", { server: "live", login, tradeDisabled: true }),
         () => gw.call("user.password", { server: "live", login, type: "main", password: NEW_MAIN }),
@@ -327,9 +326,23 @@ describe("MT5 gateway", () => {
         () => gw.call("user.find", { server: "live", group: VIP, comment: ref("A") }),
       ];
       for (const call of calls) expect(await failure(call())).toMatchObject({ kind: "refused", code: "group_not_allowed" });
+      // A read of figures lists it as missing instead, so it costs no other account in the batch its figures.
+      expect(await gw.call("accounts.get", { server: "live", logins: [login] })).toEqual({ accounts: [], missing: [login] });
       const sent = pathsSince(fake, before);
       expect(sent.every((p) => p === "/api/user/get" || p.startsWith("/api/auth/"))).toBe(true);
       expect(fake.state.users.get(login)).toMatchObject({ rights: 0x163n, mainPassword: "Main-Pass-1", balanceCents: 0 });
+    });
+
+    it("reads the rest of a batch of figures when one account is in a group the gateway does not allow", async () => {
+      const a = fake.addUser({ group: STANDARD, balanceCents: 1_100 });
+      const b = fake.addUser({ group: VIP, balanceCents: 2_200 });
+      const c = fake.addUser({ group: STANDARD, balanceCents: 3_300 });
+      const before = fake.state.requests.length;
+      const res = await gw.call("accounts.get", { server: "live", logins: [a.login, b.login, c.login] });
+      expect(res.accounts.map((x) => [x.login, x.balanceCents])).toEqual([[a.login, 1_100], [c.login, 3_300]]);
+      expect(res.missing).toEqual([b.login]);
+      // The one outside the allow-list was looked up for its group only.
+      expect(fake.state.requests.slice(before).filter((r) => r.login === b.login).map((r) => r.path)).toEqual(["/api/user/get"]);
     });
   });
 
@@ -389,6 +402,41 @@ describe("MT5 gateway", () => {
       expect(await failure(send())).toMatchObject({ kind: "unknown", code: "mt5_error" });
       fake.faults.next("/api/trade/balance", { raw: '{"retcode":"0 Done"}' });
       expect(await failure(send())).toMatchObject({ kind: "unknown", code: "mt5_error" });
+    });
+
+    it("an answer MT5 may give after making the deal (executed, timed out, no connection) is unknown, and the repeat finds the deal", async () => {
+      for (const retcode of ["10009 Request executed", "10012 Request timeout", "10001 Request on the way", "10008 Order placed", "10 No connection", "10031 No connection", "11000 Unknown"]) {
+        const u = fake.addUser({ group: STANDARD });
+        const comment = ref("T");
+        const req = { server: "live", login: u.login, amountCents: 10_000, comment, checkMargin: false, notBefore: nowIso() };
+        fake.faults.next("/api/trade/balance", { raw: JSON.stringify({ retcode }), apply: true });
+        expect(await failure(gw.call("balance", req)), retcode).toMatchObject({ kind: "unknown", retcode: Number(retcode.split(" ")[0]) });
+        expect(dealsWith(fake, comment)).toHaveLength(1);
+        expect(await gw.call("balance", req)).toEqual({ ticket: dealsWith(fake, comment)[0]!.ticket, duplicate: true });
+        expect(fake.state.users.get(u.login)!.balanceCents).toBe(10_000);
+      }
+      // An account opening answered that way is unknown too: the CRM searches for it rather than failing it.
+      const comment = ref("A");
+      fake.faults.next("/api/user/add", { raw: '{"retcode":"10012 Request timeout"}', apply: true });
+      const create = { server: "live", group: STANDARD, leverage: 2000, name: "N", email: "n@client.test", country: "", comment, password: MAIN, investorPassword: INVESTOR };
+      expect(await failure(gw.call("user.create", create))).toMatchObject({ kind: "unknown", code: "timeout", retcode: 10012 });
+      const made = [...fake.state.users.values()].find((u) => u.comment === comment)!;
+      expect(await gw.call("user.find", { server: "live", group: STANDARD, comment })).toEqual({ login: made.login });
+    });
+
+    it("a read MT5 is too busy or cut off to answer is unavailable, to be tried again soon, never refused", async () => {
+      const u = fake.addUser({ group: STANDARD });
+      await gw.call("user.get", { server: "live", login: u.login });
+      for (const retcode of ["9 Timeout", "7 Network error", "12 Too frequent requests", "1018 Server is busy", "10 No connection"]) {
+        fake.faults.next("/api/deal/get_total", { retcode });
+        expect(await failure(gw.call("deal.find", { server: "live", login: u.login, comment: ref("T"), from: nowIso() })), retcode)
+          .toMatchObject({ kind: "unavailable", retcode: Number(retcode.split(" ")[0]) });
+      }
+      fake.faults.next("/api/user/logins", { retcode: "12 Too frequent requests" });
+      expect(await failure(gw.call("user.find", { server: "live", group: STANDARD, comment: ref("A") }))).toMatchObject({ kind: "unavailable", code: "too_frequent" });
+      // Not found is still an answer.
+      fake.faults.next("/api/deal/get_total", { retcode: "13 Not found" });
+      expect(await failure(gw.call("deal.find", { server: "live", login: u.login, comment: ref("T"), from: nowIso() }))).toMatchObject({ kind: "refused", code: "not_found" });
     });
 
     it("a deal with this reference but another amount is unknown, and nothing is sent", async () => {
@@ -508,6 +556,84 @@ describe("MT5 gateway", () => {
       connection.close();
     });
   });
+});
+
+describe("MT5 gateway account search in a large group", () => {
+  let fake: FakeMt5;
+  let g: Running;
+
+  beforeAll(async () => {
+    fake = await newFake();
+    g = await startGateway(fake);
+  });
+  afterAll(() => g.close());
+  afterEach(() => fake.faults.clear());
+
+  it("says 'not found' among hundreds of accounts within the read deadline, reading only back to `from`", async () => {
+    const twoDaysAgo = fake.serverNow() - 2 * 86_400;
+    for (let i = 0; i < 250; i++) fake.addUser({ group: STANDARD, registration: twoDaysAgo });
+    // Opened since the request, and one opened by hand long ago with a login of its own above them all.
+    const recent = [fake.addUser({ group: STANDARD }), fake.addUser({ group: STANDARD })];
+    fake.addUser({ group: STANDARD, login: 9_000_000, registration: twoDaysAgo });
+    const from = new Date(Date.now() - 86_400_000).toISOString();
+    // A trade server far from the gateway: 75 ms for every user/get.
+    for (let i = 0; i < 300; i++) fake.faults.next("/api/user/get", { delayMs: 75 });
+    const before = fake.state.requests.length;
+    const started = Date.now();
+    expect(await g.gw.call("user.find", { server: "live", group: STANDARD, comment: ref("A"), from })).toEqual({ login: null });
+    expect(Date.now() - started).toBeLessThan(3_000);
+    const reads = pathsSince(fake, before).filter((p) => p === "/api/user/get").length;
+    // The two new ones, then ten registered before `from` (the hand-made one among them); two at a time, so maybe one more.
+    expect(reads).toBeGreaterThanOrEqual(recent.length + 10);
+    expect(reads).toBeLessThanOrEqual(recent.length + 10 + 1);
+
+    // One opened since the request is found as before, below the old one with the high login.
+    const comment = ref("A");
+    recent[1]!.comment = comment;
+    expect(await g.gw.call("user.find", { server: "live", group: STANDARD, comment, from })).toEqual({ login: recent[1]!.login });
+    // Without `from`, the newest 200 are read, as before.
+    fake.faults.clear();
+    const all = fake.state.requests.length;
+    expect(await g.gw.call("user.find", { server: "live", group: STANDARD, comment: ref("A") })).toEqual({ login: null });
+    expect(pathsSince(fake, all).filter((p) => p === "/api/user/get")).toHaveLength(200);
+    // A `from` in the future would end every search at once: refused.
+    expect(await failure(g.gw.call("user.find", { server: "live", group: STANDARD, comment: ref("A"), from: new Date(Date.now() + 3 * 86_400_000).toISOString() })))
+      .toMatchObject({ kind: "bad_request", code: "policy" });
+  });
+});
+
+describe("MT5 gateway under a flood of reads", () => {
+  let fake: FakeMt5;
+  let g: Running;
+
+  beforeAll(async () => {
+    fake = await newFake();
+    g = await startGateway(fake);
+  });
+  afterAll(() => g.close());
+  afterEach(() => fake.faults.clear());
+
+  it("keeps half its room, and the first free MT5 connection, for writes", async () => {
+    const readers = Array.from({ length: 40 }, () => fake.addUser({ group: STANDARD }));
+    const victim = fake.addUser({ group: STANDARD });
+    // Groups read once first, so each read below is a single MT5 request.
+    for (const u of [...readers, victim]) await g.gw.call("user.get", { server: "live", login: u.login });
+    for (let i = 0; i < 40; i++) fake.faults.next("/api/user/account/get", { delayMs: 400 });
+    const settled = (call: Promise<unknown>) => call.then(() => "ok", (e: GatewayError) => `${e.kind}/${e.code}`);
+    const reads = readers.map((u) => settled(g.gw.call("accounts.get", { server: "live", logins: [u.login] })));
+    await sleep(150);
+    const started = Date.now();
+    const comment = ref("T");
+    const write = await g.gw.call("balance", { server: "live", login: victim.login, amountCents: 10_000, comment, checkMargin: false, notBefore: nowIso() });
+    const took = Date.now() - started;
+    const outcomes = await Promise.all(reads);
+    // Past 32 reads at once, the rest are turned away at the door, with nothing sent.
+    expect(outcomes.filter((o) => o === "unavailable/too_frequent").length).toBeGreaterThanOrEqual(8);
+    // The write went ahead of the reads still waiting for a connection.
+    expect(write).toEqual({ ticket: dealsWith(fake, comment)[0]!.ticket, duplicate: false });
+    expect(fake.state.users.get(victim.login)!.balanceCents).toBe(10_000);
+    expect(took).toBeLessThan(3_000);
+  }, 20_000);
 });
 
 describe("MT5 gateway caps", () => {

@@ -518,10 +518,11 @@ export function staffMoneyRouter(deps: AppDeps): Router {
       // Only the client's own accounts (wallet and hold) carry client_id on their entries.
       const entries = await rows<{ created_at: Date; kind: string; account: string; amount_cents: number; reference: string | null; source_type: string; source_id: number }>(
         db,
-        `SELECT e.created_at, t.kind, e.account, e.amount_cents, COALESCE(d.reference, w.reference) AS reference, t.source_type, t.source_id
+        `SELECT e.created_at, t.kind, e.account, e.amount_cents, COALESCE(d.reference, w.reference, o.reference) AS reference, t.source_type, t.source_id
          FROM ledger_entries e JOIN ledger_transactions t ON t.id = e.transaction_id
          LEFT JOIN deposits d ON t.source_type = 'deposit' AND d.id = t.source_id
          LEFT JOIN withdrawals w ON t.source_type = 'withdrawal' AND w.id = t.source_id
+         LEFT JOIN mt5_balance_ops o ON t.source_type = 'mt5_op' AND o.id = t.source_id
          WHERE e.client_id = ? ORDER BY e.id DESC LIMIT 20`,
         [clientId],
       );

@@ -30,7 +30,7 @@ const GIVE_UP_CHECKS = 3;
 export const GIVE_UP_AGE_MS = 10 * 60_000;
 /** 2, 4, 8, then every 10 minutes. */
 const backoffMs = (checks: number) => Math.min(2 ** checks, 10) * 60_000;
-/** How far back from the request a deal is searched for (MT5 times are the trade server's clock). */
+/** How far back from the request a deal or an account is searched for (MT5 times are the trade server's clock). */
 const SEARCH_BACK_MS = 24 * 3_600_000;
 
 const SYSTEM: AuditContext = { actor: { type: "system", id: null, label: "MT5 resolver" }, ip: "", userAgent: "" };
@@ -64,19 +64,30 @@ export type CheckResult = "completed" | "failed" | "unknown" | "skipped";
 const isOpen = (op: BalanceOpRow) => op.status === "sending" || op.status === "unknown";
 /** The deal MT5 made for this operation: a balance deal on its login for exactly its signed amount. */
 const isItsDeal = (deal: Mt5Deal, op: BalanceOpRow) => deal.action === 2 && deal.login === op.login && deal.profitCents === signedCents(op);
-const searchFrom = (op: BalanceOpRow) => new Date(op.created_at.getTime() - SEARCH_BACK_MS).toISOString();
+const searchFrom = (row: { created_at: Date }) => new Date(row.created_at.getTime() - SEARCH_BACK_MS).toISOString();
 
 /**
  * Looks for one balance operation's deal in MT5 and settles it when the
  * answer is clear. Returns what happened, and the gateway's error when MT5
  * could not be searched (staff "Check now" shows it).
  *
+ * `mayGiveUp: false` is a staff "Check now": a deal it finds completes the
+ * operation, but a search that finds nothing neither counts as one of the
+ * resolver's searches nor settles it as failed. Only the resolver's own
+ * schedule, or a staff "mark failed" (2FA, a note, a name), does that.
+ *
  * Checks and staff decisions on one account run one at a time in this
  * process, so a search and a staff "failed" can never cross; the settle
  * itself only moves an operation that is still open, so a second check of a
  * settled one changes nothing.
  */
-export async function checkBalanceOpDetailed(db: Db, gateway: Mt5Gateway | null, opId: number, log: Log): Promise<{ result: CheckResult; error: GatewayError | null }> {
+export async function checkBalanceOpDetailed(
+  db: Db,
+  gateway: Mt5Gateway | null,
+  opId: number,
+  log: Log,
+  opts: { mayGiveUp?: boolean } = {},
+): Promise<{ result: CheckResult; error: GatewayError | null }> {
   const first = await loadOp(db, opId);
   if (!first || !isOpen(first)) return { result: "skipped", error: null };
   return withAccountLock(first.mt5_account_id, async () => {
@@ -112,6 +123,11 @@ export async function checkBalanceOpDetailed(db: Db, gateway: Mt5Gateway | null,
         "An MT5 deal carries this operation's reference but does not match it; staff must check it",
       );
       await rescheduleOp(db, op.id, "mismatch", op.checks, RECHECK_ODD_MS);
+      return { result: "unknown" as const, error: null };
+    }
+    if (opts.mayGiveUp === false) {
+      // Not found yet: still open, and the resolver's next search stays when it was due.
+      await exec(db, "UPDATE mt5_balance_ops SET status = 'unknown', failure = 'not_found' WHERE id = ? AND status IN ('sending', 'unknown')", [op.id]);
       return { result: "unknown" as const, error: null };
     }
     const checks = op.checks + 1;
@@ -177,7 +193,7 @@ export async function checkAccount(db: Db, gateway: Mt5Gateway | null, accountId
   }
   let login: number | null;
   try {
-    ({ login } = await callMt5(gateway, "user.find", { server: a.server_code, group: a.mt5_group, comment: a.create_ref }, log));
+    ({ login } = await callMt5(gateway, "user.find", { server: a.server_code, group: a.mt5_group, comment: a.create_ref, from: searchFrom(a) }, log));
   } catch (error) {
     const e = error as GatewayError;
     if (e.kind === "refused" || e.kind === "bad_request") {

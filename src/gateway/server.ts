@@ -23,6 +23,8 @@ const READ_DEADLINE_MS = 7_000;
 const WRITE_DEADLINE_MS = 18_000;
 /** Operations running at once; past this the gateway answers "unavailable" rather than queue without end. */
 const MAX_IN_FLIGHT = 64;
+/** Reads running at once: however many arrive (a client reloading its accounts page), half the room stays for writes. */
+const MAX_READS_IN_FLIGHT = MAX_IN_FLIGHT / 2;
 
 const STATUS: Record<GatewayErrorKind, number> = { bad_request: 400, refused: 422, unavailable: 503, unknown: 502 };
 
@@ -71,6 +73,7 @@ export function createGatewayServer(config: GatewayConfig, deps: GatewayDeps = {
   const gateway = new Gateway(config, log, { pingIntervalMs: deps.pingIntervalMs });
   const nonces = new NonceCache();
   let inFlight = 0;
+  let readsInFlight = 0;
 
   const answer = (res: http.ServerResponse, nonce: string, status: number, payload: unknown) => {
     const body = JSON.stringify(payload);
@@ -126,7 +129,7 @@ export function createGatewayServer(config: GatewayConfig, deps: GatewayDeps = {
       return refuseUnsigned(res, 400, "bad_request", `Invalid body: ${fields}.`);
     }
     const write = WRITE_OPS.has(op);
-    if (inFlight >= MAX_IN_FLIGHT) {
+    if (inFlight >= MAX_IN_FLIGHT || (!write && readsInFlight >= MAX_READS_IN_FLIGHT)) {
       return answer(res, nonce!, 503, { ok: false, error: { kind: "unavailable", code: "too_frequent", message: "The gateway is busy; nothing was sent." } });
     }
     const aborted = new AbortController();
@@ -134,6 +137,7 @@ export function createGatewayServer(config: GatewayConfig, deps: GatewayDeps = {
       if (!res.writableFinished) aborted.abort();
     });
     inFlight++;
+    if (!write) readsInFlight++;
     try {
       const result = await gateway.run(op, parsed.data, { deadline: Date.now() + (write ? WRITE_DEADLINE_MS : READ_DEADLINE_MS), signal: aborted.signal });
       answer(res, nonce!, 200, { ok: true, result });
@@ -149,6 +153,7 @@ export function createGatewayServer(config: GatewayConfig, deps: GatewayDeps = {
       }
     } finally {
       inFlight--;
+      if (!write) readsInFlight--;
     }
   }
 

@@ -639,7 +639,10 @@ const TRADING_SHOWN = 10;
 
 /** The client's MT5 accounts, newest first; each row opens the account's own page. */
 function TradingAccounts({ clientId }: { clientId: number }) {
+  const can = useCan();
   const [, navigate] = useLocation();
+  // Money moved between the wallet and these accounts is on the Transfers page.
+  const transfers = can("wallet.view");
   const list = useQuery({
     queryKey: [...ACCOUNTS_KEY, "client", clientId],
     queryFn: () => api.get<Page<Mt5AccountItem>>(`/api/staff/mt5/accounts${qs({ clientId, pageSize: TRADING_SHOWN })}`),
@@ -653,9 +656,10 @@ function TradingAccounts({ clientId }: { clientId: number }) {
         <h2 className="flush">
           <CandlestickChart size={18} /> Trading accounts
         </h2>
-        {total > TRADING_SHOWN && (
+        {(transfers || total > TRADING_SHOWN) && (
           <div className="grid-toolbar-end">
-            <Link href={`/mt5?client=${clientId}`}>See all {total}</Link>
+            {transfers && <Link href={`/transfers?client=${clientId}`}>This client's transfers</Link>}
+            {total > TRADING_SHOWN && <Link href={`/mt5?client=${clientId}`}>See all {total}</Link>}
           </div>
         )}
       </div>

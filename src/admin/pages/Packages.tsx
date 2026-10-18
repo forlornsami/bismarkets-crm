@@ -313,10 +313,10 @@ function PackageDialog({ pkg, onClose }: { pkg?: AccountPackage; onClose: () => 
           </Field>
         </div>
         <Field label="Description (optional)" hint={hint("description")}>
-          <textarea className="input input-area" rows={2} value={f.description} onChange={(e) => set({ description: e.target.value })} maxLength={300} />
+          <textarea className="input" rows={2} value={f.description} onChange={(e) => set({ description: e.target.value })} maxLength={300} />
         </Field>
         <Field label="Highlights (optional)" hint={hint("highlights", "One per line, up to 8 lines. Shown as a list on the package card.")}>
-          <textarea className="input input-area" rows={4} value={f.highlights} onChange={(e) => set({ highlights: e.target.value })} placeholder={"Spreads from 0.0 pips\nNo requotes"} />
+          <textarea className="input" rows={4} value={f.highlights} onChange={(e) => set({ highlights: e.target.value })} placeholder={"Spreads from 0.0 pips\nNo requotes"} />
         </Field>
         <div className="check-row">
           <label className="check">

@@ -6,7 +6,9 @@ import type { Mt5Request, Reply } from "./webapi";
 
 // A few signed-in connections per MT5 server, each carrying one request at a
 // time. Idle ones are pinged so MT5 does not drop their session, and one
-// that fails its ping signs in again straight away.
+// that fails its ping signs in again straight away. Requests that are part of
+// a write (a transfer, a password change) take a freed connection before any
+// read still waiting for one, so a crowd of reads cannot hold up the writes.
 
 /** How long a request waits for a free connection before giving up (nothing is sent). */
 const POOL_WAIT_MS = 5_000;
@@ -17,6 +19,7 @@ export class Mt5Pool {
   private connections: Mt5Connection[];
   private idle: Mt5Connection[];
   private waiters: Array<(connection: Mt5Connection) => void> = [];
+  private writeWaiters: Array<(connection: Mt5Connection) => void> = [];
   private timer: NodeJS.Timeout | null = null;
   private pinging = false;
   private failing = false;
@@ -42,9 +45,10 @@ export class Mt5Pool {
   /**
    * Sends one request on a free connection (see Mt5Connection.request).
    * `beforeSend` runs just before a write goes out and may stop it.
+   * `forWrite` puts the request ahead of reads waiting for a connection.
    */
-  async request(request: Mt5Request, opts: { deadline: number; beforeSend?: () => void }): Promise<Reply> {
-    const connection = await this.acquire(Math.min(POOL_WAIT_MS, opts.deadline - Date.now()));
+  async request(request: Mt5Request, opts: { deadline: number; beforeSend?: () => void; forWrite?: boolean }): Promise<Reply> {
+    const connection = await this.acquire(Math.min(POOL_WAIT_MS, opts.deadline - Date.now()), opts.forWrite === true);
     try {
       return await connection.request(request, opts);
     } finally {
@@ -58,29 +62,30 @@ export class Mt5Pool {
     for (const connection of this.connections) connection.close();
   }
 
-  private acquire(waitMs: number): Promise<Mt5Connection> {
+  private acquire(waitMs: number, forWrite: boolean): Promise<Mt5Connection> {
     if (this.closed) return Promise.reject(unavailable("connection", "The gateway is shutting down."));
     // The most recently used connection first: it is the one most surely
     // still signed in, and a second session only opens when two requests
     // run at once.
     const free = this.idle.pop();
     if (free) return Promise.resolve(free);
+    const queue = forWrite ? this.writeWaiters : this.waiters;
     return new Promise((resolve, reject) => {
       const take = (connection: Mt5Connection) => {
         clearTimeout(timer);
         resolve(connection);
       };
       const timer = setTimeout(() => {
-        const at = this.waiters.indexOf(take);
-        if (at >= 0) this.waiters.splice(at, 1);
+        const at = queue.indexOf(take);
+        if (at >= 0) queue.splice(at, 1);
         reject(unavailable("connection", `Every connection to MT5 server ${this.server.code} stayed busy; nothing was sent.`));
       }, Math.max(0, waitMs));
-      this.waiters.push(take);
+      queue.push(take);
     });
   }
 
   private release(connection: Mt5Connection) {
-    const next = this.waiters.shift();
+    const next = this.writeWaiters.shift() ?? this.waiters.shift();
     if (next) next(connection);
     else this.idle.push(connection);
   }

@@ -42,6 +42,10 @@ const STILL_SETTING_UP = "Your previous account is still being set up. Please ch
 const PASSWORD_REFUSED = "MT5 did not accept this password. Choose a different one.";
 const NOT_DEMO = "Choose one of your demo accounts.";
 const RESTORE_FIRST = "Restore this account before changing its leverage.";
+const CREATES_USED = "You have opened too many accounts today. Please try again tomorrow.";
+const PASSWORDS_USED = "Too many password changes. Please wait before trying again.";
+const TOP_UPS_USED = "Too many top-ups today. Please try again tomorrow.";
+const TOP_UP_ATTEMPTS_USED = "Too many top-ups. Please wait before trying again.";
 
 /** "$1,000.00": the form the app looks for in the wallet-minimum answer. */
 const dollars = (cents: number) => `$${formatMinor(cents)}`;
@@ -83,14 +87,28 @@ export function clientMt5Router(deps: AppDeps): Router {
   const auth = clientAuth(db, config);
   const ctx = (req: Request) => auditContext(req, clientActor(clientOf(req)));
 
-  // Counted when MT5 is asked (a refused form does not use one up).
+  // Counted when MT5 is asked (a refused form does not use one up), in the same step that decides, so
+  // requests sent at once cannot all pass a check made before any of them was counted. The gates
+  // below only turn a request away early once the limit is used up.
   const creates = new RateLimiter(10, DAY);
   const passwordChanges = new RateLimiter(10, HOUR);
   const topUps = new RateLimiter(20, DAY);
+  // Every top-up attempt, refused or not, since each one reads the account in MT5 before anything is decided.
+  const topUpAttempts = new RateLimiter(60, HOUR);
   const gate = (limiter: RateLimiter, message: string) => (req: Request, _res: Response, next: NextFunction) => {
     const key = String(clientOf(req).id);
     if (limiter.isLimited(key)) return next(new TooManyRequests(limiter.retryAfter(key), message));
     next();
+  };
+  /** Counts every request, refused or not, and turns it away once they are used up. */
+  const attempt = (limiter: RateLimiter, message: string) => (req: Request, _res: Response, next: NextFunction) => {
+    const key = String(clientOf(req).id);
+    if (!limiter.take(key)) return next(new TooManyRequests(limiter.retryAfter(key), message));
+    next();
+  };
+  /** Counts one use of `limiter`, or refuses with 429 when it is used up. */
+  const use = (limiter: RateLimiter, key: string, message: string) => {
+    if (!limiter.take(key)) throw new TooManyRequests(limiter.retryAfter(key), message);
   };
 
   /** MT5 on and the account's server switched on, or the "temporarily unavailable" refusal. */
@@ -160,7 +178,7 @@ export function clientMt5Router(deps: AppDeps): Router {
     "/mt5-accounts",
     auth,
     noImpersonation,
-    gate(creates, "You have opened too many accounts today. Please try again tomorrow."),
+    gate(creates, CREATES_USED),
     handler(async (req, res) => {
       const client = clientOf(req);
       const body = bodyOf(req);
@@ -208,9 +226,13 @@ export function clientMt5Router(deps: AppDeps): Router {
         const server = demo ? s.demoServerCode : p!.server_code;
         const group = demo ? s.demoGroup : p!.mt5_group;
         if (!server || !group || !(await serverEnabled(conn, server))) throw mt5Unavailable();
+        // A create whose account MT5 is known to have made, under a login another row holds, waits for staff
+        // but cannot still be on its way: it counts toward the limit and does not hold up a new account.
         const counts = await one<{ same_kind: string | null; pending: string | null }>(
           conn,
-          "SELECT SUM(is_demo = ? AND status IN ('creating', 'active', 'unknown')) AS same_kind, SUM(status IN ('creating', 'unknown')) AS pending FROM mt5_accounts WHERE client_id = ?",
+          `SELECT SUM(is_demo = ? AND status IN ('creating', 'active', 'unknown')) AS same_kind,
+             SUM(status = 'creating' OR (status = 'unknown' AND (failure IS NULL OR failure <> 'login_taken'))) AS pending
+           FROM mt5_accounts WHERE client_id = ?`,
           [demo ? 1 : 0, client.id],
         );
         const max = demo ? s.maxDemoAccounts : s.maxLiveAccounts;
@@ -218,6 +240,8 @@ export function clientMt5Router(deps: AppDeps): Router {
         // An answer that never came may still have opened an account: no second one until it is settled.
         if (Number(counts?.pending ?? 0) > 0) throw fieldError("is_demo", STILL_SETTING_UP);
         if (!demo && wallet!.available_cents < p!.min_deposit_cents) throw walletMinimum(p!.min_deposit_cents);
+        // Counted with the client row locked, just before the row that asks MT5: a refusal here writes nothing.
+        use(creates, String(client.id), CREATES_USED);
         const packageName = demo ? "Demo" : p!.name;
         return withMt5Reference("A", async (createRef) => {
           const r = await exec(
@@ -229,7 +253,6 @@ export function clientMt5Router(deps: AppDeps): Router {
           return { id: r.insertId, createRef, server, group };
         });
       });
-      creates.take(String(client.id));
       const meta = { accountId: created.id, server: created.server, group: created.group, isDemo: demo, packageId: pkg?.id ?? null, leverage, createRef: created.createRef };
 
       const profile = (await loadClient(db, client.id))!;
@@ -349,13 +372,15 @@ export function clientMt5Router(deps: AppDeps): Router {
       await changeAccount(req, async (a) => {
         // Both clients offer "restore" on a suspended account too; only staff can switch it back on.
         if (a.suspended_at) throw fieldError("account", SUSPENDED);
+        // Asked even when the row is not archived: an archive whose answer was lost may have switched trading
+        // off in MT5 all the same, and this is how it comes back on (MT5 is not written when nothing differs).
+        const gateway = await gatewayFor(a.server_code);
+        try {
+          await callMt5Again(gateway, "user.update", { server: a.server_code, login: a.login!, tradeDisabled: false }, log);
+        } catch (error) {
+          changeFailed(error);
+        }
         if (a.archived_at) {
-          const gateway = await gatewayFor(a.server_code);
-          try {
-            await callMt5Again(gateway, "user.update", { server: a.server_code, login: a.login!, tradeDisabled: false }, log);
-          } catch (error) {
-            changeFailed(error);
-          }
           await transaction(db, async (conn) => {
             await lockClient(conn, client.id);
             await exec(conn, "UPDATE mt5_accounts SET archived_at = NULL WHERE id = ?", [a.id]);
@@ -378,15 +403,17 @@ export function clientMt5Router(deps: AppDeps): Router {
         if (a.archived_at || a.suspended_at) throw fieldError("leverage", RESTORE_FIRST);
         const settings = await loadMt5Settings(db);
         if (wanted === null || !settings.leverages.includes(wanted)) throw fieldError("leverage", LEVERAGE_NOT_AVAILABLE);
-        if (wanted !== a.leverage) {
-          const gateway = await gatewayFor(a.server_code);
-          let now: number;
-          try {
-            ({ leverage: now } = await callMt5Again(gateway, "user.update", { server: a.server_code, login: a.login!, leverage: wanted }, log));
-          } catch (error) {
-            changeFailed(error);
-          }
-          // The row follows what MT5 says, so the very next list shows the account's real leverage.
+        // Asked even when the row already shows this leverage: a change whose answer was lost may have left
+        // MT5 at another one (MT5 is not written when nothing differs).
+        const gateway = await gatewayFor(a.server_code);
+        let now: number;
+        try {
+          ({ leverage: now } = await callMt5Again(gateway, "user.update", { server: a.server_code, login: a.login!, leverage: wanted }, log));
+        } catch (error) {
+          changeFailed(error);
+        }
+        // The row follows what MT5 says, so the very next list shows the account's real leverage.
+        if (now !== a.leverage) {
           await transaction(db, async (conn) => {
             await lockClient(conn, client.id);
             await exec(conn, "UPDATE mt5_accounts SET leverage = ? WHERE id = ?", [now, a.id]);
@@ -395,10 +422,10 @@ export function clientMt5Router(deps: AppDeps): Router {
               before: { leverage: a.leverage }, after: { leverage: now }, meta: { accountId: a.id, login: a.login },
             });
           });
-          if (now !== wanted) {
-            log.warn({ accountId: a.id, wanted, now }, "MT5 kept a different leverage than the one asked for");
-            throw fieldError("mt5", CHANGE_FAILED);
-          }
+        }
+        if (now !== wanted) {
+          log.warn({ accountId: a.id, wanted, now }, "MT5 kept a different leverage than the one asked for");
+          throw fieldError("mt5", CHANGE_FAILED);
         }
         res.json({ success: true, message: "Leverage changed.", leverage: String(wanted) });
       });
@@ -409,7 +436,7 @@ export function clientMt5Router(deps: AppDeps): Router {
     "/mt5-accounts/:login/password",
     auth,
     noImpersonation,
-    gate(passwordChanges, "Too many password changes. Please wait before trying again."),
+    gate(passwordChanges, PASSWORDS_USED),
     handler(async (req, res) => {
       const client = clientOf(req);
       const body = bodyOf(req);
@@ -428,7 +455,7 @@ export function clientMt5Router(deps: AppDeps): Router {
       await changeAccount(req, async (a) => {
         if (a.suspended_at) throw fieldError("account", SUSPENDED);
         const gateway = await gatewayFor(a.server_code);
-        passwordChanges.take(String(client.id));
+        use(passwordChanges, String(client.id), PASSWORDS_USED);
         // Recorded without the passwords, only which ones changed.
         const record = (changed: { main: boolean; investor: boolean }) =>
           auditStandalone(db, ctx(req), { action: "mt5.account.password_changed", entityType: "client", entityId: client.id, meta: { accountId: a.id, login: a.login, ...changed } });
@@ -467,7 +494,8 @@ export function clientMt5Router(deps: AppDeps): Router {
     "/mt5-accounts/demo/top-up",
     auth,
     noImpersonation,
-    gate(topUps, "Too many top-ups today. Please try again tomorrow."),
+    gate(topUps, TOP_UPS_USED),
+    attempt(topUpAttempts, TOP_UP_ATTEMPTS_USED),
     handler(async (req, res) => {
       const client = clientOf(req);
       const body = bodyOf(req);
@@ -502,6 +530,8 @@ export function clientMt5Router(deps: AppDeps): Router {
         if ((a.balance_cents ?? 0) + Number(pending?.total ?? 0) + amount.minor > s.demoMaxBalanceCents) {
           throw fieldError("amount", `Demo accounts can hold up to ${dollars(s.demoMaxBalanceCents)}.`);
         }
+        // Counted with the client row locked, just before the operation is written: a refusal here writes nothing.
+        use(topUps, String(client.id), TOP_UPS_USED);
         const created = await insertBalanceOp(conn, { purpose: "demo_topup", clientId: client.id, accountId: a.id, serverCode: a.server_code, login: a.login!, amountCents: amount.minor, ip: req.clientIp });
         await writeAudit(conn, ctx(req), {
           action: "mt5.demo.top_up_requested", entityType: "client", entityId: client.id,
@@ -509,9 +539,10 @@ export function clientMt5Router(deps: AppDeps): Router {
         });
         return created;
       });
-      topUps.take(String(client.id));
       const settled = await runBalanceOp({ db, mt5: gateway, log }, op.id);
       if (settled.status === "completed") return void res.json({ success: true, message: "Your demo account was topped up." });
+      // MT5 was never reached (or the gateway would not send it): the common "try again later".
+      if (settled.status === "failed" && (settled.failure === "unavailable" || settled.failure === "bad_request")) throw mt5Unavailable();
       if (settled.status === "failed") throw fieldError("amount", settled.client_message ?? DEMO_FAILED);
       res.status(202).json({ success: true, message: "Your top-up is being processed." });
     }),

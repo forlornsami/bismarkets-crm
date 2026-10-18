@@ -230,6 +230,18 @@ describe.skipIf(!hasDb)("transfers between the wallet and MT5", () => {
     await clean();
   });
 
+  it("shows staff each transfer's reference on the client's wallet entries", async () => {
+    const { c, login } = await funded(20_000);
+    const res = await toMt5(c, login, 25);
+    expect(res.status).toBe(200);
+    const op = await opByRef(res.body.data.id);
+    const page = await boss.agent.get(`/api/staff/money/clients/${c.id}/wallet`);
+    expect(page.status).toBe(200);
+    const moved = page.body.entries.filter((e: { sourceType: string }) => e.sourceType === "mt5_op");
+    expect(moved.length).toBeGreaterThan(0);
+    for (const e of moved) expect(e).toMatchObject({ reference: op.reference, sourceType: "mt5_op", sourceId: op.id });
+  });
+
   it("refuses what it cannot do with field errors (never a 409) and writes nothing", async () => {
     const { c, login } = await funded(10_000);
     const demo = await demoAccount(c);
@@ -742,6 +754,37 @@ describe.skipIf(!hasDb)("transfers between the wallet and MT5", () => {
     expect(busy.status).toBe(409);
     expect(busy.body.error.message).toMatch(/still being sent/);
     await settleBalanceOp(env.db, fresh.id, { status: "failed", failure: "test", clientMessage: "test" });
+    await clean();
+  });
+
+  it("never gives the money back from a staff 'Check now' that finds nothing: only the resolver's schedule or 'mark failed' does", async () => {
+    const { c, login } = await funded(20_000);
+    fake.failNext("balance", { kind: "unknown-before" });
+    const op = await opByRef((await toMt5(c, login, 50)).body.data.id);
+    // Old enough to be given up on, and no deal in MT5.
+    await age(op.id);
+    const url = `/api/staff/mt5/operations/${op.id}/check`;
+    for (let i = 0; i < 3; i++) {
+      const res = await post(manager, url);
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ result: "unknown", searchError: null, operation: { status: "unknown", failure: "not_found", checks: 0 } });
+    }
+    expect(await opByRef(op.reference)).toMatchObject({ status: "unknown", checks: 0, next_check_at: null, resolved_by: null });
+    expect(await kinds(op.id)).toEqual(["transfer_hold"]);
+    expect(await wallet(c.id)).toEqual({ available: 15_000, held: 5_000 });
+    expect(await audits("mt5.operation.failed", c.id)).toHaveLength(0);
+    expect((await audits("mt5.operation.checked", c.id)).map((a) => a.meta_json.result)).toEqual(["unknown", "unknown", "unknown"]);
+
+    // The resolver still gives up on its own schedule.
+    for (const checks of [1, 2]) {
+      await due(op.id);
+      await resolve();
+      expect(await opByRef(op.reference)).toMatchObject({ status: "unknown", checks });
+    }
+    await due(op.id);
+    await resolve();
+    expect(await opByRef(op.reference)).toMatchObject({ status: "failed", failure: "not_found", client_message: TO_MT5_FAILED, resolved_by: null });
+    expect(await wallet(c.id)).toEqual({ available: 20_000, held: 0 });
     await clean();
   });
 

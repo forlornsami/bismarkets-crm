@@ -1,7 +1,6 @@
 import type { Mt5Account } from "../../gateway/protocol";
 import { exec, one, rows, type Conn, type Db } from "../lib/db";
 import { toMajor } from "../money/amounts";
-import { isUnknown } from "./errors";
 import { GatewayError, type Mt5Gateway } from "./gateway";
 import { enabledServers } from "./settings";
 
@@ -208,11 +207,51 @@ const applyFigures = (a: AccountRow, f: Mt5Account): AccountRow => ({
 });
 
 /**
+ * Live reads of figures by account, from when each starts until
+ * SNAPSHOT_FRESH_MS later. A request that comes meanwhile waits for the read
+ * on its way, or keeps the snapshot once that read has ended, answered or not.
+ * So however many requests come at once or one after another (a client
+ * reloading its accounts page), MT5 is asked about an account at most once in
+ * that time and never twice at once; only an ask for the figures now
+ * (`maxAgeMs` 0, behind its own rate limit) reads again once a read is over.
+ */
+const liveReads = new Map<number, { done: boolean; figures: Promise<Mt5Account | null> }>();
+
+/**
+ * One accounts.get for some of a server's accounts. What arrives within
+ * `budgetMs` is saved as their snapshot; a later answer is dropped. Resolves
+ * with the figures by login and never rejects.
+ */
+async function readFigures(db: Db, gateway: Mt5Gateway, server: string, batch: AccountRow[], budgetMs: number, log?: { warn: (obj: unknown, msg: string) => void }) {
+  const found = new Map<number, Mt5Account>();
+  let timer: NodeJS.Timeout | undefined;
+  const late = new Promise<null>((resolve) => (timer = setTimeout(() => resolve(null), budgetMs)));
+  try {
+    const res = await Promise.race([gateway.call("accounts.get", { server, logins: batch.map((a) => a.login!) }), late]);
+    if (!res) return found;
+    if (res.missing.length) log?.warn({ server, missing: res.missing }, "MT5 does not know some of the CRM's accounts");
+    for (const a of batch) {
+      const f = res.accounts.find((x) => x.login === a.login);
+      if (!f) continue;
+      await writeSnapshot(db, a.id, f);
+      found.set(a.login!, f);
+    }
+  } catch (error) {
+    // MT5 out of reach is expected now and then; a refusal (a group the gateway no longer allows) or a bug needs a look.
+    if (!(error instanceof GatewayError) || error.kind !== "unavailable") log?.warn({ server, err: error }, "MT5 figures could not be read");
+  } finally {
+    clearTimeout(timer);
+  }
+  return found;
+}
+
+/**
  * Reads live figures for the accounts whose snapshot is older than `maxAgeMs`
  * (all of them with 0), at most 100 logins per call and one call per server
- * at a time, all within `budgetMs`. What arrives in time is saved as the
- * snapshot and returned in place; anything else keeps its cached figures.
- * Switched-off servers are not asked. Never throws for a gateway problem.
+ * at a time, all within `budgetMs`, and at most one read per account at a
+ * time (see liveReads). What arrives in time is saved as the snapshot and
+ * returned in place; anything else keeps its cached figures. Switched-off
+ * servers are not asked. Never throws for a gateway problem.
  */
 export async function refreshFigures(
   db: Db,
@@ -221,46 +260,53 @@ export async function refreshFigures(
   opts: { maxAgeMs?: number; budgetMs?: number; log?: { warn: (obj: unknown, msg: string) => void } } = {},
 ): Promise<AccountRow[]> {
   const maxAgeMs = opts.maxAgeMs ?? SNAPSHOT_FRESH_MS;
+  const budgetMs = opts.budgetMs ?? LIVE_BUDGET_MS;
   const now = Date.now();
   const stale = accounts.filter((a) => a.status === "active" && a.login !== null && (a.snapshot_at === null || now - a.snapshot_at.getTime() >= maxAgeMs));
   if (!gateway || !stale.length) return accounts;
   const enabled = await enabledServers(db);
-  const batches: { server: string; logins: number[] }[] = [];
-  for (const server of new Set(stale.map((a) => a.server_code))) {
-    if (!enabled.has(server)) continue;
-    const logins = [...new Set(stale.filter((a) => a.server_code === server).map((a) => a.login!))];
-    for (let i = 0; i < logins.length; i += LOGINS_PER_CALL) batches.push({ server, logins: logins.slice(i, i + LOGINS_PER_CALL) });
+  const reading = new Map<number, Promise<Mt5Account | null>>();
+  const ask = new Map<string, AccountRow[]>();
+  for (const a of stale) {
+    if (!enabled.has(a.server_code)) continue;
+    const earlier = liveReads.get(a.id);
+    if (earlier && !earlier.done) reading.set(a.id, earlier.figures);
+    else if (!earlier || maxAgeMs === 0) ask.set(a.server_code, [...(ask.get(a.server_code) ?? []), a]);
   }
-  const found = new Map<string, Mt5Account>();
+  for (const [server, list] of ask) {
+    for (let i = 0; i < list.length; i += LOGINS_PER_CALL) {
+      const batch = list.slice(i, i + LOGINS_PER_CALL);
+      const read = readFigures(db, gateway, server, batch, budgetMs, opts.log);
+      const started = batch.map((a) => {
+        const entry = { done: false, figures: read.then((found) => found.get(a.login!) ?? null) };
+        void entry.figures.then(() => (entry.done = true));
+        liveReads.set(a.id, entry);
+        reading.set(a.id, entry.figures);
+        return [a.id, entry] as const;
+      });
+      setTimeout(() => {
+        for (const [id, entry] of started) if (liveReads.get(id) === entry) liveReads.delete(id);
+      }, SNAPSHOT_FRESH_MS).unref();
+    }
+  }
+  const found = new Map<number, Mt5Account>();
   let timer: NodeJS.Timeout | undefined;
-  const deadline = new Promise<void>((resolve) => (timer = setTimeout(resolve, opts.budgetMs ?? LIVE_BUDGET_MS)));
+  const deadline = new Promise<void>((resolve) => (timer = setTimeout(resolve, budgetMs)));
   let late = false;
   const work = Promise.all(
-    batches.map(async (b) => {
-      try {
-        const res = await gateway.call("accounts.get", { server: b.server, logins: b.logins });
-        // Answers after the deadline are dropped: this request has already answered.
-        if (!late) for (const f of res.accounts) found.set(`${b.server}:${f.login}`, f);
-        if (res.missing.length) opts.log?.warn({ server: b.server, missing: res.missing }, "MT5 does not know some of the CRM's accounts");
-      } catch (error) {
-        if (!(error instanceof GatewayError) || isUnknown(error)) opts.log?.warn({ server: b.server, err: error }, "MT5 figures could not be read");
-      }
+    [...reading].map(async ([id, figures]) => {
+      const f = await figures;
+      // Answers after the deadline are dropped: this request has already answered.
+      if (f && !late) found.set(id, f);
     }),
   );
   await Promise.race([work, deadline]);
   late = true;
   clearTimeout(timer);
-  const out: AccountRow[] = [];
-  for (const a of accounts) {
-    const f = a.login === null ? undefined : found.get(`${a.server_code}:${a.login}`);
-    if (!f || !stale.includes(a)) {
-      out.push(a);
-      continue;
-    }
-    await writeSnapshot(db, a.id, f);
-    out.push(applyFigures(a, f));
-  }
-  return out;
+  return accounts.map((a) => {
+    const f = found.get(a.id);
+    return f ? applyFigures(a, f) : a;
+  });
 }
 
 // ---------- One change at a time per account ----------

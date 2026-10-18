@@ -657,7 +657,7 @@ function SuspendDialog({ a, mode, onClose, onChanged }: { a: Mt5AccountItem; mod
           </p>
         )}
         <Field label="Reason" hint={tried && problem ? <span className="error-text">{problem}</span> : "Kept in the audit log. The client does not see it."}>
-          <textarea className="input input-area" rows={2} value={reason} onChange={(e) => setReason(e.target.value)} maxLength={300} autoFocus />
+          <textarea className="input" rows={2} value={reason} onChange={(e) => setReason(e.target.value)} maxLength={300} autoFocus />
         </Field>
         <DecisionError error={save.error} />
         <div className="actions">

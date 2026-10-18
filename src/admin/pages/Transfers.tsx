@@ -656,7 +656,7 @@ function FailDialog({ o, onClose, onChanged, onDone }: { o: Mt5Operation; onClos
         </p>
         <p className="muted">Before anything changes, the CRM searches MT5 once more. If MT5 has a deal with this reference, the operation stays as it is.</p>
         <Field label="Note" hint={tried && problem ? <span className="error-text">{problem}</span> : "What you checked, for example the account's deals in MT5. Kept in the audit log; the client does not see it."}>
-          <textarea className="input input-area" rows={3} value={note} onChange={(e) => setNote(e.target.value)} maxLength={500} autoFocus />
+          <textarea className="input" rows={3} value={note} onChange={(e) => setNote(e.target.value)} maxLength={500} autoFocus />
         </Field>
         {deal ? (
           <div className="notice notice-warn">

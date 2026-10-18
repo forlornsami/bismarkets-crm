@@ -3,7 +3,7 @@ import type { GatewayConfig, Mt5ServerConfig } from "./config";
 import { OpError, policy, refused, unavailable, unknownOutcome } from "./errors";
 import type { GatewayLogger } from "./log";
 import { KeyedMutex, LockTimeout } from "./mutex";
-import { MT5_GROUP, MT5_REFERENCE, SERVER_CODE, type Mt5Account, type Mt5Deal, type OpName, type Ops } from "./protocol";
+import { MT5_GROUP, MT5_REFERENCE, SERVER_CODE, WRITE_OPS, type Mt5Account, type Mt5Deal, type OpName, type Ops } from "./protocol";
 import { Mt5Pool } from "./mt5/pool";
 import * as api from "./mt5/webapi";
 
@@ -24,6 +24,12 @@ const GROUP_TTL_MS = 10 * 60_000;
 const GROUP_CACHE_MAX = 10_000;
 /** user.find looks at this many of the group's newest logins. */
 const FIND_LOGINS = 200;
+/**
+ * With `from`, user.find stops after this many accounts registered before it.
+ * MT5 numbers new accounts upwards, so the logins below those are older
+ * still; a few opened by hand with a high login of their own are allowed for.
+ */
+const FIND_OLDER = 10;
 const DEAL_PAGE = 1000;
 /** A deal search reads at most this many deals; past that it cannot prove a deal is absent. */
 const MAX_SCAN_DEALS = 20_000;
@@ -35,6 +41,8 @@ export interface OpContext {
   deadline: number;
   /** Aborted when the CRM hangs up; a write not yet sent then stays unsent. */
   signal: AbortSignal;
+  /** Set for the write operations: their MT5 requests, reads included, go ahead of plain reads for a connection. */
+  write?: boolean;
 }
 
 // ---- Request bodies (strict: an unexpected key is refused) ----
@@ -69,7 +77,7 @@ export const OP_SCHEMAS: { [K in OpName]: z.ZodType<Ops[K]["req"], z.ZodTypeDef,
       investorPassword: mt5Password,
     })
     .strict(),
-  "user.find": z.object({ server, group, comment: reference }).strict(),
+  "user.find": z.object({ server, group, comment: reference, from: isoTime.optional() }).strict(),
   "user.update": z
     .object({ server, login, leverage: leverage.optional(), enabled: z.boolean().optional(), tradeDisabled: z.boolean().optional() })
     .strict()
@@ -196,6 +204,7 @@ function readOr<T>(read: () => T): T {
 }
 
 const isNotFound = (error: unknown) => error instanceof OpError && error.kind === "refused" && error.code === "not_found";
+const isGroupRefused = (error: unknown) => error instanceof OpError && error.kind === "refused" && error.code === "group_not_allowed";
 
 interface ServerRuntime {
   config: Mt5ServerConfig;
@@ -222,7 +231,7 @@ export class Gateway {
 
   run<K extends OpName>(op: K, req: Ops[K]["req"], ctx: OpContext): Promise<Ops[K]["res"]> {
     const handler = this.handlers[op] as (req: Ops[K]["req"], ctx: OpContext) => Promise<Ops[K]["res"]>;
-    return handler(req, ctx);
+    return handler(req, { ...ctx, write: WRITE_OPS.has(op) });
   }
 
   close() {
@@ -253,7 +262,9 @@ export class Gateway {
           if (account.login !== login) throw unavailable("mt5_error", "MT5 answered with another account.");
           return account;
         } catch (error) {
-          if (isNotFound(error)) return login;
+          // One login MT5 does not know, or in a group the gateway no longer allows, is listed as
+          // missing: it must not cost the other accounts their figures.
+          if (isNotFound(error) || isGroupRefused(error)) return login;
           throw error;
         }
       });
@@ -286,17 +297,24 @@ export class Gateway {
     "user.find": async (req, ctx) => {
       const s = this.server(req.server);
       this.kindOf(s, req.group);
+      const from = req.from === undefined ? null : Date.parse(req.from);
+      const now = Date.now();
+      if (from !== null && (from > now + DAY_MS || from < now - 400 * DAY_MS)) throw policy("from must be within the last 400 days.");
       // Waits for any create in the group, so "not found" is never said while
       // a create with this comment is still on its way.
       return this.withLock(s, `group:${req.group}`, ctx, async () => {
         const reply = await this.read(s, api.userLogins(req.group), ctx);
         const logins = readOr(() => api.readLogins(reply)).sort((a, b) => b - a).slice(0, FIND_LOGINS);
         const matches: number[] = [];
+        // Newest first, and only as far back as `from`: "not found" then costs a few reads, not one per
+        // account in the group, and fits the read deadline however large the group is.
+        let older = 0;
         await mapLimit(logins, 2, async (login) => {
-          if (matches.length) return;
+          if (matches.length || older >= FIND_OLDER) return;
           try {
             const { user } = await this.getUser(s, login, ctx);
             if (user.comment === req.comment && user.group === req.group) matches.push(login);
+            else if (from !== null && user.registeredAt !== null && Date.parse(user.registeredAt) < from) older++;
           } catch (error) {
             // Deleted between the list and the read: not the one.
             if (!isNotFound(error)) throw error;
@@ -449,7 +467,7 @@ export class Gateway {
   // ---- MT5 requests ----
 
   private read(s: ServerRuntime, request: api.Mt5Request, ctx: OpContext) {
-    return s.pool.request(request, { deadline: ctx.deadline });
+    return s.pool.request(request, { deadline: ctx.deadline, forWrite: ctx.write });
   }
 
   /**
@@ -460,6 +478,7 @@ export class Gateway {
   private send(s: ServerRuntime, request: api.Mt5Request, ctx: OpContext) {
     return s.pool.request(request, {
       deadline: ctx.deadline,
+      forWrite: true,
       beforeSend: () => {
         if (ctx.signal.aborted) throw unavailable("connection", "The CRM stopped waiting; nothing was sent.");
         if (ctx.deadline - Date.now() < WRITE_MIN_MS) throw unavailable("timeout", "Too little time was left to send the write; nothing was sent.");

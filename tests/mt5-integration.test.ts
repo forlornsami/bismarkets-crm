@@ -45,7 +45,6 @@ const CHANGE_UNCONFIRMED = "We could not confirm that this change was made. Plea
 const CREATE_UNCONFIRMED = "We could not confirm that your account was opened. Please check your accounts in a minute before trying again.";
 const STILL_SETTING_UP = "Your previous account is still being set up. Please check your accounts in a minute.";
 const TO_MT5_FAILED = "The transfer did not go through. The money is back in your wallet.";
-const DEMO_FAILED = "We could not add the money to your demo account. Please try again later.";
 const GATEWAY_REFUSED = "Refused a request that is not properly signed";
 const CRM_UNTRUSTED = "MT5 gateway answer has no valid signature: check CRM_MT5_GATEWAY_SECRET and that the gateway is the one listening";
 
@@ -689,7 +688,7 @@ describe.skipIf(!hasDb)("MT5 end to end: CRM, gateway and MT5 over TLS", () => {
     }
     const topped = await topUp(c, demoLogin, 10);
     expect(topped.status).toBe(422);
-    expect(topped.body.errors).toEqual({ amount: [DEMO_FAILED] });
+    expect(topped.body).toEqual({ message: UNAVAILABLE, errors: { mt5: [UNAVAILABLE] } });
 
     // Nothing reached MT5, nothing changed in the CRM, and the held money went back.
     expect(reached()).toBe(before.reached);

@@ -146,7 +146,9 @@ describe.skipIf(!hasDb)("MT5 resolver", () => {
     expect(made).toBeDefined();
     expect(await accountOf(id)).toMatchObject({ status: "active", login: made.login, next_check_at: null });
     expect(fake.callsTo("user.create")).toHaveLength(creates);
-    expect(fake.callsTo("user.find").at(-1)!.req).toMatchObject({ server: "live", group: "real\\standard" });
+    // Searched only among accounts registered since a day before the request, so a large group is not read through.
+    const { created_at: requested } = (await one<{ created_at: Date }>(env.db, "SELECT created_at FROM mt5_accounts WHERE id = ?", [id]))!;
+    expect(fake.callsTo("user.find").at(-1)!.req).toEqual({ server: "live", group: "real\\standard", comment: ref, from: new Date(requested.getTime() - 24 * 3_600_000).toISOString() });
 
     const audit = await one<{ actor_type: string; actor_label: string; meta_json: Record<string, unknown> }>(
       env.db, "SELECT actor_type, actor_label, meta_json FROM audit_log WHERE action = 'mt5.account.created' AND entity_id = ?", [String(c.id)],
@@ -256,6 +258,11 @@ describe.skipIf(!hasDb)("MT5 resolver", () => {
     expect(row).toMatchObject({ status: "unknown", failure: "login_taken", login: null, checks: 0 });
     soon(row.next_check_at, 3_600_000);
     expect(lines.find((l) => l.level === "error")).toMatchObject({ obj: { accountId: id, login } });
+    // MT5 is known to have made that one, so it is not on its way: the client may still open another.
+    const next = await create(c, realBody);
+    expect(next.status).toBe(200);
+    expect(next.body.account.login).not.toBe(String(login));
+    expect(await accountOf(id)).toMatchObject({ status: "unknown", failure: "login_taken" });
   });
 
   it("leaves an account another check already settled alone", async () => {

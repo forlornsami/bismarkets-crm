@@ -1,13 +1,14 @@
 import pino from "pino";
 import request from "supertest";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/server/app";
 import { lockClient } from "../src/server/clients/kyc";
 import { createClientSession } from "../src/server/clients/session";
 import { exec, one, rows, transaction } from "../src/server/lib/db";
 import { depositMethodAccount, lockWallet, postLedger, verifyLedger, walletAccount } from "../src/server/money/ledger";
 import { newReference } from "../src/server/money/references";
-import { FakeGateway } from "./fakes/gateway";
+import { refreshFigures, type AccountRow } from "../src/server/mt5/accounts";
+import { FakeGateway, type Fault } from "./fakes/gateway";
 import { createStaff, hasDb, setup, type TestEnv } from "./helpers";
 
 const MASTER = "Trade-Me-42!";
@@ -442,6 +443,76 @@ describe.skipIf(!hasDb)("client MT5 API", () => {
     expect((await api().patch(`/api/mt5-accounts/${login}/inactive`).set(bearer(c))).body.errors).toEqual({ mt5: ["We could not make this change. Please try again later."] });
   });
 
+  it("answers 409, never a definite no, when the retry after a lost answer fails another way", async () => {
+    const { c, login } = await withAccount();
+    const user = () => fake.user("live", Number(login))!;
+    const change = (path: string, body: Record<string, unknown> = {}) => api().patch(`/api/mt5-accounts/${login}/${path}`).set(bearer(c)).send(body);
+    /** MT5 makes the change but its answer is lost; the retry straight after then fails as `then` says. */
+    const lostThen = (op: "user.update" | "user.password", then: Fault, when?: (r: Record<string, unknown>) => boolean) => {
+      fake.failNext(op, { kind: "unknown-after" }, 1, when);
+      fake.failNext(op, then, 1, when);
+    };
+    const unconfirmed = { status: 409, body: { message: UNCONFIRMED } };
+
+    // Archive: trading is off in MT5 although the retry never got through.
+    lostThen("user.update", { kind: "unavailable" });
+    expect(await change("inactive")).toMatchObject(unconfirmed);
+    expect(user().tradeDisabled).toBe(true);
+    expect((await accountRow(login))!.archived_at).toBeNull();
+    expect((await change("inactive")).status).toBe(200);
+    // Restore: back on in MT5 although the retry was refused.
+    lostThen("user.update", { kind: "refused", code: "mt5_error" });
+    expect(await change("active")).toMatchObject(unconfirmed);
+    expect(user().tradeDisabled).toBe(false);
+    expect((await accountRow(login))!.archived_at).not.toBeNull();
+    expect((await change("active")).status).toBe(200);
+    // Leverage.
+    lostThen("user.update", { kind: "bad_request" });
+    expect(await change("leverage", { leverage: "500" })).toMatchObject(unconfirmed);
+    expect(user().leverage).toBe(500);
+    expect((await accountRow(login))!.leverage).toBe(2000);
+
+    // Passwords: the master one, the investor one alone, and the investor one after the master one went through.
+    const pairs = (main: string, investor: string) => ({ password: main, password_confirmation: main, investor_password: investor, investor_password_confirmation: investor });
+    lostThen("user.password", { kind: "unavailable" });
+    expect(await change("password", pairs("Lost-Main-11!", ""))).toMatchObject(unconfirmed);
+    expect(user().passwords.main).toBe("Lost-Main-11!");
+    lostThen("user.password", { kind: "refused", code: "invalid_password" });
+    expect(await change("password", pairs("", "Lost-Inv-12!"))).toMatchObject(unconfirmed);
+    expect(user().passwords.investor).toBe("Lost-Inv-12!");
+    lostThen("user.password", { kind: "unavailable" }, (r) => r.type === "investor");
+    expect(await change("password", pairs("Lost-Main-13!", "Lost-Inv-13!"))).toMatchObject(unconfirmed);
+    expect(user().passwords).toEqual({ main: "Lost-Main-13!", investor: "Lost-Inv-13!" });
+    const audits = await rows<{ meta_json: { main: boolean; investor: boolean } }>(env.db, "SELECT meta_json FROM audit_log WHERE action = 'mt5.account.password_changed' AND entity_id = ?", [String(c.id)]);
+    expect(audits.map((a) => [a.meta_json.main, a.meta_json.investor])).toEqual([[true, false]]);
+  });
+
+  it("asks MT5 on a restore or a leverage the row already shows, so what a lost answer changed can be put right", async () => {
+    const { c, login } = await withAccount();
+    const user = () => fake.user("live", Number(login))!;
+    const change = (path: string, body: Record<string, unknown> = {}) => api().patch(`/api/mt5-accounts/${login}/${path}`).set(bearer(c)).send(body);
+
+    // An archive MT5 made twice over, with both answers lost: trading is off, the CRM shows the account open.
+    fake.failNext("user.update", { kind: "unknown-after" }, 2);
+    expect((await change("inactive")).status).toBe(409);
+    expect(user().tradeDisabled).toBe(true);
+    expect((await list(c)).body.real_accounts[0]).toMatchObject({ login, status: "active", archived: false });
+    const restored = await change("active");
+    expect(restored.body).toEqual({ success: true, message: "Account restored." });
+    expect(user().tradeDisabled).toBe(false);
+    // Nothing changed in the CRM, so nothing is recorded as restored.
+    expect(await rows(env.db, "SELECT id FROM audit_log WHERE action = 'mt5.account.restored' AND entity_id = ?", [String(c.id)])).toHaveLength(0);
+
+    // The same for a leverage change: MT5 at 1:500, the row still at 1:2000, which the client picks again.
+    fake.failNext("user.update", { kind: "unknown-after" }, 2);
+    expect((await change("leverage", { leverage: "500" })).status).toBe(409);
+    expect(user().leverage).toBe(500);
+    expect((await list(c)).body.real_accounts[0].leverage).toBe("2000");
+    expect((await change("leverage", { leverage: "2000" })).body).toEqual({ success: true, message: "Leverage changed.", leverage: "2000" });
+    expect(user().leverage).toBe(2000);
+    expect((await accountRow(login))!.leverage).toBe(2000);
+  });
+
   it("changes leverage, and the very next list shows it", async () => {
     const { c, login } = await withAccount();
     const res = await api().patch(`/api/mt5-accounts/${login}/leverage`).set(bearer(c)).send({ leverage: "1:500" });
@@ -455,10 +526,12 @@ describe.skipIf(!hasDb)("client MT5 API", () => {
     // The app's request: back to 1:2000.
     expect((await api().patch(`/api/mt5-accounts/${login}/leverage`).set(bearer(c)).send({ leverage: "2000" })).status).toBe(200);
     expect((await list(c)).body.real_accounts[0].leverage).toBe("2000");
-    // The same leverage again does not reach MT5; one that is not offered is refused.
-    const calls = fake.callsTo("user.update").length;
+    // The same leverage again is still asked of MT5 (a lost answer may have left it elsewhere), but
+    // changes and records nothing; one that is not offered is refused.
+    const changes = (await rows(env.db, "SELECT id FROM audit_log WHERE action = 'mt5.account.leverage_changed' AND entity_id = ?", [String(c.id)])).length;
     expect((await api().patch(`/api/mt5-accounts/${login}/leverage`).set(bearer(c)).send({ leverage: 2000 })).status).toBe(200);
-    expect(fake.callsTo("user.update")).toHaveLength(calls);
+    expect(fake.callsTo("user.update").at(-1)!.req).toMatchObject({ login: Number(login), leverage: 2000 });
+    expect(await rows(env.db, "SELECT id FROM audit_log WHERE action = 'mt5.account.leverage_changed' AND entity_id = ?", [String(c.id)])).toHaveLength(changes);
     for (const bad of ["1000", "", null]) {
       expect((await api().patch(`/api/mt5-accounts/${login}/leverage`).set(bearer(c)).send({ leverage: bad })).body.errors).toEqual({ leverage: ["This leverage is not available."] });
     }
@@ -532,6 +605,57 @@ describe.skipIf(!hasDb)("client MT5 API", () => {
     expect(Number(res.headers["retry-after"])).toBeGreaterThan(0);
   });
 
+  it("counts password changes sent at once, so a burst cannot pass the hourly limit", async () => {
+    const { c, login } = await withAccount();
+    const sent = fake.callsTo("user.password").length;
+    const burst = await Promise.all(
+      Array.from({ length: 30 }, (_, i) => {
+        const p = `Burst-Pass-${i}!x`;
+        return api().patch(`/api/mt5-accounts/${login}/password`).set(bearer(c)).send({ password: p, password_confirmation: p });
+      }),
+    );
+    expect(burst.filter((r) => r.status === 200)).toHaveLength(10);
+    expect(burst.filter((r) => r.status === 429)).toHaveLength(20);
+    expect(burst.find((r) => r.status === 429)!.body).toEqual({ message: "Too many password changes. Please wait before trying again." });
+    expect(fake.callsTo("user.password").length - sent).toBe(10);
+  });
+
+  it("counts an account opening where it is decided, so one let in before the limit was used up cannot pass it", async () => {
+    const c = await makeClient();
+    await fund(c.id, 100_000);
+    const sent = fake.callsTo("user.create").length;
+    // Nine openings MT5 turned down use up nine of the ten a day.
+    for (let i = 0; i < 9; i++) {
+      fake.failNext("user.create", { kind: "refused", code: "mt5_error" });
+      expect((await create(c, demoBody())).status).toBe(422);
+    }
+    // A live opening gets past the early gate and is held at its first package read, before its checks...
+    let reached!: () => void;
+    let release!: () => void;
+    const arrived = new Promise<void>((resolve) => (reached = resolve));
+    const held = new Promise<void>((resolve) => (release = resolve));
+    const query = env.db.query.bind(env.db) as (...args: unknown[]) => Promise<unknown>;
+    const spy = vi.spyOn(env.db, "query").mockImplementation((async (...args: unknown[]) => {
+      if (typeof args[0] === "string" && args[0].includes("p.is_visible = 1") && !args[0].includes("FOR SHARE")) {
+        spy.mockRestore();
+        reached();
+        await held;
+      }
+      return query(...args);
+    }) as never);
+    const live = create(c, realBody()).then((r) => r);
+    await arrived;
+    // ...while the tenth is asked of MT5.
+    fake.failNext("user.create", { kind: "refused", code: "mt5_error" });
+    expect((await create(c, demoBody())).status).toBe(422);
+    release();
+    const res = await live;
+    expect(res.status).toBe(429);
+    expect(res.body).toEqual({ message: "You have opened too many accounts today. Please try again tomorrow." });
+    expect(fake.callsTo("user.create").length - sent).toBe(10);
+    expect(await rows(env.db, "SELECT id FROM mt5_accounts WHERE client_id = ? AND is_demo = 0", [c.id])).toHaveLength(0);
+  });
+
   // ---------- Demo top-ups ----------
 
   it("tops up a demo account within the caps", async () => {
@@ -580,6 +704,49 @@ describe.skipIf(!hasDb)("client MT5 API", () => {
     expect(await rows(env.db, "SELECT JSON_EXTRACT(meta_json, '$.amountCents') AS cents FROM audit_log WHERE action = 'mt5.demo.top_up_requested' AND entity_id = ? ORDER BY id", [String(c.id)])).toHaveLength(4);
   });
 
+  it("counts top-ups sent at once, and every attempt, since each one reads the account in MT5 first", async () => {
+    const c = await makeClient();
+    const login = Number((await create(c, demoBody({ demo_amount: 1000 }))).body.account.login);
+    const top = (amount: number) => api().post("/api/mt5-accounts/demo/top-up").set(bearer(c)).send({ login, amount });
+    const topUps = async () => (await rows(env.db, "SELECT id FROM mt5_balance_ops WHERE login = ? AND purpose = 'demo_topup'", [login])).length;
+
+    const burst = await Promise.all(Array.from({ length: 30 }, () => top(100)));
+    expect(burst.filter((r) => r.status === 200)).toHaveLength(20);
+    expect(burst.filter((r) => r.status === 429)).toHaveLength(10);
+    expect(await topUps()).toBe(20);
+    expect(fake.callsTo("balance").filter((x) => x.req.login === login)).toHaveLength(21);
+
+    // A client at the cap who keeps trying: every try reads MT5, so the tries are limited too.
+    const d = await makeClient();
+    const full = Number((await create(d, demoBody({ demo_amount: 1000 }))).body.account.login);
+    fake.setAccount("demo", full, { balanceCents: 100_000_000 });
+    const reads = fake.callsTo("accounts.get").length;
+    for (let i = 0; i < 60; i++) {
+      const res = await api().post("/api/mt5-accounts/demo/top-up").set(bearer(d)).send({ login: full, amount: 100 });
+      expect(res.body.errors).toEqual({ amount: ["Demo accounts can hold up to $1,000,000.00."] });
+    }
+    expect(fake.callsTo("accounts.get").length - reads).toBe(60);
+    const res = await api().post("/api/mt5-accounts/demo/top-up").set(bearer(d)).send({ login: full, amount: 100 });
+    expect(res.status).toBe(429);
+    expect(res.body).toEqual({ message: "Too many top-ups. Please wait before trying again." });
+    expect(fake.callsTo("accounts.get").length - reads).toBe(60);
+  });
+
+  it("answers 'temporarily unavailable' for a top-up MT5 was never reached for", async () => {
+    const c = await makeClient();
+    const login = Number((await create(c, demoBody())).body.account.login);
+    for (const fault of [{ kind: "unavailable" }, { kind: "bad_request" }] as Fault[]) {
+      fake.failNext("balance", fault);
+      const res = await api().post("/api/mt5-accounts/demo/top-up").set(bearer(c)).send({ login, amount: 10 });
+      expect(res.status).toBe(422);
+      expect(res.body).toEqual({ message: UNAVAILABLE, errors: { mt5: [UNAVAILABLE] } });
+    }
+    expect(await rows(env.db, "SELECT status, failure FROM mt5_balance_ops WHERE login = ? AND purpose = 'demo_topup' ORDER BY id", [login])).toEqual([
+      { status: "failed", failure: "unavailable" },
+      { status: "failed", failure: "bad_request" },
+    ]);
+  });
+
   // ---------- Live figures ----------
 
   it("shows live figures when the snapshot is old, the snapshot when MT5 is down, and a balance for a never-read account", async () => {
@@ -610,6 +777,43 @@ describe.skipIf(!hasDb)("client MT5 API", () => {
     } finally {
       fake.down = false;
     }
+  });
+
+  it("reads MT5 once for a burst of list requests, and not again for 15 seconds even when that read failed", async () => {
+    const { c, login } = await withAccount();
+    const stale = (l: string) => exec(env.db, "UPDATE mt5_accounts SET snapshot_at = CURRENT_TIMESTAMP(3) - INTERVAL 1 MINUTE WHERE login = ?", [Number(l)]);
+    const reads = () => fake.callsTo("accounts.get").length;
+    fake.setAccount("live", Number(login), { balanceCents: 4_200 });
+    await stale(login);
+    const before = reads();
+    const burst = await Promise.all(Array.from({ length: 40 }, () => list(c)));
+    expect(burst.every((r) => r.status === 200)).toBe(true);
+    expect(reads() - before).toBe(1);
+    expect((await list(c)).body.real_accounts[0].balance).toBe(42);
+
+    // MT5 out of reach: the read is tried once, and the list keeps answering from the snapshot meanwhile.
+    const other = await withAccount();
+    await stale(other.login);
+    fake.down = true;
+    try {
+      const tried = reads();
+      for (let i = 0; i < 5; i++) expect((await list(other.c)).body.real_accounts[0]).toMatchObject({ login: other.login, balance: 0 });
+      expect(reads() - tried).toBe(1);
+    } finally {
+      fake.down = false;
+    }
+  });
+
+  it("logs a batch of figures MT5 refuses, and keeps the snapshot", async () => {
+    const { c, login } = await withAccount();
+    const [row] = await rows<AccountRow>(env.db, "SELECT * FROM mt5_accounts WHERE login = ?", [Number(login)]);
+    const warned: { obj: unknown; msg: string }[] = [];
+    const log = { warn: (obj: unknown, msg: string) => void warned.push({ obj, msg }) };
+    fake.failNext("accounts.get", { kind: "refused", code: "group_not_allowed" });
+    const [kept] = await refreshFigures(env.db, fake, [{ ...row!, id: Number(row!.id), login: Number(login), snapshot_at: null }], { log });
+    expect(kept).toMatchObject({ snapshot_at: null });
+    expect(warned).toEqual([{ obj: expect.objectContaining({ server: "live", err: expect.objectContaining({ kind: "refused", code: "group_not_allowed" }) }), msg: "MT5 figures could not be read" }]);
+    expect(c.id).toBeGreaterThan(0);
   });
 
   // ---------- Trade history ----------
