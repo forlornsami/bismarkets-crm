@@ -40,10 +40,11 @@ async function main() {
       case "migrate": {
         const ran = await migrate(db);
         console.log(ran.length ? `Applied ${ran.length} migration(s).` : "Database is up to date.");
-        const redrawn = await syncDepositQrs(db);
-        if (redrawn.length) {
-          await auditStandalone(db, { actor: { type: "system", id: null, label: "cli" }, ip: "", userAgent: "cli" }, { action: "payment_method.qr_redrawn", meta: { methods: redrawn } });
-          console.log(`Redrew the QR code of ${redrawn.length} deposit method(s) from the saved address.`);
+        const { redrawn, cleared } = await syncDepositQrs(db);
+        if (redrawn.length || cleared.length) {
+          await auditStandalone(db, { actor: { type: "system", id: null, label: "cli" }, ip: "", userAgent: "cli" }, { action: "payment_method.qr_redrawn", meta: { redrawn, cleared } });
+          if (redrawn.length) console.log(`Redrew the QR code of ${redrawn.length} deposit method(s) from the saved address.`);
+          if (cleared.length) console.log(`Removed the QR code of ${cleared.length} method(s) that should not have one.`);
         }
         break;
       }

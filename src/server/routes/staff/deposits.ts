@@ -798,12 +798,20 @@ export function staffDepositsRouter(deps: AppDeps): Router {
              WHERE id = ? AND status = 'second_approval'`,
           [r.id],
         );
+        // The client's other deposits still waiting for a first approval become two-person too, as later ones do.
+        const others = await rows<{ id: number }>(
+          conn, "SELECT id FROM deposits WHERE client_id = ? AND id <> ? AND status = 'pending' AND needs_second_approval = 0 FOR UPDATE", [r.client_id, r.id],
+        );
+        if (others.length) await exec(conn, `UPDATE deposits SET needs_second_approval = 1 WHERE id IN (${others.map(() => "?").join(", ")})`, others.map((o) => o.id));
         await appendNote(conn, "deposits", r.id, staff, "returned", body.note);
         await writeAudit(conn, ctx(req), {
           action: "deposit.returned", entityType: "client", entityId: r.client_id,
           before: { status: "second_approval", receivedMinor: r.received_minor === null ? null : Number(r.received_minor), senderName: r.sender_name, bankReference: r.bank_reference, receivedOn: r.received_on },
           after: { status: "pending" },
-          meta: { depositId: r.id, reference: r.reference, firstReviewer: person(r.first_reviewed_by, r.first_reviewer_name), internalNote: body.note },
+          meta: {
+            depositId: r.id, reference: r.reference, firstReviewer: person(r.first_reviewed_by, r.first_reviewer_name), internalNote: body.note,
+            ...(others.length ? { alsoTwoPerson: others.map((o) => o.id) } : {}),
+          },
         });
       });
       res.json(await detailOf(req, depositId));

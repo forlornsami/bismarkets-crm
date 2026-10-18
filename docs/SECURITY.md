@@ -296,9 +296,10 @@ review that kind of request.
 - A deposit above the second-approval limit (USD 5,000 by default) needs a
   second approval from someone else, and so does one sent back from the second
   approval, whatever the amount the next reviewer enters. Only staff who give
-  second approvals can reject a sent-back deposit, and the client's next
-  deposits stay two-person while it is open and for 30 days after it is
-  refused (the same screenshot at any time). Those later deposits are not
+  second approvals can reject a sent-back deposit. The client's other deposits
+  still waiting for a first approval become two-person too, and so do their
+  next deposits while it is open and for 30 days after it is refused (the same
+  screenshot at any time). Those later deposits are not
   themselves "sent back": any reviewer may reject them, and refusing them does
   not extend the 30 days.
 - A deposit approved first by whoever set its method's account details, or the

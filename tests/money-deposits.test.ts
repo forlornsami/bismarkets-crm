@@ -384,10 +384,16 @@ describe.skipIf(!hasDb)("staff deposits", () => {
     expect(await credits(d.id)).toBe(1);
 
     // Once sent back, it stays a two-person decision even if the amount found is under the limit.
-    const again = await makeDeposit(await makeClient(), usdBank, { amountMinor: 600_000 });
+    const againClient = await makeClient();
+    const again = await makeDeposit(againClient, usdBank, { amountMinor: 600_000 });
+    // Sent before the send-back, but waiting with it: it becomes two-person too.
+    const sibling = await makeDeposit(againClient, usdBank, { amountMinor: 20_000 });
+    expect((await detail(agent, sibling.id)).twoPersonMark).toBe(false);
     await openProof(agent, again.id);
     expect((await approve(agent, again.id, { receivedAmount: "6000" })).body.status).toBe("second_approval");
     expect((await post(manager, url(again.id, "/return"), { note: "Check the amount on the statement" })).status).toBe(200);
+    expect(await detail(agent, sibling.id)).toMatchObject({ sentBack: false, twoPersonMark: true, needsSecondApproval: true });
+    expect((await audits("deposit.returned", again.id))[0]!.meta_json).toMatchObject({ alsoTwoPerson: [sibling.id] });
     // A first reviewer cannot reject it either: the client could then send it again as a fresh one-person request.
     const refused = "This deposit was sent back from the second approval, so only staff who give second approvals can reject it.";
     expect((await reject(agent, again.id)).body.error.message).toBe(refused);
@@ -892,10 +898,9 @@ describe.skipIf(!hasDb)("staff deposits", () => {
       const uploaded = await makeMethod({ kind: "crypto", name: "USDT BEP20 old", network: "bep20", bank_name: "", account_title: "", account_number: "", wallet_address: bep, qr_mime: "image/png", qr_bytes: await QRCode.toBuffer(link), qr_token: "a".repeat(32) });
       const none = await makeMethod({ kind: "crypto", name: "USDT TRC20 old", network: "trc20", bank_name: "", account_title: "", account_number: "", wallet_address: trc });
       const stray = await makeMethod({ name: "Bank with a picture", qr_mime: "image/png", qr_bytes: await QRCode.toBuffer(trc), qr_token: "b".repeat(32) });
-      const redrawn = await syncDepositQrs(env.db);
       // (The fixture TRC20 method above was made without a picture too.)
-      expect(redrawn.sort()).toEqual([crypto, uploaded, none, stray].sort());
-      expect(await syncDepositQrs(env.db)).toEqual([]);
+      expect(await syncDepositQrs(env.db)).toEqual({ redrawn: [crypto, uploaded, none].sort((a, b) => a - b), cleared: [stray] });
+      expect(await syncDepositQrs(env.db)).toEqual({ redrawn: [], cleared: [] });
       const after = await rows<{ id: number; qr_bytes: Buffer | null; qr_token: string | null }>(env.db, "SELECT id, qr_bytes, qr_token FROM payment_methods WHERE id IN (?, ?, ?) ORDER BY id", [uploaded, none, stray]);
       expect(await decode(after[0]!.qr_bytes!)).toBe(bep);
       expect(after[0]!.qr_token).toMatch(/^[0-9a-f]{32}$/);
