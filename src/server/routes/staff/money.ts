@@ -1,6 +1,5 @@
 import { randomBytes } from "node:crypto";
-import express, { Router, type NextFunction, type Request, type Response } from "express";
-import sharp from "sharp";
+import { Router, type NextFunction, type Request, type Response } from "express";
 import { z } from "zod";
 import { NOT_PLAIN } from "@shared/money";
 import type { Permission } from "@shared/permissions";
@@ -10,8 +9,7 @@ import { auditContext, writeAudit } from "../../lib/audit";
 import { sha256 } from "../../lib/crypto";
 import { exec, one, rows, transaction, type Conn } from "../../lib/db";
 import { badRequest, conflict, forbidden, handler, notFound, parse, unauthorized } from "../../lib/http";
-import { imageInfo } from "../../lib/images";
-import { qrPaysOnly, readQrText } from "../../lib/qr";
+import { addressQr, QR_NETWORKS } from "../../lib/qr";
 import { MAX_AMOUNT_MINOR, rateMicros } from "../../money/amounts";
 import { walletOf } from "../../money/ledger";
 import { clientScope, moneyId } from "../../money/review";
@@ -315,8 +313,11 @@ function settleMethod(m: MethodInput): { method: MethodInput; problems: { field:
   return { method: out, problems };
 }
 
-const MAX_QR_BYTES = 2 * 1024 * 1024;
-const QR_TYPES = ["image/png", "image/jpeg", "image/webp"];
+/** The QR code a crypto deposit method shows clients, drawn from its address, with a new link each time. */
+async function qrOf(m: Pick<MethodInput, "direction" | "kind" | "network" | "walletAddress">) {
+  if (m.direction !== "deposit" || m.kind !== "crypto" || !QR_NETWORKS.has(m.network) || !m.walletAddress) return { mime: null, bytes: null, token: null };
+  return { mime: "image/png", bytes: await addressQr(m.walletAddress), token: randomBytes(16).toString("hex") };
+}
 
 /** Deposit methods, payout types, money limits and client wallets. */
 export function staffMoneyRouter(deps: AppDeps): Router {
@@ -409,11 +410,12 @@ export function staffMoneyRouter(deps: AppDeps): Router {
       const { method, problems } = settleMethod({ ...DEFAULTS, ...body } as MethodInput);
       if (problems.length) throw badRequest("Check the highlighted fields.", problems);
       const staff = staffOf(req);
+      const qr = await qrOf(method);
       const created = await transaction(db, async (conn) => {
         const keys = Object.keys(COLUMNS) as (keyof MethodInput)[];
         // The person who chooses where clients pay cannot alone approve the deposits paid there.
-        const r = await exec(conn, `INSERT INTO payment_methods (${keys.map((k) => COLUMNS[k]).join(", ")}, updated_by, details_set_by) VALUES (${keys.map(() => "?").join(", ")}, ?, ?)`, [
-          ...keys.map((k) => (typeof method[k] === "boolean" ? (method[k] ? 1 : 0) : method[k])), staff.id, method.direction === "deposit" ? staff.id : null,
+        const r = await exec(conn, `INSERT INTO payment_methods (${keys.map((k) => COLUMNS[k]).join(", ")}, qr_mime, qr_bytes, qr_token, updated_by, details_set_by) VALUES (${keys.map(() => "?").join(", ")}, ?, ?, ?, ?, ?)`, [
+          ...keys.map((k) => (typeof method[k] === "boolean" ? (method[k] ? 1 : 0) : method[k])), qr.mime, qr.bytes, qr.token, staff.id, method.direction === "deposit" ? staff.id : null,
         ]);
         await writeAudit(conn, ctx(req), { action: "payment_method.created", entityType: "payment_method", entityId: r.insertId, after: method });
         return loadMethod(conn, r.insertId);
@@ -455,87 +457,23 @@ export function staffMoneyRouter(deps: AppDeps): Router {
           );
           if (Number(used?.n ?? 0) > 0) throw conflict("Clients have accounts saved under this payout type. Add a new type for the other network and disable this one.");
         }
-        // A QR code of the old address would send clients' money there.
-        const qrRemoved = changed.includes("walletAddress") && row.qr_token !== null;
+        // The QR code is redrawn with the address, under a new link, so no copy of the old one pays the old address.
+        const qr = changed.includes("walletAddress") || changed.includes("network") ? await qrOf(method) : null;
         const accountChanged = changed.some((k) => (ACCOUNT_FIELDS as readonly string[]).includes(k));
         const setsDetails = row.direction === "deposit" && accountChanged;
         await exec(
           conn,
-          `UPDATE payment_methods SET ${changed.map((k) => `${COLUMNS[k]} = ?`).join(", ")}${qrRemoved ? ", qr_mime = NULL, qr_bytes = NULL, qr_token = NULL" : ""}${setsDetails ? ", details_set_by = ?" : ""}, updated_by = ? WHERE id = ?`,
-          [...changed.map((k) => (typeof method[k] === "boolean" ? (method[k] ? 1 : 0) : method[k])), ...(setsDetails ? [staff.id] : []), staff.id, methodId],
+          `UPDATE payment_methods SET ${changed.map((k) => `${COLUMNS[k]} = ?`).join(", ")}${qr ? ", qr_mime = ?, qr_bytes = ?, qr_token = ?" : ""}${setsDetails ? ", details_set_by = ?" : ""}, updated_by = ? WHERE id = ?`,
+          [
+            ...changed.map((k) => (typeof method[k] === "boolean" ? (method[k] ? 1 : 0) : method[k])),
+            ...(qr ? [qr.mime, qr.bytes, qr.token] : []), ...(setsDetails ? [staff.id] : []), staff.id, methodId,
+          ],
         );
         await writeAudit(conn, ctx(req), {
           action: "payment_method.updated", entityType: "payment_method", entityId: methodId,
           before: Object.fromEntries(changed.map((k) => [k, current[k]])),
           after: Object.fromEntries(changed.map((k) => [k, method[k]])),
-          meta: { direction: row.direction, kind: row.kind, name: method.name, accountChanged, ...(qrRemoved ? { qrRemoved } : {}) },
-        });
-        return loadMethod(conn, methodId);
-      });
-      res.json(presentMethod(updated));
-    }),
-  );
-
-  // The QR code clients scan to pay a crypto deposit method. Stored re-encoded as PNG, so nothing hidden in the file survives.
-  router.post(
-    "/methods/:id/qr",
-    requirePermission("payment.manage"),
-    stepUp,
-    express.raw({ type: QR_TYPES, limit: MAX_QR_BYTES }),
-    handler(async (req, res) => {
-      const methodId = parse(moneyId, req.params.id);
-      const bytes = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
-      if (bytes.length === 0) throw badRequest("Upload the QR code as a PNG, JPEG or WebP image.");
-      const info = imageInfo(bytes);
-      if (!info || info.type !== req.get("content-type")?.split(";")[0]?.trim()) throw badRequest("This file is not a valid PNG, JPEG or WebP image.");
-      if (Math.min(info.width, info.height) < 64) throw badRequest("The QR code image must be at least 64 pixels on each side.");
-      if (Math.max(info.width, info.height) > 4096) throw badRequest("The QR code image can be at most 4096 pixels on each side.");
-      let png: Buffer;
-      try {
-        png = await sharp(bytes, { limitInputPixels: 4096 * 4096 }).png().toBuffer();
-      } catch {
-        throw badRequest("This image could not be opened.");
-      }
-      // Clients scan the picture, so it must hold the address reviewers check deposits against.
-      const text = await readQrText(png);
-      if (!text) throw badRequest("No QR code could be read in this picture. Upload a clear picture of the QR code alone.");
-      const token = randomBytes(16).toString("hex");
-      const staff = staffOf(req);
-      const updated = await transaction(db, async (conn) => {
-        const row = await loadMethod(conn, methodId, true);
-        if (row.direction !== "deposit" || row.kind !== "crypto") throw badRequest("Only crypto deposit methods have a QR code.");
-        if (!row.wallet_address || !row.network || !qrPaysOnly(text, row.wallet_address, row.network)) {
-          throw badRequest(`This QR code does not pay the method's wallet address (${row.wallet_address || "none saved"}) alone. Upload the QR code of that address.`);
-        }
-        const before = await one<{ qr_bytes: Buffer | null }>(conn, "SELECT qr_bytes FROM payment_methods WHERE id = ?", [methodId]);
-        await exec(conn, "UPDATE payment_methods SET qr_mime = 'image/png', qr_bytes = ?, qr_token = ?, updated_by = ? WHERE id = ?", [png, token, staff.id, methodId]);
-        await writeAudit(conn, ctx(req), {
-          action: "payment_method.qr_changed", entityType: "payment_method", entityId: methodId,
-          before: before?.qr_bytes ? { sha256: sha256(before.qr_bytes) } : null,
-          after: { sha256: sha256(png), bytes: png.length, width: info.width, height: info.height, text: text.slice(0, 300) },
-          meta: { name: row.name, sent: { type: info.type, bytes: bytes.length, sha256: sha256(bytes) } },
-        });
-        return loadMethod(conn, methodId);
-      });
-      res.json(presentMethod(updated));
-    }),
-  );
-
-  router.delete(
-    "/methods/:id/qr",
-    requirePermission("payment.manage"),
-    stepUp,
-    handler(async (req, res) => {
-      const methodId = parse(moneyId, req.params.id);
-      const staff = staffOf(req);
-      const updated = await transaction(db, async (conn) => {
-        const row = await loadMethod(conn, methodId, true);
-        if (!row.qr_token) return row;
-        const before = await one<{ qr_bytes: Buffer | null }>(conn, "SELECT qr_bytes FROM payment_methods WHERE id = ?", [methodId]);
-        await exec(conn, "UPDATE payment_methods SET qr_mime = NULL, qr_bytes = NULL, qr_token = NULL, updated_by = ? WHERE id = ?", [staff.id, methodId]);
-        await writeAudit(conn, ctx(req), {
-          action: "payment_method.qr_removed", entityType: "payment_method", entityId: methodId,
-          before: before?.qr_bytes ? { sha256: sha256(before.qr_bytes) } : null, after: null, meta: { name: row.name },
+          meta: { direction: row.direction, kind: row.kind, name: method.name, accountChanged, ...(qr ? { qrRedrawn: qr.token !== null } : {}) },
         });
         return loadMethod(conn, methodId);
       });

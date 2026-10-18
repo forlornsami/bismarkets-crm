@@ -18,6 +18,16 @@ export interface OutgoingEmail {
 
 export const outboxContext = (to: string, template: string) => `email_outbox:${to}:${template}`;
 
+/** The inbox an address delivers to, so name+tag@ and Gmail's dotted spellings count as one. */
+export function mailbox(email: string) {
+  const at = email.lastIndexOf("@");
+  let local = email.slice(0, at).toLowerCase().split("+")[0]!;
+  let domain = email.slice(at + 1).toLowerCase();
+  if (domain === "googlemail.com") domain = "gmail.com";
+  if (domain === "gmail.com") local = local.replace(/\./g, "");
+  return `${local}@${domain}`;
+}
+
 /** Whether new email goes out now ('queued') or waits in the outbox ('held'). */
 export async function mailEnabled(conn: Conn) {
   const r = await one<{ enabled: number }>(conn, "SELECT enabled FROM mail_settings WHERE id = 1");

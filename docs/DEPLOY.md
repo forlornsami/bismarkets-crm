@@ -99,9 +99,9 @@ the client portal and app call) at the server, get certificates
 (`apt install certbot python3-certbot-nginx && certbot --nginx`), and proxy.
 Bodies stay small everywhere except the uploads that need more: KYC uploads
 carry up to two 10 MB files, a deposit carries a 10 MB payment screenshot, a
-saved payout account may carry a 10 MB QR image, a client's profile picture is
-a 1 MB image sent as a form, and staff upload deposit-method QR images of up
-to 2 MB.
+saved payout account may carry a 10 MB QR image, and a client's profile
+picture is a 1 MB image sent as a form. (Deposit-method QR codes are drawn by
+the CRM from the saved address, so nothing is uploaded for them.)
 
 ```nginx
 # At http level (outside the server blocks): the origins that may call the
@@ -128,10 +128,10 @@ server {
     proxy_read_timeout 150s;
     proxy_pass http://127.0.0.1:3000;
   }
-  # QR images of the broker's crypto deposit addresses.
-  location ~ ^/api/staff/money/methods/[0-9]+/qr$ {
-    client_max_body_size 3m;
-    proxy_pass http://127.0.0.1:3000;
+  # QR code links belong to the client host only (see below).
+  location ~* ^/+api/+(payout|payment)-qr/ {
+    access_log off;
+    return 404;
   }
 }
 
@@ -193,9 +193,11 @@ server {
     proxy_read_timeout 90s;
     proxy_pass http://127.0.0.1:3000;
   }
-  # QR code pictures: the link itself is the secret, so it stays out of the access log.
+  # QR code pictures: the link itself is the secret, so it stays out of the
+  # access log, and out of the error log when the CRM is restarting.
   location ~* ^/+api/+(payout|payment)-qr/ {
     access_log off;
+    error_log /var/log/nginx/error.log crit;
     proxy_pass http://127.0.0.1:3000;
   }
 }
@@ -215,8 +217,11 @@ server is busy. With nginx's default of 60 s the client would see a `504` while
 the CRM still stores the document.
 
 A QR code picture's link (`/api/payout-qr/…`, `/api/payment-qr/…`) is all that
-protects it, so nginx does not log those requests, and the CRM logs them with
-the token replaced by `:token`.
+protects it. nginx serves those links on the client host only, keeps them out
+of its access log, and logs only critical errors for them (a failed connection
+to the CRM is not logged, as that line would carry the link). The CRM logs them
+with the token replaced by `:token`. Treat nginx's error log as private all the
+same.
 
 With nginx on the same host, `CRM_TRUSTED_PROXIES=127.0.0.1`. If Cloudflare is
 in front, use nginx's `real_ip` module with Cloudflare's published ranges so

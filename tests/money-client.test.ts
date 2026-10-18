@@ -478,6 +478,22 @@ describe.skipIf(!hasDb)("client money API", () => {
     const third = await deposit(ann, { method: String(m.bankUsd), amount: "75", wallet_key: ann.key }, fresh);
     expect(third.status).toBe(201);
     expect(await twoPerson(third.body.deposit.reference)).toBe(1);
+    // A re-saved copy of the screenshot has other bytes, so the mark follows the client: while
+    // such a deposit is open, and for 30 days after one is refused.
+    const resaved = async (shade: string) => sharp(fresh).extend({ right: 1, background: shade }).png().toBuffer();
+    const fourth = await deposit(ann, { method: String(m.bankUsd), amount: "74", wallet_key: ann.key }, await resaved("#000001"));
+    expect(await twoPerson(fourth.body.deposit.reference)).toBe(1);
+    const sentBack = [resent.body.deposit.reference, third.body.deposit.reference, fourth.body.deposit.reference];
+    await exec(env.db, "UPDATE deposits SET status = 'rejected', decided_at = NOW(3) - INTERVAL 29 DAY WHERE reference IN (?, ?, ?)", sentBack);
+    const fifth = await deposit(ann, { method: String(m.bankUsd), amount: "73", wallet_key: ann.key }, await resaved("#000002"));
+    expect(await twoPerson(fifth.body.deposit.reference)).toBe(1);
+    await exec(env.db, "UPDATE deposits SET status = 'rejected', decided_at = NOW(3) - INTERVAL 31 DAY WHERE reference IN (?, ?, ?, ?)", [...sentBack, fifth.body.deposit.reference]);
+    const sixth = await deposit(ann, { method: String(m.bankUsd), amount: "72", wallet_key: ann.key }, await resaved("#000003"));
+    expect(await twoPerson(sixth.body.deposit.reference)).toBe(0);
+    // The very same screenshot keeps the mark however long ago.
+    const same = await deposit(ann, { method: String(m.bankUsd), amount: "75", wallet_key: ann.key }, fresh);
+    expect(await twoPerson(same.body.deposit.reference)).toBe(1);
+    await exec(env.db, "UPDATE deposits SET status = 'rejected', decided_at = NOW(3) - INTERVAL 31 DAY WHERE reference IN (?, ?)", [sixth.body.deposit.reference, same.body.deposit.reference]);
   });
 
   it("keeps at most five deposits waiting, but still answers a retry of one of them", async () => {

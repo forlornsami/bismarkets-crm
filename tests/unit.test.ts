@@ -1,12 +1,13 @@
-import QRCode from "qrcode";
+import jsQR from "jsqr";
 import sharp from "sharp";
 import { describe, expect, it } from "vitest";
 import { canonical, entryHash, GENESIS_HASH } from "../src/server/lib/audit";
 import { decryptField, encryptField } from "../src/server/lib/crypto";
 import { buildAllowList, isAllowed, normalizeIp } from "../src/server/lib/ip";
 import { isBreachedPassword, passwordProblem } from "../src/server/lib/passwords";
+import { mailbox } from "../src/server/lib/email";
 import { loggablePath } from "../src/server/lib/logger";
-import { qrPaysOnly, readQrText } from "../src/server/lib/qr";
+import { addressQr } from "../src/server/lib/qr";
 import { base32Decode, base32Encode, hotp, verifyTotp } from "../src/server/lib/totp";
 import { splitStatements } from "../src/server/migrate";
 import { temporaryPassword } from "../src/server/staff/guards";
@@ -188,41 +189,21 @@ describe("request log paths", () => {
   });
 });
 
-describe("QR codes", () => {
-  it("reads a QR code, and gives up on a picture made to keep the reader busy without stalling the server", async () => {
-    expect(await readQrText(await QRCode.toBuffer("TJ1aBcDeFgHiJkLmNoPqRsTuVwXyZ12345", { width: 600 }))).toBe("TJ1aBcDeFgHiJkLmNoPqRsTuVwXyZ12345");
-    // 1 px vertical stripes: seconds of work for the reader.
-    const stripes = Buffer.alloc(1200 * 1200 * 3);
-    for (let i = 0; i < 1200 * 1200; i++) stripes.fill(i % 2 ? 0 : 255, i * 3, i * 3 + 3);
-    const picture = await sharp(stripes, { raw: { width: 1200, height: 1200, channels: 3 } }).png().toBuffer();
-    let last = Date.now();
-    let longest = 0;
-    const tick = setInterval(() => {
-      longest = Math.max(longest, Date.now() - last);
-      last = Date.now();
-    }, 10);
-    const started = Date.now();
-    const text = await readQrText(picture, 1500);
-    clearInterval(tick);
-    expect(text).toBeNull();
-    expect(Date.now() - started).toBeLessThan(4000);
-    expect(longest).toBeLessThan(400);
-  }, 15_000);
+describe("email inboxes", () => {
+  it("counts a +tag and Gmail's dotted spellings as the same inbox", () => {
+    expect(mailbox("Outside@Elsewhere.test")).toBe("outside@elsewhere.test");
+    expect(mailbox("inbox+7@elsewhere.test")).toBe("inbox@elsewhere.test");
+    expect(mailbox("In.B.ox+x@GoogleMail.com")).toBe("inbox@gmail.com");
+    expect(mailbox("in.box@elsewhere.test")).toBe("in.box@elsewhere.test");
+  });
+});
 
-  it("accepts a QR code that pays the address alone", () => {
-    const trc = "TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE";
-    const other = "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf";
-    expect(qrPaysOnly(trc, trc, "trc20")).toBe(true);
-    expect(qrPaysOnly(`tron:${trc}?amount=10`, trc, "trc20")).toBe(true);
-    expect(qrPaysOnly(`tron:${trc}?token=TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t`, trc, "trc20")).toBe(true);
-    for (const text of [`tron:${other}?memo=${trc}`, `${other}\n${trc}`, `https://evil.example/pay/${other}#${trc}`, `${trc}9`, ""]) {
-      expect([text, qrPaysOnly(text, trc, "trc20")]).toEqual([text, false]);
+describe("QR codes", () => {
+  it("draws a deposit QR code that holds the wallet address and nothing else", async () => {
+    for (const address of ["TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE", "0x52908400098527886E0F7030069857D2E4169EE7"]) {
+      const { data, info } = await sharp(await addressQr(address)).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+      expect(info.width).toBeGreaterThanOrEqual(400);
+      expect(jsQR(new Uint8ClampedArray(data.buffer, data.byteOffset, data.length), info.width, info.height)?.data).toBe(address);
     }
-    const bep = "0x52908400098527886E0F7030069857D2E4169EE7";
-    expect(qrPaysOnly(bep.toLowerCase(), bep, "bep20")).toBe(true);
-    expect(qrPaysOnly(`ethereum:0x55d398326f99059fF775485246999027B3197955@56/transfer?address=${bep}`, bep, "bep20")).toBe(true);
-    expect(qrPaysOnly(`ethereum:0x2222222222222222222222222222222222222222@56/transfer?address=${bep}`, bep, "bep20")).toBe(false);
-    expect(qrPaysOnly("123456789", "123456789", "binance_pay")).toBe(true);
-    expect(qrPaysOnly("pay 987654321 ref 123456789", "123456789", "binance_pay")).toBe(false);
   });
 });

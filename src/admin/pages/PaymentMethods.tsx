@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowDownToLine, ArrowUpFromLine, ImageUp, Lock, Pencil, Plus, Trash2 } from "lucide-react";
+import { ArrowDownToLine, ArrowUpFromLine, Lock, Pencil, Plus } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { ImageCanvas, KIND_LABEL, minorText, money, networkLabel, NETWORK_LABEL, parseAmountText, rateText, usePaymentMethods, type PaymentMethod, type Person } from "../components/money";
 import { DecisionError } from "../components/ReviewWorkbench";
@@ -161,7 +161,7 @@ function MethodTable({ title, icon, help, direction, items, loading, editable, o
                 ) : (
                   <td data-label="QR code">{m.kind === "crypto" ? (m.askQr ? "Client must add one" : "Not asked") : <span className="muted">–</span>}</td>
                 )}
-                {deposit && <td data-label="QR code">{m.kind === "crypto" ? (m.hasQr ? <Badge tone="good">Added</Badge> : <Badge tone="warn">None</Badge>) : <span className="muted">–</span>}</td>}
+                {deposit && <td data-label="QR code">{m.kind === "crypto" ? (m.hasQr ? <Badge tone="good">Drawn</Badge> : <span className="muted">None</span>) : <span className="muted">–</span>}</td>}
                 <td data-label="In use">
                   {m.usage?.open ? `${m.usage.open} open · ` : ""}
                   {m.usage?.total ?? 0} in total
@@ -346,7 +346,7 @@ function MethodDialog({ method, direction, onCreated, onClose }: { method?: Paym
       return api.patch<PaymentMethod>(`/api/staff/money/methods/${method.id}`, patch);
     },
     onSuccess: (res) => {
-      // A new method is shown straight away (its QR code is added in the same dialog), then the list reloads.
+      // A new method is shown straight away (its QR code appears in the same dialog), then the list reloads.
       if (!method && res && typeof res === "object" && "id" in res)
         client.setQueryData(METHODS_KEY, (old: { items: PaymentMethod[] } | undefined) => (old ? { items: [...old.items.filter((m) => m.id !== res.id), { ...res, direction, kind: f.kind }] } : old));
       void client.invalidateQueries({ queryKey: METHODS_KEY });
@@ -355,7 +355,7 @@ function MethodDialog({ method, direction, onCreated, onClose }: { method?: Paym
         onClose();
       } else {
         const created = res && typeof res === "object" && "id" in res ? res : null;
-        toast(created && deposit && f.kind === "crypto" ? `${f.name.trim()} added. Add its QR code below.` : `${f.name.trim()} added.`);
+        toast(created && deposit && f.kind === "crypto" ? `${f.name.trim()} added. Scan its QR code below to check it shows the address.` : `${f.name.trim()} added.`);
         if (created) onCreated({ ...created, direction, kind: f.kind });
         else onClose();
       }
@@ -500,74 +500,24 @@ function MethodDialog({ method, direction, onCreated, onClose }: { method?: Paym
   );
 }
 
-const QR_TYPES = ["image/png", "image/jpeg", "image/webp"];
-const QR_MAX = 2 * 1024 * 1024;
-
-/** The QR code clients scan to pay a crypto deposit method. */
+/** The QR code clients scan to pay a crypto deposit method, drawn by the CRM from the saved address. */
 function QrSection({ method }: { method: PaymentMethod }) {
-  const client = useQueryClient();
-  const { toast, confirm } = useFeedback();
-  const input = useRef<HTMLInputElement>(null);
-  const done = (text: string) => {
-    toast(text);
-    void client.invalidateQueries({ queryKey: METHODS_KEY });
-  };
-  const upload = useMutation({
-    mutationFn: (file: File) => api.post(`/api/staff/money/methods/${method.id}/qr`, file),
-    onSuccess: () => done("QR code saved. Clients see it with the wallet address."),
-    onError: (e) => toast(e instanceof Error ? e.message : "The QR code could not be saved.", "bad"),
-  });
-  const remove = useMutation({
-    mutationFn: () => api.del(`/api/staff/money/methods/${method.id}/qr`),
-    onSuccess: () => done("QR code removed."),
-    onError: (e) => toast(e instanceof Error ? e.message : "The QR code could not be removed.", "bad"),
-  });
-  const pick = (file: File | undefined) => {
-    if (!file) return;
-    if (!QR_TYPES.includes(file.type)) return toast("Choose a PNG, JPEG or WebP image.", "bad");
-    if (file.size > QR_MAX) return toast("The image must be 2 MB or smaller.", "bad");
-    upload.mutate(file);
-  };
-  const busy = upload.isPending || remove.isPending;
   return (
     <section className="review-other" style={{ marginBottom: 14 }}>
       <div className="review-other-head">
         <strong>QR code</strong>
-        {method.hasQr ? <Badge tone="good">Added</Badge> : <Badge tone="warn">None</Badge>}
+        {method.hasQr ? <Badge tone="good">Drawn</Badge> : <Badge tone="warn">None</Badge>}
       </div>
       {method.hasQr ? (
-        <div className="qr-wrap">
-          <ImageCanvas key={method.updatedAt} url={method.qrUrl ?? `/api/staff/money/methods/${method.id}/qr`} label={`QR code for ${method.name}`} size={200} />
-        </div>
+        <>
+          <div className="qr-wrap">
+            <ImageCanvas key={method.updatedAt} url={method.qrUrl ?? `/api/staff/money/methods/${method.id}/qr`} label={`QR code for ${method.name}`} size={200} />
+          </div>
+          <small className="muted">Drawn from the wallet address above and redrawn when it changes. Scan it once yourself to check it shows that address.</small>
+        </>
       ) : (
-        <small className="muted">Clients scan it to pay. Make it from the same wallet address shown above, and scan it once yourself to check.</small>
+        <small className="muted">Binance Pay has no QR code: clients type the Pay ID.</small>
       )}
-      <div className="kyc-actions">
-        <button type="button" className="button button-small" disabled={busy} onClick={() => input.current?.click()}>
-          {upload.isPending ? <Spinner /> : <ImageUp size={14} />} {method.hasQr ? "Replace" : "Upload"}
-        </button>
-        {method.hasQr && (
-          <button
-            type="button"
-            className="button button-small button-ghost"
-            disabled={busy}
-            onClick={async () => (await confirm({ title: "Remove the QR code?", body: "Clients will see only the wallet address.", confirmLabel: "Remove" })) && remove.mutate()}
-          >
-            <Trash2 size={14} /> Remove
-          </button>
-        )}
-        <small className="muted">PNG, JPEG or WebP, up to 2 MB</small>
-      </div>
-      <input
-        ref={input}
-        type="file"
-        accept={QR_TYPES.join(",")}
-        hidden
-        onChange={(e) => {
-          pick(e.target.files?.[0]);
-          e.target.value = "";
-        }}
-      />
     </section>
   );
 }

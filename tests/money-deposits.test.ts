@@ -1,5 +1,7 @@
+import jsQR from "jsqr";
 import QRCode from "qrcode";
 import sharp from "sharp";
+import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { DEPOSIT_CHECKLIST, DEPOSIT_REJECT_REASONS } from "@shared/money";
 import { encryptBytes, sha256 } from "../src/server/lib/crypto";
@@ -825,59 +827,51 @@ describe.skipIf(!hasDb)("staff deposits", () => {
       expect((await patch(agent, `${methods}/${m.id}`, { isEnabled: true })).status).toBe(403);
     });
 
-    it("stores a crypto deposit method's QR code as a clean PNG and shows it to staff", async () => {
-      const qr = await sharp(await QRCode.toBuffer(TRC20, { width: 300 })).jpeg().withExifMerge({ IFD0: { Software: "Adobe Photoshop 25.0" } }).toBuffer();
-      const upload = (s: SignedIn, id: number, body: Buffer, type = "image/jpeg") => s.agent.post(`${methods}/${id}/qr`).set("Origin", ORIGIN).set("X-CSRF-Token", s.csrf).set("Content-Type", type).send(body);
-      expect((await upload(agent, crypto, qr)).status).toBe(403);
-      expect((await upload(manager, usdBank, qr)).body.error.message).toBe("Only crypto deposit methods have a QR code.");
-      expect((await upload(manager, crypto, qr, "image/png")).status).toBe(400);
-      expect((await upload(manager, crypto, Buffer.from("<svg/>"), "image/svg+xml")).status).toBe(400);
-      const tiny = await sharp({ create: { width: 20, height: 20, channels: 3, background: "#000" } }).png().toBuffer();
-      expect((await upload(manager, crypto, tiny, "image/png")).status).toBe(400);
-      // Clients scan it, so it must hold the method's own address.
-      const blank = await sharp({ create: { width: 300, height: 300, channels: 3, background: "#000000" } }).png().toBuffer();
-      expect((await upload(manager, crypto, blank, "image/png")).body.error.message).toBe("No QR code could be read in this picture. Upload a clear picture of the QR code alone.");
-      const notOurs = `This QR code does not pay the method's wallet address (${TRC20}) alone. Upload the QR code of that address.`;
-      expect((await upload(manager, crypto, await QRCode.toBuffer("TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE", { width: 300 }), "image/png")).body.error.message).toBe(notOurs);
-      // A payment link that pays another address while naming ours in a parameter.
-      expect((await upload(manager, crypto, await QRCode.toBuffer(`tron:TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE?note=${TRC20}`, { width: 300 }), "image/png")).body.error.message).toBe(notOurs);
-      expect((await upload(manager, crypto, await QRCode.toBuffer(`${TRC20}9`, { width: 300 }), "image/png")).status).toBe(400);
-      const res = await upload(manager, crypto, qr);
-      expect(res.status).toBe(200);
-      expect(res.body).toMatchObject({ id: crypto, hasQr: true, qrUrl: expect.stringMatching(new RegExp(`^/api/staff/money/methods/${crypto}/qr\\?v=[0-9a-f]{12}$`)) });
-      const token = (await one<{ qr_token: string }>(env.db, "SELECT qr_token FROM payment_methods WHERE id = ?", [crypto]))!.qr_token;
+    it("draws a crypto deposit method's QR code from its own address and redraws it with the address", async () => {
+      const decode = async (png: Buffer) => {
+        const { data, info } = await sharp(png).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+        return jsQR(new Uint8ClampedArray(data.buffer, data.byteOffset, data.length), info.width, info.height)?.data;
+      };
+      const trc = "TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE";
+      const res = await post(manager, methods, { direction: "deposit", kind: "crypto", name: "USDT TRC20", network: "trc20", walletAddress: trc });
+      expect(res.status).toBe(201);
+      expect(res.body).toMatchObject({ hasQr: true, qrUrl: expect.stringMatching(new RegExp(`^/api/staff/money/methods/${res.body.id}/qr\\?v=[0-9a-f]{12}$`)) });
+      const token = (await one<{ qr_token: string }>(env.db, "SELECT qr_token FROM payment_methods WHERE id = ?", [res.body.id]))!.qr_token;
       expect(token).toMatch(/^[0-9a-f]{32}$/);
       expect(JSON.stringify(res.body)).not.toContain(token);
-      const shown = await sales.agent.get(res.body.qrUrl);
+      const shown = await sales.agent.get(res.body.qrUrl).buffer(true);
       expect(shown.status).toBe(200);
       expect(shown.headers["content-type"]).toBe("image/png");
       expect(shown.headers["content-security-policy"]).toBe("default-src 'none'; sandbox");
       expect(shown.headers["x-content-type-options"]).toBe("nosniff");
-      const meta = await sharp(shown.body as Buffer).metadata();
-      expect([meta.format, meta.width, meta.exif]).toEqual(["png", 300, undefined]);
+      expect(await decode(shown.body as Buffer)).toBe(trc);
       expect((await dealing.agent.get(res.body.qrUrl)).status).toBe(403);
-      // A new image gets a new address; a payment link naming the address is fine.
-      const second = await upload(manager, crypto, await QRCode.toBuffer(`tron:${TRC20}?amount=10`, { width: 200 }), "image/png");
-      expect(second.body.qrUrl).not.toBe(res.body.qrUrl);
-      const changedAudit = await one<{ after_json: Record<string, unknown> }>(env.db, "SELECT after_json FROM audit_log WHERE action = 'payment_method.qr_changed' AND entity_id = ? ORDER BY id DESC LIMIT 1", [String(crypto)]);
-      expect(changedAudit!.after_json).toMatchObject({ text: `tron:${TRC20}?amount=10` });
-      const removed = await del(manager, `${methods}/${crypto}/qr`);
-      expect(removed.body).toMatchObject({ hasQr: false, qrUrl: null });
-      expect((await sales.agent.get(`${methods}/${crypto}/qr`)).status).toBe(404);
-      const trail = await rows<{ action: string }>(env.db, "SELECT action FROM audit_log WHERE entity_type = 'payment_method' AND entity_id = ? ORDER BY id", [String(crypto)]);
-      expect(trail.map((a) => a.action)).toEqual(["payment_method.qr_changed", "payment_method.qr_changed", "payment_method.qr_removed"]);
+      // Clients get the same picture, and nobody can put another one in its place.
+      const forClients = await request(env.app).get(`/api/payment-qr/${token}`).buffer(true);
+      expect(await decode(forClients.body as Buffer)).toBe(trc);
+      const picture = await QRCode.toBuffer(`tron:TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf?note=${trc}`, { width: 300 });
+      const upload = await manager.agent.post(`${methods}/${res.body.id}/qr`).set("Origin", ORIGIN).set("X-CSRF-Token", manager.csrf).set("Content-Type", "image/png").send(picture);
+      expect(upload.status).toBe(404);
+      expect((await del(manager, `${methods}/${res.body.id}/qr`)).status).toBe(404);
 
-      // A new wallet address takes the old QR code with it.
-      const bep = (await post(manager, methods, { direction: "deposit", kind: "crypto", name: "USDT BEP20", network: "bep20", walletAddress: "0x52908400098527886E0F7030069857D2E4169EE7" })).body;
-      expect((await upload(manager, bep.id, await QRCode.toBuffer("0x52908400098527886e0f7030069857d2e4169ee7", { width: 300 }), "image/png")).body.hasQr).toBe(true);
-      // A USDT transfer link names the token contract besides the payee; any other address is refused.
-      const usdtLink = (contract: string) => `ethereum:${contract}@56/transfer?address=0x52908400098527886E0F7030069857D2E4169EE7&uint256=1e19`;
-      expect((await upload(manager, bep.id, await QRCode.toBuffer(usdtLink("0x55d398326f99059fF775485246999027B3197955"), { width: 300 }), "image/png")).status).toBe(200);
-      expect((await upload(manager, bep.id, await QRCode.toBuffer(usdtLink("0x2222222222222222222222222222222222222222"), { width: 300 }), "image/png")).status).toBe(400);
-      const moved = await patch(manager, `${methods}/${bep.id}`, { walletAddress: "0x1111111111111111111111111111111111111111" });
-      expect(moved.body).toMatchObject({ walletAddress: "0x1111111111111111111111111111111111111111", hasQr: false, qrUrl: null });
-      const audit = await one<{ meta_json: Record<string, unknown> }>(env.db, "SELECT meta_json FROM audit_log WHERE action = 'payment_method.updated' AND entity_id = ? ORDER BY id DESC LIMIT 1", [String(bep.id)]);
-      expect(audit!.meta_json).toMatchObject({ accountChanged: true, qrRemoved: true });
+      // A new address is drawn under a new link; the old link stops working.
+      const other = "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf";
+      const moved = await patch(manager, `${methods}/${res.body.id}`, { walletAddress: other });
+      expect(moved.body).toMatchObject({ walletAddress: other, hasQr: true });
+      expect(moved.body.qrUrl).not.toBe(res.body.qrUrl);
+      expect((await request(env.app).get(`/api/payment-qr/${token}`)).status).toBe(404);
+      expect(await decode((await sales.agent.get(moved.body.qrUrl).buffer(true)).body as Buffer)).toBe(other);
+      const audit = await one<{ meta_json: Record<string, unknown> }>(env.db, "SELECT meta_json FROM audit_log WHERE action = 'payment_method.updated' AND entity_id = ? ORDER BY id DESC LIMIT 1", [String(res.body.id)]);
+      expect(audit!.meta_json).toMatchObject({ accountChanged: true, qrRedrawn: true });
+      // Wording changes keep the picture and its link.
+      expect((await patch(manager, `${methods}/${res.body.id}`, { feeLabel: "Network fee only" })).body.qrUrl).toBe(moved.body.qrUrl);
+
+      const bep = "0x52908400098527886E0F7030069857D2E4169EE7";
+      const bsc = (await post(manager, methods, { direction: "deposit", kind: "crypto", name: "USDT BEP20", network: "bep20", walletAddress: bep })).body;
+      expect(await decode((await sales.agent.get(bsc.qrUrl).buffer(true)).body as Buffer)).toBe(bep);
+      // A Pay ID is typed, not scanned; bank accounts have no QR code.
+      expect((await post(manager, methods, { direction: "deposit", kind: "crypto", name: "Binance Pay", network: "binance_pay", walletAddress: "123456789" })).body).toMatchObject({ hasQr: false, qrUrl: null });
+      expect((await post(manager, methods, { ...bank, name: "HBL QR test" })).body).toMatchObject({ hasQr: false, qrUrl: null });
     });
 
     it("keeps a payout type's network while clients have accounts saved under it", async () => {

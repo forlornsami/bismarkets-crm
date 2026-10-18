@@ -295,7 +295,10 @@ review that kind of request.
 
 - A deposit above the second-approval limit (USD 5,000 by default) needs a
   second approval from someone else, and so does one sent back from the second
-  approval, whatever the amount the next reviewer enters.
+  approval, whatever the amount the next reviewer enters. Only staff who give
+  second approvals can reject a sent-back deposit, and the client's next
+  deposits stay two-person while it is open and for 30 days after it is
+  refused (the same screenshot at any time).
 - A deposit approved first by whoever set its method's account details, or the
   rupee rate it uses, goes to a second person whatever the amount. The second
   reviewer is asked to check that the account is the company's own and the
@@ -314,10 +317,12 @@ review that kind of request.
 
 **Where clients pay.** A deposit method's account details cannot change while
 deposits paid to it wait for review (add a new method instead). A crypto
-method's QR code must decode to a payment of its own wallet address and no
-other (a payment link that names another address is refused), and a new
-address removes the old QR code. QR pictures are read in a worker thread with a
-5-second limit. A payout type's network cannot change once clients have saved
+method's QR code is drawn by the CRM from the method's own wallet address
+(TRC20 and BEP20; a Binance Pay ID is typed, not scanned). Staff cannot upload
+a picture in its place, so the code clients scan cannot hold a second code or a
+payment link to another address. A new address is drawn under a new link and
+the old link stops working, and whoever changes the address cannot approve
+deposits to it alone. A payout type's network cannot change once clients have saved
 accounts under it, and its name must carry its own network's word only, as the
 portal and app choose the form by name.
 

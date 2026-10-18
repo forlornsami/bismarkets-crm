@@ -31,6 +31,8 @@ const IMAGE_FORM_LIMIT = PROOF_MAX_BYTES + 512 * 1024;
 const OPEN_DEPOSITS = ["pending", "second_approval"];
 const OPEN_WITHDRAWALS = ["pending", "second_approval", "approved"];
 const MAX_OPEN_DEPOSITS = 5;
+/** How long a refused deposit that was sent back from the second approval keeps the client's next deposits two-person. */
+const SENT_BACK_DAYS = 30;
 const MAX_OPEN_WITHDRAWALS = 3;
 const MAX_PAYOUT_METHODS = 10;
 /** A retry of the same request (same method, amount and screenshot) within this time is answered with the first one. */
@@ -411,10 +413,15 @@ export function clientMoneyRouter(deps: AppDeps): Router {
         if (again) return { row: again, isNew: false };
         const { method } = request;
         if (!(await one(conn, `${DEPOSIT_METHOD} AND id = ?`, [method.id]))) throw fieldError("method", "Choose a deposit method.");
-        // The same screenshot as a deposit sent back from the second approval stays a two-person decision.
+        // A deposit sent back from the second approval stays a two-person decision when it comes back:
+        // the same screenshot at any time, and any deposit while one is open or was refused in the last
+        // SENT_BACK_DAYS days, since a re-saved copy of the screenshot has different bytes.
         const sentBack = await one(
           conn,
-          "SELECT 1 AS x FROM deposits d JOIN deposit_proofs p ON p.deposit_id = d.id WHERE d.client_id = ? AND p.sha256 = ? AND d.needs_second_approval = 1 LIMIT 1",
+          `SELECT 1 AS x FROM deposits d WHERE d.client_id = ? AND d.needs_second_approval = 1
+             AND (d.status IN ('pending', 'second_approval') OR (d.status = 'rejected' AND d.decided_at > NOW(3) - INTERVAL ${SENT_BACK_DAYS} DAY)
+                  OR EXISTS (SELECT 1 FROM deposit_proofs p WHERE p.deposit_id = d.id AND p.sha256 = ?))
+           LIMIT 1`,
           [client.id, request.sha256],
         );
         const { id, reference } = await withReference("D", async (reference) => {

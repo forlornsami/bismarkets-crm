@@ -27,7 +27,7 @@ import { notifyClient } from "../../clients/notifications";
 import { auditContext, auditStandalone, writeAudit } from "../../lib/audit";
 import { sha256 } from "../../lib/crypto";
 import { exec, one, transaction } from "../../lib/db";
-import { queueEmail } from "../../lib/email";
+import { mailbox, queueEmail } from "../../lib/email";
 import { handler, HttpError } from "../../lib/http";
 import { dummyPasswordHash, hashPassword, isBreachedPassword, verifyPassword } from "../../lib/passwords";
 import { deletePicture, PICTURE_MAX_BYTES, savePicture, sendPicture } from "../../lib/pictures";
@@ -157,7 +157,7 @@ export function clientAuthRouter(deps: AppDeps): Router {
       limit(otpEmailBurst, key, "Please wait before requesting another code.");
       limit(otpEmailHour, key, "Too many codes requested. Please wait before retrying.");
       // A new address is anyone's to type in: however many accounts ask, it gets a few codes an hour.
-      if (purpose === "update_email") limit(otpAddressHour, email.toLowerCase(), "Too many codes requested. Please wait before retrying.");
+      if (purpose === "update_email") limit(otpAddressHour, mailbox(email), "Too many codes requested. Please wait before retrying.");
       const code = newEmailCode();
       await transaction(db, async (conn) => {
         if (signedIn)
