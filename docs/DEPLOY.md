@@ -236,3 +236,204 @@ in front, use nginx's `real_ip` module with Cloudflare's published ranges so
 - Hourly `node dist/cli.mjs verify-ledger` from cron; alert if it exits
   non-zero (a wallet, deposit or withdrawal that does not match the ledger).
 - `unattended-upgrades` for security patches.
+
+## 7. The MT5 gateway
+
+The CRM never holds MT5 credentials. A separate service, the MT5 gateway
+(`dist/gateway.mjs`), holds the manager logins and is the only thing that talks
+to MT5. It runs as its own user from code only root can change, listens on
+127.0.0.1 only, and answers only requests signed with the secret it shares with
+the CRM (see `docs/SECURITY.md`, "MT5 gateway"). With `CRM_MT5_GATEWAY_URL`
+unset the CRM runs without MT5: lists answer from the database and every MT5
+change is refused as "temporarily unavailable".
+
+**Ask the broker for:**
+
+- The Web API access server's host and port (HTTPS), and the SHA-256
+  fingerprint of its certificate, given to you over a second channel (phone,
+  signed email) so you can check the one you see.
+- A manager login for the CRM alone, with Web API access allowed on that access
+  server (`ACCESS_ALLOW_WEB_API`), this VPS's IP on the manager's allowed IP
+  list, and only the rights it needs: read and edit accounts, balance operations
+  (dealer), read trades. No administrator rights.
+- The exact group names: the live group behind each account package, and the
+  demo groups. Demo groups should be on the same platform as live, since the
+  portal and app always show the server as `BISMarkets-Trade`. Also each group's
+  minimum password length and login range.
+- The trade server's offset from UTC, and whether it changes for daylight
+  saving.
+- The client build number the access server accepts (`version`, default 3211),
+  its idle-session timeout, and any connection limit.
+- A test server (or test groups) for the checklist below before going live.
+
+**Install.** Run the gateway from its own copy of the release, owned by root.
+The CRM's user owns `/home/crm/app`, so if the gateway ran from there a
+compromised CRM could rewrite the gateway's code and wait for a restart. Copy it
+right after building a release (section 3):
+
+```sh
+adduser --system --group --no-create-home bisgw
+install -d -m 0755 -o root -g root /opt/bismarkets-gateway/dist
+cp /home/crm/app/dist/gateway.mjs /home/crm/app/dist/gateway.mjs.map /opt/bismarkets-gateway/dist/
+cp /home/crm/app/package.json /home/crm/app/package-lock.json /opt/bismarkets-gateway/
+cd /opt/bismarkets-gateway && npm ci --omit=dev --ignore-scripts
+chown -R root:root /opt/bismarkets-gateway
+```
+
+**Settings** go in `/etc/bismarkets/gateway.env`, owner root, mode 0600
+(systemd reads it as root; the `bisgw` user itself cannot):
+
+```sh
+install -d -m 0750 -o root -g root /etc/bismarkets
+install -m 0600 -o root -g root /dev/null /etc/bismarkets/gateway.env
+openssl rand -hex 32   # the shared secret, for GATEWAY_SECRET here and CRM_MT5_GATEWAY_SECRET in the CRM
+```
+
+```sh
+GATEWAY_HOST=127.0.0.1
+GATEWAY_PORT=3100
+GATEWAY_SECRET=<64 hex characters, the same as CRM_MT5_GATEWAY_SECRET>
+GATEWAY_LOG_LEVEL=info
+# Leverages accounts may have (2000 is 1:2000), and the money limits in US cents.
+GATEWAY_LEVERAGES=2000
+GATEWAY_MAX_OP_CENTS=10000000
+GATEWAY_DAILY_CREDIT_CENTS=50000000
+GATEWAY_DEMO_MAX_OP_CENTS=10000000
+
+# One block per server code; the CRM's MT5 servers use the same codes.
+GATEWAY_SERVERS=live
+GATEWAY_SERVER_LIVE_HOST=mt5-webapi.broker.example
+GATEWAY_SERVER_LIVE_PORT=443
+GATEWAY_SERVER_LIVE_LOGIN=1005
+GATEWAY_SERVER_LIVE_PASSWORD='<manager password>'
+GATEWAY_SERVER_LIVE_CERT_SHA256=<SHA-256 fingerprint, with or without colons>
+# Single quotes keep the backslashes in group names.
+GATEWAY_SERVER_LIVE_GROUPS='real\standard,real\pro'
+GATEWAY_SERVER_LIVE_DEMO_GROUPS='demo\standard'
+GATEWAY_SERVER_LIVE_TZ_OFFSET_MINUTES=120
+GATEWAY_SERVER_LIVE_CONNECTIONS=2
+```
+
+A server code `live-2` uses variables named `GATEWAY_SERVER_LIVE_2_*`. The
+gateway refuses to start on any `GATEWAY_*` name it does not know (so a
+mistyped pin is not silently ignored) and on a listen address other than
+loopback (unless `GATEWAY_ALLOW_REMOTE=true`, which this setup never needs).
+Its first log line lists each server's groups as it read them: check that the
+backslashes are there.
+
+To see the certificate you are about to pin, and compare it with what the
+broker gave you:
+
+```sh
+openssl s_client -connect mt5-webapi.broker.example:443 -servername mt5-webapi.broker.example </dev/null 2>/dev/null \
+  | openssl x509 -noout -fingerprint -sha256
+```
+
+Without a pin the certificate must be signed by a CA the server trusts and name
+the host; there is no setting that skips both checks. When the broker renews
+its certificate the gateway reports MT5 as unavailable until the new
+fingerprint is set.
+
+`/etc/systemd/system/bismarkets-gateway.service`:
+
+```ini
+[Unit]
+Description=BIS Markets MT5 gateway
+After=network-online.target
+Wants=network-online.target
+Before=bismarkets-crm.service
+
+[Service]
+User=bisgw
+Group=bisgw
+WorkingDirectory=/opt/bismarkets-gateway
+EnvironmentFile=/etc/bismarkets/gateway.env
+ExecStart=/usr/bin/node --enable-source-maps dist/gateway.mjs
+Restart=always
+# It waits up to 25 s for operations already sent to MT5 before stopping.
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```sh
+systemctl daemon-reload && systemctl enable --now bismarkets-gateway
+curl -s 127.0.0.1:3100/healthz      # {"ok":true}
+journalctl -u bismarkets-gateway -n 20
+```
+
+Then add to `/etc/bismarkets-crm.env` and restart the CRM:
+
+```sh
+CRM_MT5_GATEWAY_URL=http://127.0.0.1:3100
+CRM_MT5_GATEWAY_SECRET=<the same value as GATEWAY_SECRET>
+```
+
+**Network.** Nothing new listens publicly: the gateway is on 127.0.0.1 and
+ufw's default deny stays as it is. Never proxy it through nginx. If you filter
+outgoing traffic, allow the MT5 host and port only.
+
+**Before going live: the write checklist.** Several MT5 Web API paths and
+formats could not be checked against MetaQuotes' documentation and are marked
+`UNCONFIRMED` in `src/gateway/mt5/webapi.ts` (the only file to change if one is
+wrong). On the broker's test server, with a test client in the CRM, check each
+in the MT5 Manager terminal:
+
+1. Open a live and a demo account: each is in the package's group with the
+   leverage chosen, the comment `BIS-A…`, the main and investor passwords the
+   client typed, and the rights ENABLED, PASSWORD, TRAILING, EXPERT and REPORTS
+   (`user/add`: path, passwords as `pass_main` / `pass_investor` query
+   parameters or in the body, the answer's `Login`).
+2. Archive and restore it (TRADE_DISABLED set, then cleared), change its
+   leverage, and suspend and reactivate it from the staff panel (ENABLED
+   cleared, then set): nothing else about the account changes, in particular
+   its group, balance and credit (`user/update` with the whole record).
+3. Change the main and the investor password, then sign in to the MT5 terminal
+   with each (`user/change_password`, or `user/pass_change`; the `type`
+   spelling).
+4. Transfer wallet → MT5 and MT5 → wallet: one balance deal each with comment
+   `BIS-T…` and the right sign; an MT5 → wallet transfer larger than the free
+   margin is refused with retcode 10019 (`trade/balance`: method, parameters,
+   `check_margin`, the answer's ticket).
+5. The CRM's account list shows the same balance, equity, credit and margin as
+   the terminal (`user/account/get`).
+6. A deal's time in the CRM matches the terminal once the UTC offset is applied
+   (`GATEWAY_SERVER_X_TZ_OFFSET_MINUTES`).
+7. `user/logins?group=` lists the group's accounts (the CRM uses it to find an
+   account whose creation answer was lost).
+
+**Running it.**
+
+- Every MT5 change is a `"msg":"MT5 write"` log line with its operation,
+  server, login, amount, comment, ticket and outcome. `outcome:"unknown"`
+  (level 50) means MT5 may or may not have done it: the CRM settles it by
+  searching MT5, never by sending it again, and staff see it under MT5
+  operations.
+- `Refused a request that is not properly signed` means something other than
+  the CRM is calling the gateway, or the two secrets or clocks differ. Keep both
+  servers' clocks on NTP (`timedatectl`).
+- `MT5 connection lost and could not sign in again` means MT5 is down, the
+  manager's password or IP access changed, or the certificate no longer matches
+  its pin.
+- The 24-hour credit limit is kept in memory: a restart starts a new count.
+- To change the shared secret: stop the CRM, set the new value in both env
+  files, restart the gateway, then start the CRM. (While the two differ, the
+  gateway refuses every request and the CRM cannot verify any answer, so a
+  transfer started then would wait as unknown until the resolver settles it.)
+- Upgrading: copy the new `gateway.mjs` as above and restart the gateway. It
+  finishes the operations already sent to MT5 first; an answer lost anyway shows
+  in the CRM as an unknown outcome that the resolver settles.

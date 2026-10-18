@@ -17,6 +17,7 @@ import {
   Users,
   UserX,
   CalendarPlus,
+  CandlestickChart,
   History,
   Mail,
 } from "lucide-react";
@@ -26,6 +27,7 @@ import { DataGrid, gridQuery, type Column, type GridState } from "../components/
 import { ClientWallet } from "../components/money";
 import { Avatar, Badge, Dialog, EmptyState, ErrorText, Field, PageHeader, Spinner, useFeedback } from "../components/ui";
 import { api, formatDate, qs, type Page } from "../lib/api";
+import { ACCOUNTS_KEY, BalanceCell, leverageText, Mt5StateBadge, typeLabel, type Mt5AccountItem } from "../lib/mt5";
 import { useCan, useSession } from "../lib/session";
 import { COUNTRIES } from "../../shared/countries";
 import { actionLabel } from "../lib/audit-labels";
@@ -595,6 +597,7 @@ export function ClientDetail({ id }: { id: string }) {
           <ClientNotice notice={d.importantNotice} />
         )}
       </div>
+      {can("mt5.view") && <TradingAccounts clientId={d.id} />}
       {can("wallet.view") && (
         <div className="columns columns-wide">
           <ClientNotice notice={d.importantNotice} />
@@ -626,6 +629,101 @@ function ClientNotice({ notice }: { notice: string | null }) {
         <h2 className="flush">Notice for the client</h2>
       </div>
       {notice ? <p>{notice}</p> : <p className="muted">None. Staff who can edit clients can add one under Edit details; the client sees it on their profile.</p>}
+    </section>
+  );
+}
+
+// ---------------- Trading accounts ----------------
+
+const TRADING_SHOWN = 10;
+
+/** The client's MT5 accounts, newest first; each row opens the account's own page. */
+function TradingAccounts({ clientId }: { clientId: number }) {
+  const [, navigate] = useLocation();
+  const list = useQuery({
+    queryKey: [...ACCOUNTS_KEY, "client", clientId],
+    queryFn: () => api.get<Page<Mt5AccountItem>>(`/api/staff/mt5/accounts${qs({ clientId, pageSize: TRADING_SHOWN })}`),
+  });
+  const items = list.data?.items;
+  const total = list.data?.total ?? 0;
+  const open = (a: Mt5AccountItem) => navigate(`/mt5/${a.id}`);
+  return (
+    <section className="grid" style={{ marginBottom: 18 }}>
+      <div className="grid-toolbar">
+        <h2 className="flush">
+          <CandlestickChart size={18} /> Trading accounts
+        </h2>
+        {total > TRADING_SHOWN && (
+          <div className="grid-toolbar-end">
+            <Link href={`/mt5?client=${clientId}`}>See all {total}</Link>
+          </div>
+        )}
+      </div>
+      {list.error ? <ErrorText error={list.error} /> : null}
+      <div className="grid-scroll">
+        <table className="table">
+          <thead>
+            <tr>
+              <th>Login</th>
+              <th>Type</th>
+              <th>Leverage</th>
+              <th>Balance</th>
+              <th>Status</th>
+              <th className="col-optional">Created</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items?.map((a) => (
+              <tr
+                key={a.id}
+                className="row-link"
+                tabIndex={0}
+                onClick={() => open(a)}
+                onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), open(a))}
+              >
+                <td data-label="Login">
+                  <span className="stack-tight">
+                    {a.login !== null ? <strong className="mono">{a.login}</strong> : <span className="muted">No login yet</span>}
+                    <small className="muted">{a.serverLabel}</small>
+                  </span>
+                </td>
+                <td data-label="Type">
+                  <span className="stack-tight">
+                    <span>{typeLabel(a)}</span>
+                    <small className="muted">{a.packageName}</small>
+                  </span>
+                </td>
+                <td data-label="Leverage">{leverageText(a.leverage)}</td>
+                <td data-label="Balance">
+                  <BalanceCell a={a} />
+                </td>
+                <td data-label="Status">
+                  <Mt5StateBadge state={a.state} />
+                </td>
+                <td data-label="Created" className="col-optional">
+                  {formatDate(a.createdAt)}
+                </td>
+              </tr>
+            ))}
+            {items?.length === 0 && (
+              <tr>
+                <td colSpan={6} className="empty">
+                  <EmptyState icon={<CandlestickChart size={32} />} title="No trading accounts yet">
+                    The client opens MT5 accounts in the portal or app.
+                  </EmptyState>
+                </td>
+              </tr>
+            )}
+            {!items && !list.error && (
+              <tr>
+                <td colSpan={6}>
+                  <Spinner />
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
     </section>
   );
 }

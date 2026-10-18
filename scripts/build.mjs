@@ -20,3 +20,5 @@ const common = {
 };
 await build({ ...common, entryPoints: [path.join(root, "src/server/index.ts")], outfile: path.join(dist, "server.mjs") });
 await build({ ...common, entryPoints: [path.join(root, "src/cli/index.ts")], outfile: path.join(dist, "cli.mjs") });
+// The MT5 gateway runs as its own service and imports nothing from the CRM's server code.
+await build({ ...common, entryPoints: [path.join(root, "src/gateway/index.ts")], outfile: path.join(dist, "gateway.mjs") });

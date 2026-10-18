@@ -43,7 +43,7 @@ export interface TestEnv {
   app: Express;
 }
 
-export async function setup(overrides: Record<string, string> = {}, deps: Partial<Pick<AppDeps, "mailTransport">> = {}): Promise<TestEnv> {
+export async function setup(overrides: Record<string, string> = {}, deps: Partial<Pick<AppDeps, "mailTransport" | "mt5">> = {}): Promise<TestEnv> {
   const config = testConfig(overrides);
   const db = createDb(TEST_DB_URL);
   await resetDatabase(db);

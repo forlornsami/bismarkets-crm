@@ -753,3 +753,19 @@ body.no-scroll { overflow: hidden; }
 @media (min-width: 701px) and (max-width: 1279px) {
   .table .col-optional { display: none; }
 }
+
+/* A badge stacked above small text keeps its own width instead of stretching across the cell. */
+.stack-tight > .badge { align-self: flex-start; }
+/* An information notice at the top of a page, spaced like .notice-warn. */
+.notice-page { margin: 0 0 18px; }
+/* A textarea as tall as its rows (a plain .input is one line high). */
+textarea.input-area { height: auto; min-height: 38px; padding: 8px 12px; line-height: 1.45; resize: vertical; }
+/* A ledger entry on the Transfers page: the account on the left, the amount on the right. */
+.ledger-amount { margin-left: auto; font-variant-numeric: tabular-nums; }
+/* A value that must not break across lines, such as a BIS- reference or an amount. */
+.nowrap { white-space: nowrap; }
+/* Shown only on tablets and small laptops, where the columns marked optional are left out. */
+.tablet-only { display: none; }
+@media (min-width: 701px) and (max-width: 1279px) {
+  .tablet-only { display: block; }
+}

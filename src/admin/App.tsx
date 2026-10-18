@@ -29,6 +29,13 @@ const DepositWorkbench = lazy(() => import("./pages/Deposits").then((m) => ({ de
 const WithdrawalsQueue = lazy(() => import("./pages/Withdrawals").then((m) => ({ default: m.WithdrawalsQueue })));
 const WithdrawalWorkbench = lazy(() => import("./pages/Withdrawals").then((m) => ({ default: m.WithdrawalWorkbench })));
 const PaymentMethods = lazy(() => import("./pages/PaymentMethods").then((m) => ({ default: m.PaymentMethods })));
+// MT5 screens, the same way.
+const Mt5AccountsList = lazy(() => import("./pages/Mt5Accounts").then((m) => ({ default: m.Mt5AccountsList })));
+const Mt5AccountDetail = lazy(() => import("./pages/Mt5Accounts").then((m) => ({ default: m.Mt5AccountDetail })));
+const Packages = lazy(() => import("./pages/Packages").then((m) => ({ default: m.Packages })));
+const Mt5Settings = lazy(() => import("./pages/Mt5Settings").then((m) => ({ default: m.Mt5Settings })));
+const TransfersList = lazy(() => import("./pages/Transfers").then((m) => ({ default: m.TransfersList })));
+const TransferDetail = lazy(() => import("./pages/Transfers").then((m) => ({ default: m.TransferDetail })));
 
 const Loading = ({ children }: { children: React.ReactNode }) => (
   <Suspense
@@ -195,6 +202,52 @@ export function App() {
             <Guarded anyOf={["payment.manage", "deposit.view", "withdrawal.view"]}>
               <Loading>
                 <PaymentMethods />
+              </Loading>
+            </Guarded>
+          </Route>
+          <Route path="/mt5">
+            <Guarded permission="mt5.view">
+              <Loading>
+                <Mt5AccountsList />
+              </Loading>
+            </Guarded>
+          </Route>
+          <Route path="/mt5/:id">
+            {(params) => (
+              <Guarded permission="mt5.view">
+                <Loading>
+                  <Mt5AccountDetail key={params.id} id={params.id} />
+                </Loading>
+              </Guarded>
+            )}
+          </Route>
+          <Route path="/transfers">
+            <Guarded permission="wallet.view">
+              <Loading>
+                <TransfersList />
+              </Loading>
+            </Guarded>
+          </Route>
+          <Route path="/transfers/:id">
+            {(params) => (
+              <Guarded permission="wallet.view">
+                <Loading>
+                  <TransferDetail key={params.id} id={params.id} />
+                </Loading>
+              </Guarded>
+            )}
+          </Route>
+          <Route path="/packages">
+            <Guarded permission="package.view">
+              <Loading>
+                <Packages />
+              </Loading>
+            </Guarded>
+          </Route>
+          <Route path="/settings/mt5">
+            <Guarded anyOf={["mt5.view", "mt5.servers"]}>
+              <Loading>
+                <Mt5Settings />
               </Loading>
             </Guarded>
           </Route>

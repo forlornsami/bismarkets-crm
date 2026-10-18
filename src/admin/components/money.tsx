@@ -637,7 +637,7 @@ const ENTRY_LABEL: Record<string, string> = {
   withdrawal_release: "Withdrawal rejected, money returned",
 };
 
-/** The client's USD wallet: balance, money held for withdrawals, totals and the latest ledger entries. */
+/** The client's USD wallet: balance, money held for withdrawals and transfers, totals and the latest ledger entries. */
 export function ClientWallet({ clientId }: { clientId: number }) {
   const can = useCan();
   const allowed = can("wallet.view");
@@ -672,7 +672,7 @@ export function ClientWallet({ clientId }: { clientId: number }) {
             <dt>Held</dt>
             <dd>
               {money(w.heldCents, w.currency)}
-              <small className="muted block">Set aside for withdrawals not paid yet</small>
+              <small className="muted block">Held for withdrawals and transfers not finished yet</small>
             </dd>
             <dt>Deposited</dt>
             <dd>

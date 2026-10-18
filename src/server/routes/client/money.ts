@@ -289,16 +289,7 @@ export function clientMoneyRouter(deps: AppDeps): Router {
     }),
   );
 
-  // Transfers come with the MT5 work. Until then both history pages need an
-  // empty list rather than an error, or the whole page fails.
-  router.get(
-    "/transfers",
-    auth,
-    handler(async (req, res) => {
-      const { page, perPage } = pageQuery(req.query);
-      res.json(paged([], page, perPage, 0));
-    }),
-  );
+  // Transfers between the wallet and MT5 (GET /transfers) are in routes/client/transfers.ts.
 
   router.get(
     "/ib-transfer-history",

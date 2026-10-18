@@ -291,7 +291,8 @@ describe.skipIf(!hasDb)("client money API", () => {
     await exec(env.db, "UPDATE money_settings SET max_withdrawal_cents = NULL WHERE id = 1");
   });
 
-  it("answers the transfer, IB and instant-deposit reads that are not built yet without breaking the pages", async () => {
+  it("answers an empty transfer list, and the IB and instant-deposit reads that are not built yet, without breaking the pages", async () => {
+    // Ann has never moved money to MT5; tests/mt5-transfers.test.ts covers the list with rows in it.
     const transfers = await api().get("/api/transfers?page=1&per_page=200").set(bearer(ann.token));
     expect(transfers.body).toEqual({ success: true, data: [], pagination: { current_page: 1, last_page: 1, per_page: 200, total: 0 }, current_page: 1, last_page: 1, per_page: 200, total: 0 });
     const ib = await api().get("/api/ib-transfer-history?from_date=2026-01-01&to_date=2026-10-17&page=1&per_page=50").set(bearer(newbie.token));

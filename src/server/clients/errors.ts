@@ -11,8 +11,10 @@ export class ValidationError extends HttpError {
     public fields: Record<string, string[]>,
     /** Extra top-level keys for the error body, next to message and errors. */
     public extra: Record<string, unknown> = {},
+    /** 422, or 403 where a client looks for that status (the app's "add funds" answer to opening an MT5 account). */
+    status: 422 | 403 = 422,
   ) {
-    super(422, "VALIDATION", Object.values(fields)[0]?.[0] ?? "The given data was invalid.");
+    super(status, "VALIDATION", Object.values(fields)[0]?.[0] ?? "The given data was invalid.");
   }
 }
 
@@ -43,7 +45,7 @@ function issuesToFields(error: ZodError): Record<string, string[]> {
 export function clientErrorMiddleware(log: { error: (obj: unknown, msg: string) => void }) {
   return (error: unknown, req: Request, res: Response, _next: NextFunction) => {
     if (error instanceof ValidationError) {
-      res.status(422).json({ ...error.extra, message: error.message, errors: error.fields });
+      res.status(error.status).json({ ...error.extra, message: error.message, errors: error.fields });
       return;
     }
     if (error instanceof TooManyRequests) {

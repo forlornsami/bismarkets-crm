@@ -15,6 +15,8 @@ import { clientAuthRouter } from "./routes/client/auth";
 import { clientKycRouter } from "./routes/client/kyc";
 import { clientAccountRouter } from "./routes/client/account";
 import { clientMoneyRouter } from "./routes/client/money";
+import { clientMt5Router } from "./routes/client/mt5";
+import { clientTransfersRouter } from "./routes/client/transfers";
 import { staffAuditRouter } from "./routes/staff/audit";
 import { staffAuthRouter } from "./routes/staff/auth";
 import { staffBrandingRouter } from "./routes/staff/branding";
@@ -25,12 +27,16 @@ import { staffKycRouter } from "./routes/staff/kyc";
 import { staffMailRouter } from "./routes/staff/mail";
 import { staffMessagesRouter } from "./routes/staff/messages";
 import { staffMoneyRouter } from "./routes/staff/money";
+import { staffMt5Router } from "./routes/staff/mt5";
+import { staffMt5OperationsRouter } from "./routes/staff/mt5-operations";
+import { staffPackagesRouter } from "./routes/staff/packages";
 import { staffWithdrawalsRouter } from "./routes/staff/withdrawals";
 import { emailUnsubscribeRouter } from "./routes/unsubscribe";
 import type { TransportFactory } from "./lib/mailer";
 import { staffRolesRouter } from "./routes/staff/roles";
 import { staffUsersRouter } from "./routes/staff/users";
 import { staffSession } from "./staff/session";
+import type { Mt5Gateway } from "./mt5/gateway";
 
 export interface AppDeps {
   db: Db;
@@ -40,6 +46,8 @@ export interface AppDeps {
   fetch: typeof fetch;
   /** SMTP transport factory; tests pass a fake so no email leaves the machine. */
   mailTransport?: TransportFactory;
+  /** The MT5 gateway, or null when MT5 is off. Tests pass an in-memory one, so no test reaches MT5. */
+  mt5?: Mt5Gateway | null;
 }
 
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
@@ -134,6 +142,10 @@ export function createApp(deps: AppDeps): Express {
   staff.use("/deposits", staffDepositsRouter(deps));
   staff.use("/withdrawals", staffWithdrawalsRouter(deps));
   staff.use("/money", staffMoneyRouter(deps));
+  // Ahead of /mt5, so that router never sees these paths.
+  staff.use("/mt5/operations", staffMt5OperationsRouter(deps));
+  staff.use("/mt5", staffMt5Router(deps));
+  staff.use("/packages", staffPackagesRouter(deps));
   app.use("/api/staff", staff);
 
   // ---- Client API: what the client portal and app call, with Bearer tokens. ----
@@ -162,7 +174,9 @@ export function createApp(deps: AppDeps): Express {
   client.use(clientKycRouter(deps));
   client.use(clientAccountRouter(deps));
   client.use(clientMoneyRouter(deps));
-  // Later phases add the remaining portal endpoints (MT5 accounts, transfers, IB).
+  client.use(clientMt5Router(deps));
+  client.use(clientTransfersRouter(deps));
+  // Later phases add the remaining portal endpoints (IB).
   client.use((_req, _res, next) => next(new HttpError(404, "NOT_AVAILABLE", "This feature is not available yet.")));
   client.use(clientErrorMiddleware(log));
   app.use("/api", (req, res, next) => (req.path.startsWith("/staff/") || req.path === "/staff" ? next() : client(req, res, next)));

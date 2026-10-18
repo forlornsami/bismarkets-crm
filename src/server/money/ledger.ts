@@ -5,17 +5,22 @@ import { conflict, HttpError } from "../lib/http";
 // Double-entry ledger. Every movement of client money is one transaction whose
 // entries sum to zero. Client accounts are liabilities (what the broker owes
 // the client): `wallet` is what the client can use, `hold` is money set aside
-// for a withdrawal that has not been paid yet. The broker's side is the method
-// the money came in or went out through. Entries are never changed; a mistake
-// is corrected by a new transaction. The `wallets` row caches the two client
-// balances and is updated in the same transaction (`cli verify-ledger` checks
-// the cache against the entries).
+// for a withdrawal that has not been paid yet, or for a transfer to MT5 that
+// MT5 has not confirmed yet. The broker's side is the method the money came
+// in or went out through, or the MT5 account it moved to or from. Entries are
+// never changed; a mistake is corrected by a new transaction. The `wallets`
+// row caches the two client balances and is updated in the same transaction
+// (`cli verify-ledger` checks the cache against the entries).
 //
 // Lock order for anything that moves money: the client row (lockClient), then
-// the wallet (lockWallet), then the deposit or withdrawal row.
+// the wallet (lockWallet), then the deposit, withdrawal or MT5 account row,
+// then the MT5 balance operation.
 
-export type LedgerKind = "deposit" | "withdrawal_hold" | "withdrawal_release" | "withdrawal_paid";
-export type LedgerSource = "deposit" | "withdrawal";
+export type LedgerKind =
+  | "deposit" | "withdrawal_hold" | "withdrawal_release" | "withdrawal_paid"
+  | "transfer_hold" | "transfer_release" | "transfer_out" | "transfer_in";
+/** `mt5_op` is a row of mt5_balance_ops: a transfer between the wallet and an MT5 account. */
+export type LedgerSource = "deposit" | "withdrawal" | "mt5_op";
 
 export const walletAccount = (clientId: number) => `client:${clientId}:wallet`;
 export const holdAccount = (clientId: number) => `client:${clientId}:hold`;
@@ -23,6 +28,11 @@ export const holdAccount = (clientId: number) => `client:${clientId}:hold`;
 export const depositMethodAccount = (paymentMethodId: number) => `deposit_method:${paymentMethodId}`;
 /** Where paid withdrawals of one payout type went out. */
 export const payoutAccount = (paymentMethodId: number) => `payout:${paymentMethodId}`;
+/**
+ * The broker's side of one MT5 account: money sent to it from the wallet, less
+ * money taken back. Not a client account, so it has no wallet cache.
+ */
+export const mt5FundingAccount = (mt5AccountId: number) => `mt5_funding:${mt5AccountId}`;
 
 const CLIENT_ACCOUNT = /^client:(\d+):(wallet|hold)$/;
 
@@ -169,13 +179,68 @@ export async function verifyLedger(conn: Conn): Promise<string[]> {
     }
   }
 
+  problems.push(...(await verifyTransfers(conn)));
   problems.push(...(await verifyTransactions(conn)));
   return problems;
 }
 
+/** The ledger transactions each MT5 operation should have, by purpose and status. */
+function transferExpected(purpose: string, status: string) {
+  const none = { transfer_hold: 0, transfer_release: 0, transfer_out: 0, transfer_in: 0 };
+  // To MT5: held from the request until MT5 makes the deal (paid out) or definitely does not (back to the wallet).
+  if (purpose === "wallet_to_mt5") return { ...none, transfer_hold: 1, transfer_out: status === "completed" ? 1 : 0, transfer_release: status === "failed" ? 1 : 0 };
+  // From MT5: nothing moves until MT5 has taken the money out.
+  if (purpose === "mt5_to_wallet") return { ...none, transfer_in: status === "completed" ? 1 : 0 };
+  // Demo money is not client money.
+  return none;
+}
+
 /**
- * Every transaction moves exactly what its deposit or withdrawal says, between the accounts its
- * kind names, for that deposit's or withdrawal's own client. Read in pages, oldest first.
+ * Each MT5 operation has exactly the ledger transactions its status calls
+ * for (and a demo one has none), names the same client and login as its
+ * account, and a completed one has MT5's ticket. What each transaction moves
+ * is checked with the others in verifyTransactions.
+ */
+async function verifyTransfers(conn: Conn): Promise<string[]> {
+  const problems: string[] = [];
+  const ops = await rows<{
+    reference: string; purpose: string; status: string; mt5_ticket: number | null; client_id: number; login: number; server_code: string;
+    account_client: number; account_login: number | null; account_server: string;
+    holds: string | null; releases: string | null; outs: string | null; ins: string | null; total: string | null;
+  }>(
+    conn,
+    `SELECT o.reference, o.purpose, o.status, o.mt5_ticket, o.client_id, o.login, o.server_code,
+       a.client_id AS account_client, a.login AS account_login, a.server_code AS account_server,
+       k.holds, k.releases, k.outs, k.ins, k.total
+     FROM mt5_balance_ops o JOIN mt5_accounts a ON a.id = o.mt5_account_id
+     LEFT JOIN (
+       SELECT source_id, SUM(kind = 'transfer_hold') AS holds, SUM(kind = 'transfer_release') AS releases,
+         SUM(kind = 'transfer_out') AS outs, SUM(kind = 'transfer_in') AS ins, COUNT(*) AS total
+       FROM ledger_transactions WHERE source_type = 'mt5_op' GROUP BY source_id
+     ) k ON k.source_id = o.id
+     ORDER BY o.id`,
+  );
+  const label: Record<string, string> = { transfer_hold: "hold", transfer_release: "return to the wallet", transfer_out: "payment to MT5", transfer_in: "credit from MT5" };
+  for (const o of ops) {
+    const want = transferExpected(o.purpose, o.status);
+    const got = { transfer_hold: Number(o.holds ?? 0), transfer_release: Number(o.releases ?? 0), transfer_out: Number(o.outs ?? 0), transfer_in: Number(o.ins ?? 0) };
+    const kinds = Object.keys(want) as (keyof typeof want)[];
+    const other = Number(o.total ?? 0) - kinds.reduce((sum, k) => sum + got[k], 0);
+    if (other !== 0 || kinds.some((k) => got[k] !== want[k])) {
+      const show = (counts: Record<string, number>) => kinds.map((k) => `${counts[k]} ${label[k]}`).join(", ");
+      problems.push(`MT5 operation ${o.reference} (${o.purpose}) is ${o.status}, but the ledger has ${show(got)}${other ? ` and ${other} other` : ""}, not ${show(want)}.`);
+    }
+    if (o.status === "completed" && o.mt5_ticket === null) problems.push(`MT5 operation ${o.reference} is completed but has no MT5 ticket.`);
+    if (Number(o.client_id) !== Number(o.account_client) || Number(o.login) !== Number(o.account_login) || o.server_code !== o.account_server) {
+      problems.push(`MT5 operation ${o.reference} is for client ${o.client_id}, login ${o.server_code}:${o.login}, but its account is client ${o.account_client}'s ${o.account_server}:${o.account_login ?? "none"}.`);
+    }
+  }
+  return problems;
+}
+
+/**
+ * Every transaction moves exactly what its deposit, withdrawal or MT5 operation says, between the
+ * accounts its kind names, for that source's own client. Read in pages, oldest first.
  */
 async function verifyTransactions(conn: Conn): Promise<string[]> {
   const problems: string[] = [];
@@ -217,10 +282,15 @@ async function verifyTransactions(conn: Conn): Promise<string[]> {
       "withdrawal",
       "SELECT id, reference, client_id, payment_method_id, amount_cents FROM withdrawals",
     );
+    const ops = await sourcesOf<{ id: number; reference: string; client_id: number; mt5_account_id: number; purpose: string; amount_cents: number }>(
+      "mt5_op",
+      "SELECT id, reference, client_id, mt5_account_id, purpose, amount_cents FROM mt5_balance_ops",
+    );
 
     for (const t of batch) {
       const label = `Ledger transaction ${t.id} (${t.kind})`;
-      const source = t.source_type === "deposit" ? deposits.get(Number(t.source_id)) : t.source_type === "withdrawal" ? withdrawals.get(Number(t.source_id)) : undefined;
+      const id = Number(t.source_id);
+      const source = t.source_type === "deposit" ? deposits.get(id) : t.source_type === "withdrawal" ? withdrawals.get(id) : t.source_type === "mt5_op" ? ops.get(id) : undefined;
       if (!source) {
         problems.push(`${label} belongs to ${t.source_type} ${t.source_id}, which does not exist.`);
         continue;
@@ -231,14 +301,24 @@ async function verifyTransactions(conn: Conn): Promise<string[]> {
       if (t.source_type === "deposit" && t.kind === "deposit" && "credited_cents" in source) {
         const x = Number(source.credited_cents ?? 0);
         want = [[walletAccount(clientId), x], [depositMethodAccount(Number(source.payment_method_id)), -x]];
-      } else if (t.source_type === "withdrawal" && "amount_cents" in source) {
+      } else if (t.source_type === "withdrawal" && "amount_cents" in source && "payment_method_id" in source) {
         const a = Number(source.amount_cents);
         if (t.kind === "withdrawal_hold") want = [[walletAccount(clientId), -a], [holdAccount(clientId), a]];
         if (t.kind === "withdrawal_paid") want = [[holdAccount(clientId), -a], [payoutAccount(Number(source.payment_method_id)), a]];
         if (t.kind === "withdrawal_release") want = [[holdAccount(clientId), -a], [walletAccount(clientId), a]];
+      } else if (t.source_type === "mt5_op" && "purpose" in source) {
+        const a = Number(source.amount_cents);
+        const funding = mt5FundingAccount(Number(source.mt5_account_id));
+        if (source.purpose === "wallet_to_mt5") {
+          if (t.kind === "transfer_hold") want = [[walletAccount(clientId), -a], [holdAccount(clientId), a]];
+          if (t.kind === "transfer_out") want = [[holdAccount(clientId), -a], [funding, a]];
+          if (t.kind === "transfer_release") want = [[holdAccount(clientId), -a], [walletAccount(clientId), a]];
+        }
+        if (source.purpose === "mt5_to_wallet" && t.kind === "transfer_in") want = [[funding, -a], [walletAccount(clientId), a]];
       }
       if (!want) {
-        problems.push(`${label} is not a kind of transaction a ${t.source_type} makes.`);
+        const maker = "purpose" in source ? `an MT5 ${source.purpose} operation` : `a ${t.source_type}`;
+        problems.push(`${label} is not a kind of transaction ${maker} makes.`);
         continue;
       }
       const show = (list: [string, number][]) => list.map(([account, amount]) => `${account} ${amount}`).sort().join(", ");

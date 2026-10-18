@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { MIN_SECRET_LENGTH } from "../gateway/protocol";
 
 const boolean = (fallback: boolean) =>
   z
@@ -49,6 +50,11 @@ const schema = z.object({
   CRM_SUPPORT_EVENTS_URL: z.string().url().optional().or(z.literal("").transform(() => undefined)),
   CRM_SUPPORT_EVENTS_SECRET: z.string().optional().default(""),
   CRM_SUPPORT_EVENTS_ENVIRONMENT: z.enum(["staging", "production"]).default("production"),
+  // The MT5 gateway (a separate process on this server). Leave the URL empty to
+  // keep MT5 off: account lists still answer from the database, and every MT5
+  // change is refused as "temporarily unavailable".
+  CRM_MT5_GATEWAY_URL: z.string().url().optional().or(z.literal("").transform(() => undefined)),
+  CRM_MT5_GATEWAY_SECRET: z.string().optional().default(""),
   CRM_LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
 });
 
@@ -76,7 +82,24 @@ export type Config = {
   clientIdleMs: number;
   impersonationMs: number;
   supportEvents: { url: string | null; secret: string; environment: "staging" | "production" };
+  /** Where the MT5 gateway listens and the secret both sides sign with, or null when MT5 is off. */
+  mt5Gateway: { url: string; secret: string } | null;
 };
+
+/** In production the gateway is on this machine (plain HTTP on loopback) or reached over HTTPS. */
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+/** Why a gateway URL is not acceptable, or null. */
+function gatewayUrlProblem(raw: string, production: boolean): string | null {
+  const url = new URL(raw);
+  if (url.protocol !== "http:" && url.protocol !== "https:") return "must be an http:// or https:// URL";
+  if (url.username || url.password) return "must not contain a user name or password";
+  if (url.search || url.hash) return "must not have a query string or fragment";
+  if (production && url.protocol === "http:" && (!LOOPBACK_HOSTS.has(url.hostname) || !url.port)) {
+    return "must be https, or http://127.0.0.1:<port> (or localhost or [::1]) on this server, in production";
+  }
+  return null;
+}
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const parsed = schema.safeParse(env);
@@ -94,6 +117,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   if (c.CRM_SUPPORT_EVENTS_URL && c.CRM_SUPPORT_EVENTS_SECRET.length < 32) {
     throw new Error("Invalid CRM configuration: CRM_SUPPORT_EVENTS_SECRET must be at least 32 characters when CRM_SUPPORT_EVENTS_URL is set");
+  }
+  if (c.CRM_MT5_GATEWAY_URL) {
+    const problem = gatewayUrlProblem(c.CRM_MT5_GATEWAY_URL, c.NODE_ENV === "production");
+    if (problem) throw new Error(`Invalid CRM configuration: CRM_MT5_GATEWAY_URL ${problem}`);
+    if (c.CRM_MT5_GATEWAY_SECRET.length < MIN_SECRET_LENGTH) {
+      throw new Error(`Invalid CRM configuration: CRM_MT5_GATEWAY_SECRET must be at least ${MIN_SECRET_LENGTH} characters when CRM_MT5_GATEWAY_URL is set`);
+    }
   }
   const proxies = c.CRM_TRUSTED_PROXIES.trim();
   return {
@@ -124,5 +154,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       secret: c.CRM_SUPPORT_EVENTS_SECRET,
       environment: c.CRM_SUPPORT_EVENTS_ENVIRONMENT,
     },
+    mt5Gateway: c.CRM_MT5_GATEWAY_URL ? { url: c.CRM_MT5_GATEWAY_URL.replace(/\/+$/, ""), secret: c.CRM_MT5_GATEWAY_SECRET } : null,
   };
 }

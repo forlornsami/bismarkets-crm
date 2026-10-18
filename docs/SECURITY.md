@@ -336,3 +336,100 @@ changes and payout account changes (a rename or new default does not count),
 money that arrived just before it is asked out, and a withdrawal to a different
 kind of account than the client deposited with.
 
+
+## MT5 gateway (Phase 3)
+
+**Who holds what.** MT5 manager logins and passwords are only in the gateway's
+own environment file (`/etc/bismarkets/gateway.env`, root, mode 0600). The CRM,
+its database, its logs and its audit log never see them: the CRM asks the
+gateway for a fixed list of operations by server code. The gateway runs as its
+own OS user (`bisgw`), from code only root can change (so a compromised CRM
+cannot rewrite it), and listens on 127.0.0.1 only; it refuses to start on any
+other address unless that is set on purpose. After reading its settings it
+removes the shared secret and the passwords from its process environment. The
+secret and password hashes print as `[hidden]` wherever they end up, and a
+settings problem names the setting, never its value.
+
+**Only the CRM can ask.** Every request is `POST /v1/<op>` signed with
+HMAC-SHA256 (the secret shared with the CRM, at least 32 characters) over the
+time, a one-time random nonce, the path and a hash of the body. The gateway
+checks, in this order and before anything reaches MT5: body at most 16 KB,
+signature (in constant time), time within 30 seconds of its own clock, nonce not
+seen in the last 60 seconds, a known operation, and a body that matches the
+operation exactly (an unexpected key, a wrong type or a value of the wrong
+shape is refused). Whatever fails gets an unsigned 401, 400 or 413. A bad
+signature is logged with the path, the caller's address and the reason, and a
+bad body with the operation and the names of the wrong fields; neither log line
+holds the body, its values or the headers. Nonces are remembered in a bounded memory:
+when it is full of live nonces the gateway refuses new requests (unsigned 503) rather than
+forget a nonce early. Every answer to an accepted request is signed over that
+request's nonce, so the CRM can tell a real answer from one made up by a process
+that took over the gateway's port.
+
+**Rules the gateway keeps even if the CRM is compromised.**
+
+- Only configured servers, and only accounts whose MT5 group is on that
+  server's live or demo list. Every operation naming an account first reads its
+  group (cached for 10 minutes); an account in any other group is refused, and
+  so is opening or searching an account in one.
+- No operation deletes an account or changes its group. An update changes only
+  the leverage (from `GATEWAY_LEVERAGES`) and the ENABLED and TRADE_DISABLED
+  bits of the account's 64-bit rights (read as BigInt, every other bit written
+  back as it was). New accounts get fixed rights (ENABLED, PASSWORD, TRAILING,
+  EXPERT, REPORTS).
+- Balance operations carry a `BIS-` reference as their comment, stay under the
+  per-operation limit (`GATEWAY_MAX_OP_CENTS`, `GATEWAY_DEMO_MAX_OP_CENTS` for
+  demo groups), and credits to live accounts stay under a rolling 24-hour limit
+  per server (`GATEWAY_DAILY_CREDIT_CENTS`, kept in memory, so a restart starts
+  a new count). Money only leaves an MT5 account with MT5's margin check on.
+- One write at a time per account (one account opening at a time per group),
+  and at most 64 operations at once.
+
+**Talking to MT5.** Over TLS 1.2 or later, with the access server's certificate
+pinned by its SHA-256 fingerprint; without a pin it must chain to a trusted CA
+and name the host, and no setting skips both. The certificate is checked before
+the socket is handed to any request. The manager signs in on that socket, and
+MT5 must prove it knows the password too (each side answers the other's random
+challenge), so a look-alike server is not trusted. MT5 ties the session to the
+socket, so each connection is a keep-alive agent with a single socket that
+opens only while signing in, and every request checks that the socket it was
+given is the signed-in one before writing a byte. Idle sessions are pinged
+every 20 seconds and signed in again when MT5 drops them.
+
+**Outcomes.** The CRM is told one of: done; refused (MT5 or a gateway rule said
+no, nothing changed); unavailable (MT5 was never reached, nothing changed);
+unknown (a write may or may not have happened); or bad request (a broken rule,
+nothing changed).
+
+- A write becomes unknown once any byte of it may have reached MT5: a
+  connection lost or an answer missing, cut off, unreadable, without a retcode
+  or with an HTTP error after that point, and MT5's own "timeout" or "network
+  error" retcodes. Before that point, the same failures are unavailable.
+- Reads are tried once more on a fresh sign-in. A write is tried again only if
+  nothing of it was sent, and never after. Nothing is sent once the CRM has hung
+  up or too little of its wait is left for the answer to reach it.
+- A balance operation first searches the account's deals for its reference,
+  under the same lock as the send. If MT5 already has it, the original ticket
+  comes back and nothing is sent again (even if a limit has been reached since);
+  a deal with that reference but another amount or kind is reported as unknown
+  for staff to check, and nothing is sent. A search MT5 cannot complete is
+  "unavailable", never "not found". The CRM's own searches for a lost answer
+  (`deal.find`, `user.find`) wait for any write still running on that account or
+  group, so "not found" is never said while the write is on its way.
+
+**Money** crosses the gateway as integer cents. MT5's decimal text is parsed
+without floats (MT5's JSON numbers are kept as their exact text), rounding a
+third decimal half away from zero, and cents go back to MT5 as exact
+two-decimal text.
+
+**Logs** (JSON on stdout, to the journal): every write with its operation,
+server, account, amount, reference, ticket, outcome and MT5 retcode; unknown
+outcomes at error level. Never a password, the secret, an MT5 URL (a password
+change carries the password in one) or a request body; fields named like
+passwords or secrets are hidden even if passed by mistake. MT5's own error text
+goes to the CRM for staff only; the CRM shows clients its own words.
+
+**Bounded memory.** Nonces (100,000), the group cache (10,000 accounts), the
+24-hour credit count (one number per minute per server), locks (one per
+operation in flight) and MT5 answers (8 MB each) all have fixed limits, so no
+caller can make the gateway grow without end.

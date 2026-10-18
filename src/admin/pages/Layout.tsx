@@ -1,5 +1,6 @@
 import {
   ArrowDownToLine,
+  ArrowLeftRight,
   ArrowUpFromLine,
   BadgeCheck,
   ChevronsLeft,
@@ -9,8 +10,10 @@ import {
   LogOut,
   Menu,
   Network,
+  Package,
   Palette,
   ScrollText,
+  ServerCog,
   Shield,
   UserCog,
   UserRound,
@@ -58,12 +61,14 @@ const NAV: { title: string; items: NavItem[] }[] = [
     items: [
       { href: "/deposits", label: "Deposits", icon: ArrowDownToLine, permission: "deposit.view", badge: "deposits" },
       { href: "/withdrawals", label: "Withdrawals", icon: ArrowUpFromLine, permission: "withdrawal.view", badge: "withdrawals" },
+      { href: "/transfers", label: "Transfers", icon: ArrowLeftRight, permission: "wallet.view" },
     ],
   },
   {
     title: "Trading",
     items: [
-      { href: "/mt5", label: "MT5 accounts", icon: Wallet, permission: "mt5.view", soon: true },
+      { href: "/mt5", label: "MT5 accounts", icon: Wallet, permission: "mt5.view" },
+      { href: "/packages", label: "Account packages", icon: Package, permission: "package.view" },
       { href: "/ib", label: "IB partners", icon: Network, permission: "ib.view", soon: true },
     ],
   },
@@ -83,6 +88,7 @@ const NAV: { title: string; items: NavItem[] }[] = [
       { href: "/roles", label: "Roles", icon: Shield, permission: "role.view" },
       { href: "/audit", label: "Audit log", icon: ScrollText, permission: "audit.view" },
       { href: "/payment-methods", label: "Payment methods", icon: CreditCard, anyOf: ["payment.manage", "deposit.view", "withdrawal.view"] },
+      { href: "/settings/mt5", label: "MT5 settings", icon: ServerCog, anyOf: ["mt5.view", "mt5.servers"] },
       { href: "/settings/email", label: "Email settings", icon: AtSign, permission: "settings.view" },
       { href: "/settings/branding", label: "Branding", icon: Palette, permission: "settings.view" },
     ],
