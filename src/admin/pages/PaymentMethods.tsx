@@ -618,9 +618,13 @@ function LimitsCard() {
   }
   if (!RATE.test(form.usdToPkr.trim()) || /^0+(\.0+)?$/.test(form.usdToPkr.trim())) problems.usdToPkr = "Enter the rate as a number above zero, with up to 6 decimals, such as 280 or 279.5.";
   else {
-    // As the server checks it: one change moves the rate by at most 20% either way.
-    const [was, now] = [Number(initial.usdToPkr), Number(form.usdToPkr.trim())];
-    if (was > 0 && (now * 100 > was * 120 || was * 100 > now * 120)) problems.usdToPkr = `Change the rate by at most 20% at a time (now ${initial.usdToPkr}). For a bigger change, make it in steps.`;
+    // As the server checks it, in exact millionths: one change moves the rate by at most 20% either way.
+    const micros = (t: string) => {
+      const [whole, part = ""] = t.trim().split(".");
+      return BigInt(whole || "0") * 1_000_000n + BigInt(part.padEnd(6, "0").slice(0, 6) || "0");
+    };
+    const [was, now] = RATE.test(String(initial.usdToPkr).trim()) ? [micros(String(initial.usdToPkr)), micros(form.usdToPkr)] : [0n, 0n];
+    if (was > 0n && (now * 100n > was * 120n || was * 100n > now * 120n)) problems.usdToPkr = `Change the rate by at most 20% at a time (now ${initial.usdToPkr}). For a bigger change, make it in steps.`;
   }
   const max = cents.maxWithdrawalCents;
   const min = cents.minWithdrawalCents;
