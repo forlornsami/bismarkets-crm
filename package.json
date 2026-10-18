@@ -1,0 +1,57 @@
+{
+  "name": "bismarkets-crm",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "22.x"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server/index.ts",
+    "dev:admin": "vite",
+    "build": "node scripts/build.mjs",
+    "start": "node --enable-source-maps dist/server.mjs",
+    "cli": "tsx src/cli/index.ts",
+    "migrate": "tsx src/cli/index.ts migrate",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts"
+  },
+  "dependencies": {
+    "@fontsource-variable/inter": "5.3.0",
+    "@node-rs/argon2": "^2.2.2",
+    "@tanstack/react-query": "^5.104.3",
+    "express": "^5.3.0",
+    "heic-convert": "2.1.0",
+    "helmet": "^8.3.0",
+    "lucide-react": "1.49.0",
+    "mysql2": "^3.24.6",
+    "nodemailer": "^10.1.2",
+    "pdfjs-dist": "6.3.289",
+    "pino": "^10.4.0",
+    "pino-http": "^11.0.0",
+    "qrcode": "^1.5.4",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "sharp": "0.35.5",
+    "wouter": "^3.13.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/heic-convert": "2.1.1",
+    "@types/node": "^22.20.5",
+    "@types/nodemailer": "^8.0.2",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@types/supertest": "^7.2.1",
+    "@vitejs/plugin-react": "^5.2.0",
+    "esbuild": "^0.28.2",
+    "jsqr": "1.4.0",
+    "supertest": "^7.3.1",
+    "tsx": "^4.23.15",
+    "typescript": "~5.9.2",
+    "vite": "^7.3.7",
+    "vitest": "^5.0.4"
+  }
+}
