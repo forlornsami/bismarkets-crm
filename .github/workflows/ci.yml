@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: crm_test
+          MYSQL_USER: crm
+          MYSQL_PASSWORD: crm_test_pw
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -proot"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Allow trigger creation with binary logging on
+        run: mysql -h 127.0.0.1 -uroot -proot -e "SET GLOBAL log_bin_trust_function_creators = 1;"
+      - run: npm run typecheck
+      - run: npm test
+        env:
+          CRM_TEST_DATABASE_URL: mysql://crm:crm_test_pw@127.0.0.1:3306/crm_test
+      - run: npm run build
+      - run: npm audit --omit=dev --audit-level=high
