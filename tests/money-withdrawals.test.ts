@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import sharp from "sharp";
@@ -916,18 +917,19 @@ describe.skipIf(!hasDb)("staff withdrawals", () => {
   it("leaves the ledger consistent, and the verify-ledger command says so", async () => {
     expect(await verifyLedger(env.db)).toEqual([]);
     const run = promisify(execFile);
-    const tsx = fileURLToPath(new URL("../node_modules/.bin/tsx", import.meta.url));
+    // Node runs tsx's own script, so this works on Windows too (where .bin/tsx is a .cmd file).
+    const tsx = createRequire(import.meta.url).resolve("tsx/cli");
     const cli = fileURLToPath(new URL("../src/cli/index.ts", import.meta.url));
     const cwd = fileURLToPath(new URL("..", import.meta.url));
     const opts = { cwd, env: { ...process.env, CRM_DATABASE_URL: TEST_DB_URL }, timeout: 60_000 };
-    const ok = await run(tsx, [cli, "verify-ledger"], opts);
+    const ok = await run(process.execPath, [tsx, cli, "verify-ledger"], opts);
     expect(ok.stdout.trim()).toBe("Ledger checks passed.");
 
     // A wallet cache that no longer matches its entries is reported, with exit code 1.
     const client = (await one<{ client_id: number }>(env.db, "SELECT client_id FROM wallets ORDER BY id LIMIT 1"))!.client_id;
     await exec(env.db, "UPDATE wallets SET available_cents = available_cents + 1 WHERE client_id = ?", [client]);
     try {
-      const failed = await run(tsx, [cli, "verify-ledger"], opts).then(
+      const failed = await run(process.execPath, [tsx, cli, "verify-ledger"], opts).then(
         () => null,
         (e: { code?: number; stdout?: string }) => e,
       );
