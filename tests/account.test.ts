@@ -131,8 +131,11 @@ describe.skipIf(!hasDb)("client notifications, devices and support events", () =
     expect((await api().get("/api/sessions").set(ownAuth)).body.data).toHaveLength(1);
     expect(await one(env.db, "SELECT id FROM client_sessions WHERE id = SHA2(?, 256) AND revoked_reason = 'client_signed_out_others'", [idle])).toBeTruthy();
 
-    // Staff ending the client's sessions still ends the view too.
-    await post(boss, `/api/staff/clients/${user.id}/revoke-sessions`, {});
+    // Staff ending the client's sessions still ends the view too, and counts every session ended,
+    // timed-out ones included, as the staff client page lists them.
+    const stale = await login("viewonly@client.test");
+    await exec(env.db, "UPDATE client_sessions SET last_seen_at = CURRENT_TIMESTAMP(3) - INTERVAL 8 DAY WHERE id = SHA2(?, 256)", [stale]);
+    expect((await post(boss, `/api/staff/clients/${user.id}/revoke-sessions`, {})).body.revoked).toBe(3);
     expect((await api().get("/api/user").set(auth)).status).toBe(401);
   });
 

@@ -35,9 +35,9 @@ export async function createClientSession(
 
 /**
  * Ends sessions and tells the support service, so the app stops pushing to signed-out devices.
- * `devicesOnly` leaves staff view-only sessions running: the client's own "sign out other devices"
- * ends only what their device list shows. Returns how many of the ended sessions could still be
- * used (not timed out), which is the count the device list showed.
+ * `devicesOnly` is the client's own "sign out other devices": it leaves staff view-only sessions
+ * running and returns only the devices their list showed (not timed out). Otherwise every
+ * unexpired session ended is counted, as staff and the audit log see them.
  */
 export async function revokeClientSessions(conn: Conn, config: Config, clientId: number, reason: string, exceptSessionId?: string, devicesOnly = false) {
   const where = `client_id = ? AND revoked_at IS NULL${exceptSessionId ? " AND id <> ?" : ""}${devicesOnly ? " AND kind = 'login'" : ""}`;
@@ -50,7 +50,7 @@ export async function revokeClientSessions(conn: Conn, config: Config, clientId:
   );
   await exec(conn, `UPDATE client_sessions SET revoked_at = CURRENT_TIMESTAMP(3), revoked_reason = ? WHERE ${where}`, [reason, ...params]);
   for (const s of live) if (s.kind === "login") await queueSupportEvent(conn, config, { event: "session.revoked", clientId, sessionId: s.id });
-  return live.filter((s) => Number(s.usable) === 1).length;
+  return devicesOnly ? live.filter((s) => Number(s.usable) === 1).length : live.length;
 }
 
 /** Ends one session (sign-out, or the client removing a device). */
