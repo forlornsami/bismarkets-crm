@@ -6,6 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { DEPOSIT_CHECKLIST, DEPOSIT_REJECT_REASONS } from "@shared/money";
 import { encryptBytes, sha256 } from "../src/server/lib/crypto";
 import { exec, one, rows } from "../src/server/lib/db";
+import { syncDepositQrs } from "../src/server/lib/qr";
 import { verifyLedger, walletOf } from "../src/server/money/ledger";
 import { depositProofContext } from "../src/server/money/proofs";
 import { newReference } from "../src/server/money/references";
@@ -149,7 +150,7 @@ describe.skipIf(!hasDb)("staff deposits", () => {
     expect(Object.keys(item).sort()).toEqual(
       [
         "id", "reference", "clientId", "clientName", "clientEmail", "clientStatus", "kycStatus", "methodId", "methodName", "methodKind", "currency", "amountMinor", "amountCents",
-        "creditedCents", "status", "needsSecondApproval", "sentBack", "firstReviewedBy", "decidedBy", "createdAt", "decidedAt", "claimedBy", "warningCount",
+        "creditedCents", "status", "needsSecondApproval", "sentBack", "twoPersonMark", "firstReviewedBy", "decidedBy", "createdAt", "decidedAt", "claimedBy", "warningCount",
       ].sort(),
     );
     expect(item).toMatchObject({ reference: d.reference, clientId, clientName: "Ali Khan", methodId: usdBank, methodKind: "bank", currency: "USD", amountMinor: 10_000, amountCents: 10_000, creditedCents: null, status: "pending", needsSecondApproval: false, firstReviewedBy: null, claimedBy: null });
@@ -396,6 +397,19 @@ describe.skipIf(!hasDb)("staff deposits", () => {
     expect(await credits(again.id)).toBe(0);
     expect((await secondApprove(manager, again.id)).status).toBe(403);
     expect((await reject(manager2, again.id)).status).toBe(200);
+
+    // Two-person only because the client's other deposit was sent back: not itself sent back, so a
+    // first reviewer may reject it, but approving it still takes a second person.
+    const inherited = await makeDeposit(await makeClient(), usdBank, { amountMinor: 10_000 });
+    await exec(env.db, "UPDATE deposits SET needs_second_approval = 1 WHERE id = ?", [inherited.id]);
+    const view = await detail(agent, inherited.id);
+    expect(view).toMatchObject({ sentBack: false, twoPersonMark: true, needsSecondApproval: true });
+    expect(view.warnings).toContainEqual({
+      tone: "info", text: "Needs a second approval from another person. The client's other deposit was sent back from the second approval, so this applies whatever the amount.",
+    });
+    expect(view.can.reject).toEqual({ ok: true, reason: null });
+    await openProof(agent, inherited.id);
+    expect((await approve(agent, inherited.id, { receivedAmount: "100" })).body.status).toBe("second_approval");
 
     // Rejecting a waiting deposit tells the client why.
     const waiting = await makeDeposit(clientId, pkrBank, { currency: "PKR", amountMinor: 2_800_000 });
@@ -872,6 +886,23 @@ describe.skipIf(!hasDb)("staff deposits", () => {
       // A Pay ID is typed, not scanned; bank accounts have no QR code.
       expect((await post(manager, methods, { direction: "deposit", kind: "crypto", name: "Binance Pay", network: "binance_pay", walletAddress: "123456789" })).body).toMatchObject({ hasQr: false, qrUrl: null });
       expect((await post(manager, methods, { ...bank, name: "HBL QR test" })).body).toMatchObject({ hasQr: false, qrUrl: null });
+
+      // Pictures an earlier build took as uploads are redrawn by the migrate command, under a new link.
+      const link = `ethereum:0x55d398326f99059fF775485246999027B3197955@56/transfer?address=${bep}&uint256=1e18`;
+      const uploaded = await makeMethod({ kind: "crypto", name: "USDT BEP20 old", network: "bep20", bank_name: "", account_title: "", account_number: "", wallet_address: bep, qr_mime: "image/png", qr_bytes: await QRCode.toBuffer(link), qr_token: "a".repeat(32) });
+      const none = await makeMethod({ kind: "crypto", name: "USDT TRC20 old", network: "trc20", bank_name: "", account_title: "", account_number: "", wallet_address: trc });
+      const stray = await makeMethod({ name: "Bank with a picture", qr_mime: "image/png", qr_bytes: await QRCode.toBuffer(trc), qr_token: "b".repeat(32) });
+      const redrawn = await syncDepositQrs(env.db);
+      // (The fixture TRC20 method above was made without a picture too.)
+      expect(redrawn.sort()).toEqual([crypto, uploaded, none, stray].sort());
+      expect(await syncDepositQrs(env.db)).toEqual([]);
+      const after = await rows<{ id: number; qr_bytes: Buffer | null; qr_token: string | null }>(env.db, "SELECT id, qr_bytes, qr_token FROM payment_methods WHERE id IN (?, ?, ?) ORDER BY id", [uploaded, none, stray]);
+      expect(await decode(after[0]!.qr_bytes!)).toBe(bep);
+      expect(after[0]!.qr_token).toMatch(/^[0-9a-f]{32}$/);
+      expect(after[0]!.qr_token).not.toBe("a".repeat(32));
+      expect(await decode(after[1]!.qr_bytes!)).toBe(trc);
+      expect(after[2]).toMatchObject({ qr_bytes: null, qr_token: null });
+      expect((await request(env.app).get(`/api/payment-qr/${"a".repeat(32)}`)).status).toBe(404);
     });
 
     it("keeps a payout type's network while clients have accounts saved under it", async () => {

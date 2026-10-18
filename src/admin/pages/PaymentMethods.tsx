@@ -516,7 +516,9 @@ function QrSection({ method }: { method: PaymentMethod }) {
           <small className="muted">Drawn from the wallet address above and redrawn when it changes. Scan it once yourself to check it shows that address.</small>
         </>
       ) : (
-        <small className="muted">Binance Pay has no QR code: clients type the Pay ID.</small>
+        <small className="muted">
+          {method.network === "binance_pay" ? "Binance Pay has no QR code: clients type the Pay ID." : "No QR code yet. It is drawn when the method has a TRC20 or BEP20 wallet address."}
+        </small>
       )}
     </section>
   );

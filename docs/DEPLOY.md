@@ -55,7 +55,9 @@ Upgrading: stop the service, install the new release as above, run
 `node dist/cli.mjs migrate`, then start it again. Migrations also grant new
 permissions to the built-in roles (0011 gives `kyc.documents` to Super Admin,
 Admin, Compliance and Auditor); custom roles that should open KYC documents
-need it added under Roles.
+need it added under Roles. `migrate` also redraws any crypto deposit QR code
+that is not the CRM's own drawing of the method's address (from a build that
+took uploaded pictures), under a new link, and records it in the audit log.
 
 **Cutover order.** The client portal must run the version built for this CRM
 (bismarkets-client-portal PR #2) before or at the same moment

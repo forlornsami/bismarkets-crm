@@ -4,6 +4,7 @@ import { SUPER_ADMIN_SLUG } from "@shared/permissions";
 import { auditStandalone, verifyAuditChain } from "../server/lib/audit";
 import { createDb, exec, one } from "../server/lib/db";
 import { hashPassword } from "../server/lib/passwords";
+import { syncDepositQrs } from "../server/lib/qr";
 import { migrate } from "../server/migrate";
 import { verifyLedger } from "../server/money/ledger";
 import { seedRoles } from "../server/seed";
@@ -12,7 +13,7 @@ import { temporaryPassword } from "../server/staff/guards";
 const HELP = `BIS Markets CRM command line
 
   generate-key                       Print a new random CRM_DATA_KEY
-  migrate                            Apply new database migrations
+  migrate                            Apply new database migrations (and redraw deposit QR codes left by an earlier build)
   seed-roles [--reset]               Create the built-in roles (--reset restores their default permissions)
   create-super-admin --email E --name N
                                      Create a Super Admin and print a one-time temporary password
@@ -39,6 +40,11 @@ async function main() {
       case "migrate": {
         const ran = await migrate(db);
         console.log(ran.length ? `Applied ${ran.length} migration(s).` : "Database is up to date.");
+        const redrawn = await syncDepositQrs(db);
+        if (redrawn.length) {
+          await auditStandalone(db, { actor: { type: "system", id: null, label: "cli" }, ip: "", userAgent: "cli" }, { action: "payment_method.qr_redrawn", meta: { methods: redrawn } });
+          console.log(`Redrew the QR code of ${redrawn.length} deposit method(s) from the saved address.`);
+        }
         break;
       }
       case "seed-roles": {

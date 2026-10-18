@@ -418,7 +418,7 @@ export function clientMoneyRouter(deps: AppDeps): Router {
         // SENT_BACK_DAYS days, since a re-saved copy of the screenshot has different bytes.
         const sentBack = await one(
           conn,
-          `SELECT 1 AS x FROM deposits d WHERE d.client_id = ? AND d.needs_second_approval = 1
+          `SELECT 1 AS x FROM deposits d WHERE d.client_id = ? AND d.sent_back_at IS NOT NULL
              AND (d.status IN ('pending', 'second_approval') OR (d.status = 'rejected' AND d.decided_at > NOW(3) - INTERVAL ${SENT_BACK_DAYS} DAY)
                   OR EXISTS (SELECT 1 FROM deposit_proofs p WHERE p.deposit_id = d.id AND p.sha256 = ?))
            LIMIT 1`,

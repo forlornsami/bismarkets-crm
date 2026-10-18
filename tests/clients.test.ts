@@ -64,6 +64,8 @@ describe.skipIf(!hasDb)("client portal API", () => {
     const code = codeIn(email.full);
     expect(email.body_text).not.toContain(code);
     expect((await api().post("/api/send-otp").send({ email: "jane@client.test" })).status).toBe(429);
+    // The same inbox under a +tag counts too.
+    expect((await api().post("/api/send-otp").send({ email: "Jane+again@client.test" })).status).toBe(429);
 
     expect((await api().post("/api/verify-otp").send({ email: "jane@client.test", verification_code: "000000" === code ? "111111" : "000000" })).status).toBe(422);
     expect((await api().post("/api/verify-otp").send({ email: "jane@client.test", verification_code: code })).body).toMatchObject({ success: true });

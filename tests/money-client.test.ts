@@ -474,7 +474,7 @@ describe.skipIf(!hasDb)("client money API", () => {
     const twoPerson = async (reference: string) => (await one<{ n: number }>(env.db, "SELECT needs_second_approval AS n FROM deposits WHERE reference = ?", [reference]))!.n;
     expect(await twoPerson(resent.body.deposit.reference)).toBe(0);
     // A screenshot whose deposit was sent back from the second approval keeps needing two people when it comes again.
-    await exec(env.db, "UPDATE deposits SET status = 'rejected', needs_second_approval = 1 WHERE reference = ?", [resent.body.deposit.reference]);
+    await exec(env.db, "UPDATE deposits SET status = 'rejected', decided_at = NOW(3), needs_second_approval = 1, sent_back_at = NOW(3) WHERE reference = ?", [resent.body.deposit.reference]);
     const third = await deposit(ann, { method: String(m.bankUsd), amount: "75", wallet_key: ann.key }, fresh);
     expect(third.status).toBe(201);
     expect(await twoPerson(third.body.deposit.reference)).toBe(1);
@@ -483,6 +483,8 @@ describe.skipIf(!hasDb)("client money API", () => {
     const resaved = async (shade: string) => sharp(fresh).extend({ right: 1, background: shade }).png().toBuffer();
     const fourth = await deposit(ann, { method: String(m.bankUsd), amount: "74", wallet_key: ann.key }, await resaved("#000001"));
     expect(await twoPerson(fourth.body.deposit.reference)).toBe(1);
+    // The later deposits are two-person, but were never sent back themselves.
+    expect(await one(env.db, "SELECT sent_back_at FROM deposits WHERE reference = ?", [fourth.body.deposit.reference])).toEqual({ sent_back_at: null });
     const sentBack = [resent.body.deposit.reference, third.body.deposit.reference, fourth.body.deposit.reference];
     await exec(env.db, "UPDATE deposits SET status = 'rejected', decided_at = NOW(3) - INTERVAL 29 DAY WHERE reference IN (?, ?, ?)", sentBack);
     const fifth = await deposit(ann, { method: String(m.bankUsd), amount: "73", wallet_key: ann.key }, await resaved("#000002"));

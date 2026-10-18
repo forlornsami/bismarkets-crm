@@ -107,6 +107,7 @@ const ACTION_LABEL: Record<string, string> = {
   "payment_method.updated": "Payment method changed",
   "payment_method.qr_changed": "Payment method QR code changed",
   "payment_method.qr_removed": "Payment method QR code removed",
+  "payment_method.qr_redrawn": "Deposit QR codes redrawn from their addresses",
   "money_settings.updated": "Money limits changed",
 };
 

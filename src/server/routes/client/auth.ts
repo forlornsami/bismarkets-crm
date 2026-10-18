@@ -153,7 +153,8 @@ export function clientAuthRouter(deps: AppDeps): Router {
       }
       // A signed-in client's codes are theirs alone: counted, replaced and checked per client,
       // so another client asking for codes to the same address cannot cancel or block them.
-      const key = signedIn ? `${purpose}:client:${signedIn.id}` : `${purpose}:${email}`;
+      // Without a session the inbox is counted, so +tags and Gmail's dots do not multiply sign-up codes.
+      const key = signedIn ? `${purpose}:client:${signedIn.id}` : `${purpose}:${mailbox(email)}`;
       limit(otpEmailBurst, key, "Please wait before requesting another code.");
       limit(otpEmailHour, key, "Too many codes requested. Please wait before retrying.");
       // A new address is anyone's to type in: however many accounts ask, it gets a few codes an hour.
