@@ -30,7 +30,7 @@ describe.skipIf(!hasDb)("client portal API", () => {
     const code = codeIn((await lastEmail(email)).full);
     const res = await api().post("/api/register").send({ first_name: "Jane", last_name: "Doe", email, password: GOOD, password_confirmation: GOOD, verification_code: code, ...extra });
     expect(res.status).toBe(201);
-    return res.body as { token: string; user: { id: number; referral_code: string } };
+    return res.body as { token: string; user: { id: number; own_referral_code: string } };
   }
 
   beforeAll(async () => {

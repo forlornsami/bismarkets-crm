@@ -25,6 +25,8 @@ import { badRequest, conflict, forbidden, handler, HttpError, notFound, parse } 
 import { likeTerm, listQuery, toPage } from "../../lib/pagination";
 import { queueEmail } from "../../lib/email";
 import { deletePicture } from "../../lib/pictures";
+import { latestApplication, partnerOf } from "../../ib/model";
+import { activePartnersAmong, directReferralCounts, networkOf } from "../../ib/network";
 import { requirePermission, requireStepUp, staffActor, staffOf, type StaffContext } from "../../staff/session";
 
 const id = z.coerce.number().int().positive();
@@ -119,6 +121,8 @@ export function staffClientsRouter(deps: AppDeps): Router {
           verified: z.enum(["yes", "no"]).optional().or(z.literal("").transform(() => undefined)),
           kyc: z.enum(["none", "partial", "pending", "approved", "rejected"]).optional().or(z.literal("").transform(() => undefined)),
           country: z.string().trim().max(80).optional(),
+          // An IB partner's page opens "Clients they referred" with this.
+          referredBy: id.optional().or(z.literal("").transform(() => undefined)),
         }),
         req.query,
       );
@@ -138,6 +142,7 @@ export function staffClientsRouter(deps: AppDeps): Router {
       if (query.source) (where.push("c.source = ?"), params.push(query.source));
       if (query.kyc) (where.push("c.kyc_status = ?"), params.push(query.kyc));
       if (query.country) (where.push("c.country = ?"), params.push(query.country));
+      if (query.referredBy) (where.push("c.referred_by = ?"), params.push(query.referredBy));
       if (query.verified) where.push(query.verified === "yes" ? "c.email_verified_at IS NOT NULL" : "c.email_verified_at IS NULL");
       if (query.assigned === "me") (where.push("c.assigned_staff_id = ?"), params.push(staff.id));
       else if (query.assigned === "none") where.push("c.assigned_staff_id IS NULL");
@@ -243,6 +248,25 @@ export function staffClientsRouter(deps: AppDeps): Router {
 
   // ---------- One client ----------
 
+  /** The profile's "IB partnership" panel: the latest application, the partnership and the sponsor. */
+  async function ibBlock(row: Row) {
+    const latest = await latestApplication(db, row.id);
+    const partner = await partnerOf(db, row.id);
+    const counts = partner ? { direct: (await directReferralCounts(db, [row.id])).get(row.id) ?? 0, network: (await networkOf(db, row.id, deps.log)).length } : null;
+    const sponsorIsIb = row.referred_by ? (await activePartnersAmong(db, [row.referred_by])).has(row.referred_by) : false;
+    return {
+      status: latest?.status ?? "none",
+      applicationId: latest?.id ?? null,
+      partner: partner
+        ? {
+            status: partner.status, tier: partner.tier_name, approvedAt: partner.approved_at.toISOString(), referralCode: row.referral_code,
+            directClients: counts!.direct, network: counts!.network, removedAt: partner.removed_at?.toISOString() ?? null,
+          }
+        : null,
+      sponsor: row.referred_by ? { id: row.referred_by, name: row.referrer_name, isIb: sponsorIsIb } : null,
+    };
+  }
+
   router.get(
     "/:id",
     requirePermission("client.view"),
@@ -257,7 +281,8 @@ export function staffClientsRouter(deps: AppDeps): Router {
       );
       // Fields checked against documents under review or approved; the edit form shows them locked.
       const lockedFields = lockedProfileFields(await latestSubmissions(db, row.id), row).map((f) => FORM_FIELD[f]);
-      res.json({ ...present(row), activeSessions: Number(counts?.sessions ?? 0), notesCount: Number(counts?.notes ?? 0), referrals: Number(counts?.referrals ?? 0), lockedFields });
+      const ib = staffOf(req).permissions.has("ib.view") ? await ibBlock(row) : null;
+      res.json({ ...present(row), activeSessions: Number(counts?.sessions ?? 0), notesCount: Number(counts?.notes ?? 0), referrals: Number(counts?.referrals ?? 0), lockedFields, ib });
     }),
   );
 
@@ -531,7 +556,7 @@ export function staffClientsRouter(deps: AppDeps): Router {
       const list = await rows<{ id: number; occurred_at: Date; actor_type: string; actor_label: string; action: string; ip: string; meta_json: unknown }>(
         db,
         `SELECT id, occurred_at, actor_type, actor_label, action, ip, meta_json FROM audit_log
-         WHERE entity_type = 'client' AND entity_id = ? AND action NOT IN ('kyc.document_page_viewed', 'deposit.viewed', 'deposit.proof_viewed', 'withdrawal.viewed')
+         WHERE entity_type = 'client' AND entity_id = ? AND action NOT IN ('kyc.document_page_viewed', 'deposit.viewed', 'deposit.proof_viewed', 'withdrawal.viewed', 'ib.application_viewed')
          ORDER BY id DESC LIMIT 100`,
         [String(row.id)],
       );
@@ -545,6 +570,7 @@ export function staffClientsRouter(deps: AppDeps): Router {
         deposit: permissions.has("deposit.proof"),
         withdrawal: permissions.has("withdrawal.view") && (["withdrawal.process", "withdrawal.approve", "withdrawal.reject", "withdrawal.pay"] as const).some((p) => permissions.has(p)),
       };
+      const fullIb = permissions.has("ib.view");
       const meta = (a: (typeof list)[number]) => {
         if (!a.meta_json || typeof a.meta_json !== "object") return a.meta_json ?? null;
         const m = a.meta_json as Record<string, unknown>;
@@ -558,6 +584,13 @@ export function staffClientsRouter(deps: AppDeps): Router {
           const { warnings: _warnings, payoutReferenceAlsoOn: _alsoOn, ...rest } = m;
           if (fullMoney[area]) return rest;
           return Object.fromEntries(["depositId", "withdrawalId", "reference", "stage", "reason"].filter((k) => k in m).map((k) => [k, m[k]]));
+        }
+        if (area === "ib") {
+          // IB review warnings can name other clients; internal notes are for the IB reviewers.
+          const { warnings: _warnings, ...rest } = m;
+          if (fullIb) return rest;
+          const shown = a.action === "ib.rejected" || a.action === "ib.removed";
+          return Object.fromEntries(["applicationId", "tier", ...(shown ? ["reason"] : [])].filter((k) => k in m).map((k) => [k, m[k]]));
         }
         // Saved payout accounts: which one and what changed, without its type or account ending.
         if (area === "payout_method" && !fullMoney.withdrawal) {

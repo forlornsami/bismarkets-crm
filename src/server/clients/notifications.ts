@@ -4,7 +4,7 @@ import { exec } from "../lib/db";
 // The bell in the client portal and app. Rows are written in the same
 // transaction as the change they describe.
 
-export type NotificationType = "kyc" | "security" | "account" | "deposit" | "withdrawal";
+export type NotificationType = "kyc" | "security" | "account" | "deposit" | "withdrawal" | "ib";
 
 export const NOTIFICATION_TYPES: { value: NotificationType; label: string }[] = [
   { value: "kyc", label: "Verification" },
@@ -12,6 +12,7 @@ export const NOTIFICATION_TYPES: { value: NotificationType; label: string }[] = 
   { value: "account", label: "Account" },
   { value: "deposit", label: "Deposits" },
   { value: "withdrawal", label: "Withdrawals" },
+  { value: "ib", label: "IB partnership" },
 ];
 
 export async function notifyClient(

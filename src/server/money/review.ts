@@ -4,7 +4,8 @@ import { exec, one, type Conn } from "../lib/db";
 import { badRequest } from "../lib/http";
 import type { StaffContext } from "../staff/session";
 
-// Pieces shared by the deposit and withdrawal review routes.
+// Pieces shared by the deposit and withdrawal review routes; the IB queue uses
+// the same reasons, notes, checklists and scope.
 
 export const moneyId = z.coerce.number().int().positive();
 
@@ -45,10 +46,10 @@ export const clientScope = (staff: StaffContext, alias = "c") =>
 /** Whether the staff member may see this client (for naming other clients in warnings). */
 export const inScope = (staff: StaffContext, assignedTo: number | null) => staff.permissions.has("client.view_all") || assignedTo === staff.id;
 
-export type NoteStage = "first_approval" | "second_approval" | "returned" | "approved" | "paid" | "rejected";
+export type NoteStage = "first_approval" | "second_approval" | "returned" | "approved" | "paid" | "rejected" | "removed";
 
-/** Adds an internal note to a deposit or withdrawal (oldest first). */
-export async function appendNote(conn: Conn, table: "deposits" | "withdrawals", id: number, staff: StaffContext, stage: NoteStage, text: string | null) {
+/** Adds an internal note to a deposit, a withdrawal or an IB application (oldest first). */
+export async function appendNote(conn: Conn, table: "deposits" | "withdrawals" | "ib_applications", id: number, staff: StaffContext, stage: NoteStage, text: string | null) {
   if (!text) return;
   const note = JSON.stringify({ at: new Date().toISOString(), by: staff.id, byName: staff.name, stage, text });
   await exec(conn, `UPDATE ${table} SET notes = JSON_ARRAY_APPEND(COALESCE(notes, JSON_ARRAY()), '$', CAST(? AS JSON)) WHERE id = ?`, [note, id]);
