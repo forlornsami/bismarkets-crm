@@ -663,6 +663,8 @@ export interface ReviewDecisionProps {
   /** An example for the internal note box. */
   notePlaceholder?: string;
   approveLabel?: string;
+  /** Whether a decision opens the next item (default yes); false for staff who may only reject, who go back to the list. */
+  continues?: boolean;
   /** Opens the rejection with this reason filled in; each new `key` opens it again. */
   rejectWith?: { reason: string; key: number } | null;
   /** Extra rules for the reason, such as what the app can show. */
@@ -811,7 +813,7 @@ export function ReviewDecision(props: ReviewDecisionProps) {
               Back <kbd>Esc</kbd>
             </button>
             <button type="submit" className="button button-danger-solid" disabled={busy || reason.trim().length < 5 || !!reasonProblem || !!noteProblem}>
-              {busy && <Spinner />} Reject and next <kbd>Ctrl ↵</kbd>
+              {busy && <Spinner />} Reject{props.continues === false ? "" : " and next"} <kbd>Ctrl ↵</kbd>
             </button>
           </div>
         </form>

@@ -23,19 +23,47 @@ export interface ClientIbBlock {
 }
 
 /** The "IB partnership" panel on a client's page: whether they are an IB, their level and code, who they brought in and who brought them. */
-export function ClientIb({ clientId, ib }: { clientId: number; ib: ClientIbBlock }) {
+export function ClientIb({ clientId, ib, closed = false }: { clientId: number; ib: ClientIbBlock; closed?: boolean }) {
   const p = ib.partner;
+  // A pending or rejected latest application is newer than a removed partnership: the badge is the application's.
+  const newerApplication = ib.status === "pending" || ib.status === "rejected";
   return (
     <section className="panel">
       <div className="card-head">
         <h2 className="flush">
           <Network size={18} /> IB partnership
         </h2>
-        {p ? <PartnerBadge status={p.status} /> : ib.status === "none" ? <Badge tone="neutral">Not an IB</Badge> : <IbStatusBadge status={ib.status} />}
+        {p && !newerApplication ? (
+          <span>
+            <PartnerBadge status={p.status} />
+            {closed && p.status === "active" && (
+              <>
+                {" "}
+                <Badge tone="bad">Account closed</Badge>
+              </>
+            )}
+          </span>
+        ) : ib.status === "none" ? (
+          <Badge tone="neutral">Not an IB</Badge>
+        ) : (
+          <IbStatusBadge status={ib.status} />
+        )}
       </div>
       <dl className="details">
         {p ? (
           <>
+            {newerApplication && (
+              <>
+                <dt>Latest application</dt>
+                <dd>
+                  <IbStatusBadge status={ib.status as IbStatus} />
+                </dd>
+                <dt>Earlier partnership</dt>
+                <dd>
+                  <PartnerBadge status={p.status} />
+                </dd>
+              </>
+            )}
             <dt>Level</dt>
             <dd>{p.tier}</dd>
             <dt>Referral code</dt>

@@ -313,7 +313,7 @@ export function DepositWorkbench({ id }: { id: string }) {
   const [bankRef, setBankRef] = useState("");
   const [receivedOn, setReceivedOn] = useState("");
 
-  if (!d) return <ReviewItemMissing error={item.detail.error} route="/deposits" />;
+  if (!d || item.detail.error) return <ReviewItemMissing error={item.detail.error} route="/deposits" />;
   const open = item.open;
   const holdable = item.holdable;
   const stage = stageOf(d);
@@ -516,6 +516,7 @@ export function DepositWorkbench({ id }: { id: string }) {
                 </>
               )}
               <ReviewDecision
+                continues={item.mayContinue}
                 reasonRule={moneyReasonProblem}
                 resetKey={sid}
                 checklist={stage === "second" ? lists.second : lists.first}

@@ -112,7 +112,7 @@ export function queueTab<S extends string>(name: string, stages: readonly S[]): 
   };
 }
 
-export type NextItem = UseMutationResult<{ id: number | null }, Error, { release?: number }>;
+export type NextItem = UseMutationResult<{ id: number | null }, Error, { release?: number; skip?: number[] }>;
 
 /** "Start reviewing" and approve-and-next: claims the oldest item this reviewer can act on, or goes back to the queue. */
 export function useNextItem<S extends string>({ base, route, keys, tab, nothing }: { base: string; route: string; keys: string[]; tab: QueueTab<S>; nothing: (stage: S | null, skips: number) => string }): NextItem {
@@ -120,9 +120,10 @@ export function useNextItem<S extends string>({ base, route, keys, tab, nothing 
   const { toast } = useFeedback();
   const client = useQueryClient();
   return useMutation({
-    mutationFn: (opts: { release?: number } = {}) => {
+    // `skip` passes over more items this once, without adding them to the tab's skipped list.
+    mutationFn: ({ skip = [], ...opts }: { release?: number; skip?: number[] } = {}) => {
       const stage = tab.stage();
-      return api.post<{ id: number | null }>(`${base}/next`, { skip: tab.skipped(), ...(stage ? { stage } : {}), ...opts });
+      return api.post<{ id: number | null }>(`${base}/next`, { skip: [...tab.skipped(), ...skip].slice(-200), ...(stage ? { stage } : {}), ...opts });
     },
     onSuccess: (res) => {
       for (const key of keys) void client.invalidateQueries({ queryKey: [key] });

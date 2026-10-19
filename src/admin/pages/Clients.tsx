@@ -141,6 +141,16 @@ export function ClientsList() {
     const filters: Record<string, string> = referredBy && /^\d{1,12}$/.test(referredBy) ? { referredBy } : {};
     return { page: 1, pageSize: 25, sort: "created_at", dir: "desc", filters };
   });
+  // The referrer's name for the filter chip, from their profile, only when this viewer may see them:
+  // every client with client.view_all, otherwise the client whose page they came from. Otherwise the chip gives the ID.
+  const queryClient = useQueryClient();
+  const referrerId = state.filters.referredBy ?? "";
+  const referrer = useQuery({
+    queryKey: ["client", referrerId],
+    queryFn: () => api.get<Client>(`/api/staff/clients/${referrerId}`),
+    enabled: referrerId !== "" && (can("client.view_all") || queryClient.getQueryData(["client", referrerId]) !== undefined),
+    retry: false,
+  });
   // The dashboard's "Add a client" shortcut opens the form straight away.
   const [creating, setCreating] = useState(() => new URLSearchParams(window.location.search).get("new") === "1");
   const list = useQuery({
@@ -203,7 +213,7 @@ export function ClientsList() {
         toolbar={
           state.filters.referredBy && (
             <span className="review-filter">
-              Clients referred by client {state.filters.referredBy}
+              Clients referred by {referrer.data?.name || `client ${referrerId}`}
               <button type="button" className="icon-button" aria-label="Show every client" title="Show every client" onClick={() => setState({ ...state, page: 1, filters: { ...state.filters, referredBy: "" } })}>
                 <X size={14} />
               </button>
@@ -621,7 +631,7 @@ export function ClientDetail({ id }: { id: string }) {
       {(can("wallet.view") || d.ib) && (
         <div className="columns columns-wide">
           {can("wallet.view") && <ClientNotice notice={d.importantNotice} />}
-          {d.ib && <ClientIb clientId={d.id} ib={d.ib} />}
+          {d.ib && <ClientIb clientId={d.id} ib={d.ib} closed={d.status === "closed"} />}
         </div>
       )}
       <div className="columns columns-wide">

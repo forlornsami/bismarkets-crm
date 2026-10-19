@@ -193,6 +193,10 @@ describe.skipIf(!hasDb)("staff IB applications and partners", () => {
       expect([blocked.status, blocked.body.error.message]).toEqual([409, "admin is reviewing this right now."]);
       expect((await post(admin2, `${A(id)}/claim`, { takeOver: true })).body.claimedBy.id).toBe(admin2.staffId);
       expect((await audits("ib.review_taken_over", id))[0]).toMatchObject({ actor_id: admin2.staffId, meta_json: { applicationId: id, from: admin.staffId } });
+      // What happened names the reviewer the item was taken from, as on every other queue.
+      expect((await admin2.agent.get(A(id))).body.trail.at(-1)).toEqual({
+        at: expect.any(String), action: "review_taken_over", label: "Took over the review from admin", staff: "admin2", reason: null, internalNote: null,
+      });
       expect((await post(admin2, `${A(id)}/release`)).status).toBe(200);
       expect((await one<{ claimed_by: number | null }>(env.db, "SELECT claimed_by FROM ib_applications WHERE id = ?", [id]))!.claimed_by).toBeNull();
       expect((await post(compliance, `${A(id)}/claim`)).status).toBe(403);
@@ -226,6 +230,8 @@ describe.skipIf(!hasDb)("staff IB applications and partners", () => {
       expect(await audits("ib.application_viewed", id)).toHaveLength(2);
       // The assigned account manager may open it but not approve it (four eyes).
       expect((await admin2.agent.get(A(id))).body.can.approve).toEqual({ ok: false, reason: FOUR_EYES });
+      expect((await admin2.agent.get(A(id))).body.setUpByMe).toBe(true);
+      expect(res.body.setUpByMe).toBe(false);
       expect((await compliance.agent.get(A(id))).body.can.approve).toEqual({ ok: false, reason: "You can look at this application but not decide it." });
     });
 
@@ -259,6 +265,10 @@ describe.skipIf(!hasDb)("staff IB applications and partners", () => {
       expect(list).not.toContain(theirs);
       // Their own client: they may look and reject, but approving needs another person.
       expect((await scoped.agent.get(A(mine))).body.can.approve.reason).toBe(FOUR_EYES);
+      // The four-eyes flag holds while an earlier reason (another reviewer's claim, a frozen account) is the one given.
+      await post(admin, `${A(mine)}/claim`);
+      expect((await scoped.agent.get(A(mine))).body).toMatchObject({ setUpByMe: true, can: { approve: { ok: false, reason: "admin is reviewing this right now." } } });
+      await post(admin, `${A(mine)}/release`);
       expect((await post(scoped, "/api/staff/ib/applications/next", {})).body.id).toBeNull();
       expect((await scoped.agent.get("/api/staff/ib/applications/summary")).body.forMe).toBe(0);
     });
@@ -455,6 +465,11 @@ describe.skipIf(!hasDb)("staff IB applications and partners", () => {
       const summary = (await compliance.agent.get("/api/staff/ib/partners/summary")).body;
       expect(summary).toEqual({ active: expect.any(Number), removed: expect.any(Number), newThisMonth: expect.any(Number) });
       expect(summary.active).toBeGreaterThanOrEqual(3);
+      // A closed account is no longer an IB, so it is not counted as active, though the list still shows it for removal.
+      await exec(env.db, "UPDATE clients SET status = 'closed' WHERE id = ?", [sub]);
+      const after = (await compliance.agent.get("/api/staff/ib/partners/summary")).body;
+      expect([after.active, after.newThisMonth]).toEqual([summary.active - 1, summary.newThisMonth - 1]);
+      expect((await compliance.agent.get(`/api/staff/ib/partners?q=${sub}`)).body.items).toMatchObject([{ clientId: sub, status: "active", clientStatus: "closed" }]);
       const removed = (await compliance.agent.get("/api/staff/ib/partners?status=removed")).body.items;
       expect(removed.every((p: { status: string }) => p.status === "removed")).toBe(true);
       expect((await scoped.agent.get(`/api/staff/ib/partners?q=Pat%20Partner`)).body.items).toEqual([]);

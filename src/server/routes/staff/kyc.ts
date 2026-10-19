@@ -184,6 +184,7 @@ const TRAIL: Record<string, string> = {
   "kyc.new_document_requested": "New document requested",
   "kyc.approved_without_documents": "Approved without documents",
   "kyc.withdrawn_by_client": "Taken back by the client",
+  "kyc.review_taken_over": "Took over the review",
 };
 const text = (v: unknown) => (typeof v === "string" && v ? v : null);
 
@@ -536,9 +537,10 @@ export function staffKycRouter(deps: AppDeps): Router {
         ? { id: otherRow.id, category: otherRow.category, status: otherRow.status, documentType: present(otherRow).documentType, submittedAt: otherRow.submitted_at.toISOString(), decidedAt: otherRow.decided_at?.toISOString() ?? null, documents: Number(otherRow.documents), files: (await documentsOf(otherRow.id)).map(file) }
         : null;
 
-      const trailRows = await rows<{ occurred_at: Date; action: string; actor_type: string; staff_name: string | null; meta_json: Record<string, unknown> | null }>(
+      const trailRows = await rows<{ occurred_at: Date; action: string; actor_type: string; staff_name: string | null; from_name: string | null; meta_json: Record<string, unknown> | null }>(
         db,
-        `SELECT a.occurred_at, a.action, a.actor_type, u.name AS staff_name, a.meta_json FROM audit_log a LEFT JOIN staff_users u ON a.actor_type = 'staff' AND u.id = a.actor_id
+        `SELECT a.occurred_at, a.action, a.actor_type, u.name AS staff_name, f.name AS from_name, a.meta_json FROM audit_log a LEFT JOIN staff_users u ON a.actor_type = 'staff' AND u.id = a.actor_id
+           LEFT JOIN staff_users f ON a.action = 'kyc.review_taken_over' AND f.id = CAST(a.meta_json->>'$.from' AS UNSIGNED)
          WHERE a.entity_type = 'client' AND a.entity_id = ? AND a.action IN (${Object.keys(TRAIL).map(() => "?").join(",")}) AND a.meta_json->'$.submissionId' = ? ORDER BY a.id`,
         [String(row.client_id), ...Object.keys(TRAIL), row.id],
       );
@@ -547,7 +549,12 @@ export function staffKycRouter(deps: AppDeps): Router {
         return {
           at: a.occurred_at.toISOString(),
           action: a.action.replace(/^kyc\./, ""),
-          label: a.action === "kyc.decision_changed" && text(meta.from) && text(meta.to) ? `Decision changed from ${meta.from} to ${meta.to}` : TRAIL[a.action]!,
+          label:
+            a.action === "kyc.decision_changed" && text(meta.from) && text(meta.to)
+              ? `Decision changed from ${meta.from} to ${meta.to}`
+              : a.action === "kyc.review_taken_over" && a.from_name
+                ? `Took over the review from ${a.from_name}`
+                : TRAIL[a.action]!,
           staff: a.actor_type === "staff" ? (a.staff_name ?? "Staff") : null,
           reason: text(meta.reason) ?? text(meta.note),
           internalNote: text(meta.internalNote),

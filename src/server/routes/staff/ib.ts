@@ -9,23 +9,23 @@ import { exec, one, rows, transaction, type Conn } from "../../lib/db";
 import { badRequest, conflict, handler, notFound, parse } from "../../lib/http";
 import { likeTerm, listQuery, toPage } from "../../lib/pagination";
 import { activeClaim, claim, CLAIM_MINUTES, release } from "../../lib/review";
+import { reviewTrail, tookOver, type TrailStep } from "../../lib/review-detail";
 import { appendNote, checklistOf, clientScope, internalNote, moneyId, reasonText } from "../../money/review";
 import { loadTiers, partnerOf } from "../../ib/model";
 import { activePartnersAmong, approvedDeposits, directReferralCounts, networkOf, TtlCache, usd, type Member } from "../../ib/network";
 import {
-  blockOf, can, IB_CHECKLIST, IB_REJECT_REASONS, IB_REMOVE_REASONS, NOT_FOUND, NOT_SET_UP_BY, REVIEW_SELECT, tellClient, verifiedName, warningCount, warningsFor, type ReviewRow,
+  blockOf, can, IB_CHECKLIST, IB_REJECT_REASONS, IB_REMOVE_REASONS, NOT_FOUND, NOT_SET_UP_BY, REVIEW_SELECT, setUpBy, tellClient, verifiedName, warningCount, warningsFor, type ReviewRow,
 } from "../../ib/review";
 import { requirePermission, requireStepUp, staffActor, staffOf, type StaffContext } from "../../staff/session";
 
 // The decision history shown with an application, from the audit log. Opening it is audited too, but not listed.
-const TRAIL: Record<string, string> = {
-  "ib.applied": "Sent by the client",
-  "ib.approved": "Approved",
-  "ib.rejected": "Rejected",
-  "ib.removed": "IB status removed",
-  "ib.review_taken_over": "Review taken over",
+const TRAIL: Record<string, TrailStep> = {
+  "ib.applied": { action: "applied", label: "Sent by the client" },
+  "ib.approved": { action: "approved", label: "Approved" },
+  "ib.rejected": { action: "rejected", label: "Rejected" },
+  "ib.removed": { action: "removed", label: "IB status removed" },
+  "ib.review_taken_over": { action: "review_taken_over", label: tookOver },
 };
-const text = (v: unknown) => (typeof v === "string" && v ? v : null);
 const person = (staffId: number | null, name: string | null) => (staffId ? { id: staffId, name: name ?? "Staff" } : null);
 const iso = (d: Date | null | undefined) => d?.toISOString() ?? null;
 const STATUSES = ["pending", "approved", "rejected", "removed", "all"] as const;
@@ -131,12 +131,6 @@ export function staffIbRouter(deps: AppDeps): Router {
       db, "SELECT id, status, submitted_at, decided_at, removed_at, reject_reason FROM ib_applications WHERE client_id = ? AND id <> ? ORDER BY id DESC LIMIT 20", [r.client_id, r.id],
     );
     const remover = partner?.removed_by ? await one<{ name: string }>(db, "SELECT name FROM staff_users WHERE id = ?", [partner.removed_by]) : undefined;
-    const trailRows = await rows<{ occurred_at: Date; action: string; actor_type: string; staff_name: string | null; meta_json: Record<string, unknown> | null }>(
-      db,
-      `SELECT a.occurred_at, a.action, a.actor_type, u.name AS staff_name, a.meta_json FROM audit_log a LEFT JOIN staff_users u ON a.actor_type = 'staff' AND u.id = a.actor_id
-       WHERE a.entity_type = 'client' AND a.entity_id = ? AND a.action IN (${Object.keys(TRAIL).map(() => "?").join(",")}) AND a.meta_json->'$.applicationId' = ? ORDER BY a.id`,
-      [String(r.client_id), ...Object.keys(TRAIL), r.id],
-    );
     const assigned = person(r.assigned_staff_id, r.assigned_name);
     return {
       id: r.id,
@@ -198,21 +192,13 @@ export function staffIbRouter(deps: AppDeps): Router {
       tiers: tiers.map((t) => ({ id: t.id, name: t.name, position: t.position })),
       defaultTierId: tiers[0]?.id ?? null,
       can: { approve: can(staff, r, "approve"), reject: can(staff, r, "reject"), remove: can(staff, r, "remove", partnerActive) },
+      // The four-eyes rule on its own (can.approve gives an earlier reason first), so the screen never holds an item this reviewer may not approve.
+      setUpByMe: setUpBy(r, staff.id),
       claimedBy: presentRow(r).claimedBy,
       claimMinutes: CLAIM_MINUTES,
       queue: await queueOf(staff, r),
       notes: (r.notes ?? []).map((n) => ({ at: n.at, byName: n.byName, stage: n.stage, text: n.text })),
-      trail: trailRows.map((a) => {
-        const meta = a.meta_json ?? {};
-        return {
-          at: a.occurred_at.toISOString(),
-          action: a.action.replace(/^ib\./, ""),
-          label: TRAIL[a.action]!,
-          staff: a.actor_type === "staff" ? (a.staff_name ?? "Staff") : null,
-          reason: text(meta.reason),
-          internalNote: text(meta.internalNote),
-        };
-      }),
+      trail: await reviewTrail(db, { clientId: r.client_id, idKey: "applicationId", id: r.id, steps: TRAIL }),
     };
   }
 
@@ -574,7 +560,9 @@ export function staffIbRouter(deps: AppDeps): Router {
       const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
       const r = await one<{ active: string | null; removed: string | null; recent: string | null }>(
         db,
-        `SELECT SUM(p.status = 'active') AS active, SUM(p.status = 'removed') AS removed, SUM(p.status = 'active' AND p.approved_at >= ?) AS recent
+        // A closed account is not an IB (its IB Dashboard is shut), even before staff remove the partnership.
+        `SELECT SUM(p.status = 'active' AND c.status <> 'closed') AS active, SUM(p.status = 'removed') AS removed,
+           SUM(p.status = 'active' AND c.status <> 'closed' AND p.approved_at >= ?) AS recent
          FROM ib_partners p JOIN clients c ON c.id = p.client_id WHERE 1 = 1${s.sql}`,
         [monthStart, ...s.params],
       );

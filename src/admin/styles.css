@@ -186,7 +186,7 @@ code { background: var(--surface-sunken); padding: 1px 6px; border-radius: 5px; 
 .page-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 22px; flex-wrap: wrap; }
 .page-head-text { min-width: 0; }
 .page-head h1 { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.page-head p { margin: 4px 0 0; color: var(--muted); max-width: 720px; }
+.page-head p { margin: 4px 0 0; color: var(--muted); max-width: 720px; overflow-wrap: anywhere; }
 .page-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .back-link { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); font-weight: 500; margin-bottom: 10px; }
 .back-link:hover { color: var(--text); text-decoration: none; }
@@ -475,7 +475,8 @@ textarea.input { height: auto; padding: 8px 12px; resize: vertical; }
 .notice-warn svg { color: var(--warn); }
 .columns-wide { grid-template-columns: repeat(auto-fit, minmax(min(380px, 100%), 1fr)); }
 .profile-head { display: flex; align-items: center; gap: 16px; margin-bottom: 20px; padding-bottom: 18px; border-bottom: 1px solid var(--border); }
-.profile-head .muted { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.profile-head > div { min-width: 0; }
+.profile-head .muted { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; overflow-wrap: anywhere; }
 .note-form { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
 .note-form textarea { resize: vertical; min-height: 76px; font: inherit; }
 .note-form-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; }

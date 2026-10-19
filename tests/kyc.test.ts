@@ -375,6 +375,13 @@ describe.skipIf(!hasDb)("KYC", () => {
       expect.arrayContaining([expect.stringMatching(/^The client sent the same file that was rejected on \d{1,2} [A-Z][a-z]+ \d{4}\.$/), "1 earlier attempt was rejected. See the history below."]),
     );
     expect(resentDetail.history).toEqual([expect.objectContaining({ id: identity.id, status: "rejected", newer: false })]);
+    // Taking over a colleague's review shows in What happened, naming the colleague, as on the other queues.
+    await post(second, `/api/staff/kyc/${resent.id}/claim`, {});
+    expect((await post(reviewer, `/api/staff/kyc/${resent.id}/claim`, { takeOver: true })).body.claimedBy.name).toBe("comp");
+    expect((await reviewer.agent.get(`/api/staff/kyc/${resent.id}`)).body.trail.at(-1)).toEqual({
+      at: expect.any(String), action: "review_taken_over", label: "Took over the review from comp2", staff: "comp", reason: null, internalNote: null,
+    });
+    await post(reviewer, `/api/staff/kyc/${resent.id}/release`, {});
     const earlier = (await reviewer.agent.get(`/api/staff/kyc/${identity.id}`)).body;
     expect(earlier).toMatchObject({ isLatest: false, mayApprove: false, approveBlockedReason: "The client has a newer submission for this. Change that one instead." });
     expect(earlier.history[0]).toMatchObject({ id: resent.id, newer: true });

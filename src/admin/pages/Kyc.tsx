@@ -412,7 +412,7 @@ export function KycWorkbench({ id }: { id: string }) {
     void send(0);
   }, []);
 
-  if (!d) return <ReviewItemMissing error={item.detail.error} route="/kyc" />;
+  if (!d || item.detail.error) return <ReviewItemMissing error={item.detail.error} route="/kyc" />;
   const closed = d.client.status === "closed" || d.approveBlockedReason === CLOSED;
   const heldBy = hold.heldBy;
   const p = d.profile;
@@ -542,6 +542,7 @@ export function KycWorkbench({ id }: { id: string }) {
             <>
               <HoldNotices away={hold.away} heldBy={heldBy} holdable={item.holdable} busy={hold.claim.isPending} onResume={hold.resume} onTakeOver={() => hold.claim.mutate(true)} />
               <ReviewDecision
+                continues={item.mayContinue}
                 resetKey={sid}
                 checklist={d.checklist}
                 reasons={reasons}
@@ -554,7 +555,7 @@ export function KycWorkbench({ id }: { id: string }) {
                 rejectWith={rejectWith}
                 onApprove={(checklist, note) => item.decide.mutate({ kind: "approve", body: { decision: "approve", checklist, ...(note ? { note } : {}) } })}
                 onReject={(reason, checklist, note) => item.decide.mutate({ kind: "reject", body: { decision: "reject", reason, checklist, ...(note ? { note } : {}) } })}
-                onSkip={mayDecide ? item.skip : undefined}
+                onSkip={item.holdable ? item.skip : undefined}
                 onBack={item.back}
                 footnote={<ReviewFootnote recorded="Opening documents" held={item.holdable && !heldBy && !hold.away} />}
               />

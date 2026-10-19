@@ -324,7 +324,8 @@ export function useReviewItem<D, K extends string, R, S extends string>(o: Revie
       void client.invalidateQueries({ queryKey: [o.detailKey, o.id], refetchType: "none" });
       for (const key of o.listKeys) void client.invalidateQueries({ queryKey: [key] });
       // Staff who may only reject have no queue to be handed the next item from.
-      if (o.mayContinue) o.next.mutate({});
+      // An item just sent back is for someone else's earlier step, so next passes over it this once.
+      if (o.mayContinue) o.next.mutate(x.kind === "return" ? { skip: [o.id] } : {});
       else back();
     },
     // Someone else may have decided or taken the item, or the rules changed: show the item as it is now.
@@ -338,7 +339,7 @@ export function useReviewItem<D, K extends string, R, S extends string>(o: Revie
     hold.decided.current = true;
     o.next.mutate({ release: o.id });
   };
-  return { detail, d, open, holdable, hold, decide, variables: decide.variables, skip, back };
+  return { detail, d, open, holdable, hold, decide, variables: decide.variables, skip, back, mayContinue: o.mayContinue };
 }
 
 /** The workbench while its item loads, or when it cannot be opened. */

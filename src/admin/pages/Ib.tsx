@@ -99,6 +99,8 @@ interface IbDetail {
   tiers: { id: number; name: string; position: number }[];
   defaultTierId: number | null;
   can: { approve: CanDo; reject: CanDo; remove: CanDo };
+  /** This reviewer set up the client's account or KYC, so another person must approve (four eyes). */
+  setUpByMe: boolean;
   claimedBy: Claimer | null;
   claimMinutes: number;
   queue: { pending: number; position: number | null };
@@ -107,8 +109,6 @@ interface IbDetail {
 
 type Tab = IbStatus | "all";
 type Kind = "approve" | "reject";
-// The server's reason when this reviewer set up the client's account or KYC: another person must approve.
-const FOUR_EYES = "You set up this client's account or KYC, so another person must approve their IB application.";
 const isPending = (a: { status: IbStatus }) => a.status === "pending";
 
 // IB applications have one step, so Start reviewing keeps to no stage.
@@ -391,7 +391,7 @@ export function IbApplicationWorkbench({ id }: { id: string }) {
     holdable: (d) => {
       // An application this reviewer can never approve (a closed account, or a client they set up) stays free for colleagues,
       // unless it is already held for them.
-      const notForMe = d.client.status === "closed" || d.can.approve.reason === FOUR_EYES;
+      const notForMe = d.client.status === "closed" || d.setUpByMe;
       return isPending(d) && mayDecide && (!notForMe || d.claimedBy?.id === me);
     },
     claimedBy: (d) => d.claimedBy,
@@ -406,7 +406,7 @@ export function IbApplicationWorkbench({ id }: { id: string }) {
   const { d, hold, decide } = item;
   const [tierId, setTierId] = useState<number | null>(null);
 
-  if (!d) return <ReviewItemMissing error={item.detail.error} route="/ib" />;
+  if (!d || item.detail.error) return <ReviewItemMissing error={item.detail.error} route="/ib" />;
   const open = item.open;
   const tiers = [...d.tiers].sort((a, b) => a.position - b.position);
   const tier = tierId ?? d.defaultTierId ?? tiers[0]?.id ?? null;
@@ -461,6 +461,7 @@ export function IbApplicationWorkbench({ id }: { id: string }) {
             <>
               <HoldNotices away={hold.away} heldBy={hold.heldBy} holdable={item.holdable} busy={hold.claim.isPending} onResume={hold.resume} onTakeOver={() => hold.claim.mutate(true)} />
               <ReviewDecision
+                continues={item.mayContinue}
                 reasonRule={moneyReasonProblem}
                 resetKey={sid}
                 checklist={d.checklist.review}
@@ -499,9 +500,10 @@ export function IbApplicationWorkbench({ id }: { id: string }) {
           ) : (
             decided && <DecidedNotice>{decided}</DecidedNotice>
           )}
-          {d.partner && d.partner.applicationId !== d.id && (
+          {d.partner && d.partner.applicationId > d.id && (
             <p className="muted tight">
-              The client's current IB partnership comes from <Link href={`/ib/${d.partner.applicationId}`}>a later application</Link>.
+              The client's {d.partner.status === "active" ? "current IB partnership comes" : "IB partnership, since removed, came"} from{" "}
+              <Link href={`/ib/${d.partner.applicationId}`}>a later application</Link>.
             </p>
           )}
           {d.status === "approved" && mayDecide && (d.can.remove.ok ? <RemoveIbStatus d={d} /> : d.can.remove.reason && <p className="muted tight">{d.can.remove.reason}</p>)}
@@ -547,7 +549,15 @@ const partnerColumns: Column<IbPartner>[] = [
       <span className="cell-person">
         <Avatar name={p.name} src={p.avatarUrl} />
         <span>
-          <strong>{p.name}</strong>
+          <strong>
+            {p.name}
+            {p.clientStatus === "closed" && (
+              <>
+                {" "}
+                <Badge tone="bad">Account closed</Badge>
+              </>
+            )}
+          </strong>
           <small>
             {p.email} · {p.clientId}
           </small>

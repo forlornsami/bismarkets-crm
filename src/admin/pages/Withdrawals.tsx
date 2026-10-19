@@ -350,7 +350,7 @@ export function WithdrawalWorkbench({ id }: { id: string }) {
   const [payoutRef, setPayoutRef] = useState("");
   const [paidOn, setPaidOn] = useState("");
 
-  if (!d) return <ReviewItemMissing error={item.detail.error} route="/withdrawals" />;
+  if (!d || item.detail.error) return <ReviewItemMissing error={item.detail.error} route="/withdrawals" />;
   const open = item.open;
   const holdable = item.holdable;
   const stage = stageOf(d);
@@ -430,7 +430,7 @@ export function WithdrawalWorkbench({ id }: { id: string }) {
             <dt>Wallet</dt>
             <dd>
               {money(d.wallet?.availableCents)} available
-              <small className="muted block">{money(d.wallet?.heldCents)} held, this withdrawal included</small>
+              <small className="muted block">{money(d.wallet?.heldCents)} held{open ? ", this withdrawal included" : ""}</small>
             </dd>
           </ClientCard>
 
@@ -495,6 +495,7 @@ export function WithdrawalWorkbench({ id }: { id: string }) {
                 </p>
               )}
               <ReviewDecision
+                continues={item.mayContinue}
                 reasonRule={moneyReasonProblem}
                 resetKey={sid}
                 checklist={checklist}
