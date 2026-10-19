@@ -20,6 +20,7 @@ import {
   UserRound,
   Users,
   FileText,
+  Handshake,
   Mail,
   MailCheck,
   AtSign,
@@ -35,8 +36,9 @@ import { api } from "../lib/api";
 import { useLogo } from "../lib/branding";
 import { useCan, useSession } from "../lib/session";
 import { useDepositsForMe, useWithdrawalsForMe } from "../components/money";
-import { useReconSummary } from "../lib/mt5";
-import { useKycSummary } from "./Kyc";
+import { useMt5OpsSummary, useReconSummary } from "../lib/mt5";
+import { useIbSummary } from "../components/ib";
+import { useKycSummary } from "../components/kyc";
 
 interface NavItem {
   href: string;
@@ -46,7 +48,7 @@ interface NavItem {
   /** Shown when the staff member holds any one of these. */
   anyOf?: string[];
   soon?: boolean;
-  badge?: "kyc" | "deposits" | "withdrawals" | "reconciliation";
+  badge?: "kyc" | "deposits" | "withdrawals" | "ib" | "transfers" | "reconciliation";
 }
 
 const NAV: { title: string; items: NavItem[] }[] = [
@@ -63,7 +65,7 @@ const NAV: { title: string; items: NavItem[] }[] = [
     items: [
       { href: "/deposits", label: "Deposits", icon: ArrowDownToLine, permission: "deposit.view", badge: "deposits" },
       { href: "/withdrawals", label: "Withdrawals", icon: ArrowUpFromLine, permission: "withdrawal.view", badge: "withdrawals" },
-      { href: "/transfers", label: "Transfers", icon: ArrowLeftRight, permission: "wallet.view" },
+      { href: "/transfers", label: "Transfers", icon: ArrowLeftRight, permission: "wallet.view", badge: "transfers" },
       { href: "/reconciliation", label: "Reconciliation", icon: Scale, anyOf: ["wallet.reconcile", "wallet.view"], badge: "reconciliation" },
     ],
   },
@@ -72,7 +74,8 @@ const NAV: { title: string; items: NavItem[] }[] = [
     items: [
       { href: "/mt5", label: "MT5 accounts", icon: Wallet, permission: "mt5.view" },
       { href: "/packages", label: "Account packages", icon: Package, permission: "package.view" },
-      { href: "/ib", label: "IB partners", icon: Network, permission: "ib.view", soon: true },
+      { href: "/ib", label: "IB applications", icon: Handshake, permission: "ib.view", badge: "ib" },
+      { href: "/ib-partners", label: "IB partners", icon: Network, permission: "ib.view" },
     ],
   },
   {
@@ -111,16 +114,22 @@ function readCollapsed() {
 
 export function Layout({ children, onSignedOut }: { children: ReactNode; onSignedOut: () => void }) {
   const can = useCan();
-  const kycWaiting = useKycSummary(can("kyc.view")).data?.pending ?? 0;
-  // Money badges count only what this staff member can act on.
+  // Every queue badge counts only what Start reviewing would hand this staff member now.
+  const kyc = useKycSummary(can("kyc.view")).data;
+  const kycForMe = can("kyc.decide", "kyc.documents") ? (kyc?.forMe ?? kyc?.pending ?? 0) : 0;
   const depositsForMe = useDepositsForMe();
   const withdrawalsForMe = useWithdrawalsForMe();
+  const ibForMe = useIbSummary(can("ib.view")).data?.forMe ?? 0;
+  // Staff balance and credit changes waiting for this person's approval.
+  const transfersForMe = useMt5OpsSummary(can("wallet.view") && can("mt5.balance.adjust")).data?.awaitingForMe ?? 0;
   // Open critical reconciliation issues, for those who can resolve them.
   const reconcileForMe = useReconSummary(can("wallet.reconcile")).data?.open.critical ?? 0;
   const counts: Record<NonNullable<NavItem["badge"]>, { n: number; title: string }> = {
-    kyc: { n: kycWaiting, title: "waiting for review" },
+    kyc: { n: kycForMe, title: "KYC documents waiting for you" },
     deposits: { n: depositsForMe, title: "deposits waiting for you" },
     withdrawals: { n: withdrawalsForMe, title: "withdrawals waiting for you" },
+    ib: { n: ibForMe, title: "IB applications waiting for you" },
+    transfers: { n: transfersForMe, title: "MT5 changes waiting for your approval" },
     reconciliation: { n: can("wallet.reconcile") ? reconcileForMe : 0, title: "open critical reconciliation issues" },
   };
   const [location] = useLocation();

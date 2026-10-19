@@ -20,6 +20,7 @@ import {
   CandlestickChart,
   History,
   Mail,
+  X,
 } from "lucide-react";
 import { useState } from "react";
 import { Link, useLocation } from "wouter";
@@ -32,7 +33,9 @@ import { useCan, useSession } from "../lib/session";
 import { COUNTRIES } from "../../shared/countries";
 import { actionLabel } from "../lib/audit-labels";
 import { OutboxGrid } from "./Emails";
-import { ClientKyc, KycStatusBadge } from "./Kyc";
+import { KycStatusBadge } from "../components/kyc";
+import { ClientIb, type ClientIbBlock } from "./ClientIb";
+import { ClientKyc } from "./ClientKyc";
 
 export interface Client {
   id: number;
@@ -71,6 +74,8 @@ export interface Client {
   activeSessions?: number;
   notesCount?: number;
   referrals?: number;
+  /** The IB partnership panel (null without the IB view permission). */
+  ib?: ClientIbBlock | null;
 }
 
 interface Summary {
@@ -130,7 +135,12 @@ export function ClientsList() {
   const can = useCan();
   const [, navigate] = useLocation();
   const summary = useSummary();
-  const [state, setState] = useState<GridState>({ page: 1, pageSize: 25, sort: "created_at", dir: "desc", filters: {} });
+  const [state, setState] = useState<GridState>(() => {
+    // "Clients they referred" on a client's page opens the list filtered to them.
+    const referredBy = new URLSearchParams(window.location.search).get("referredBy");
+    const filters: Record<string, string> = referredBy && /^\d{1,12}$/.test(referredBy) ? { referredBy } : {};
+    return { page: 1, pageSize: 25, sort: "created_at", dir: "desc", filters };
+  });
   // The dashboard's "Add a client" shortcut opens the form straight away.
   const [creating, setCreating] = useState(() => new URLSearchParams(window.location.search).get("new") === "1");
   const list = useQuery({
@@ -190,6 +200,16 @@ export function ClientsList() {
           { key: "source", label: "Joined via", options: Object.entries(SOURCE_LABEL).map(([value, label]) => ({ value, label })) },
           { key: "verified", label: "Email", options: [{ value: "yes", label: "Verified" }, { value: "no", label: "Not verified" }] },
         ]}
+        toolbar={
+          state.filters.referredBy && (
+            <span className="review-filter">
+              Clients referred by client {state.filters.referredBy}
+              <button type="button" className="icon-button" aria-label="Show every client" title="Show every client" onClick={() => setState({ ...state, page: 1, filters: { ...state.filters, referredBy: "" } })}>
+                <X size={14} />
+              </button>
+            </span>
+          )
+        }
         emptyText="Clients appear here as soon as they sign up in the client portal."
       />
       <NewClientDialog open={creating} onClose={() => setCreating(false)} onCreated={(c) => navigate(`/clients/${c.id}`)} />
@@ -514,7 +534,7 @@ export function ClientDetail({ id }: { id: string }) {
             <dt>Referred by</dt>
             <dd>{d.referredBy ? <Link href={`/clients/${d.referredBy.id}`}>{d.referredBy.name ?? `Client ${d.referredBy.id}`}</Link> : <span className="muted">Nobody</span>}</dd>
             <dt>Has referred</dt>
-            <dd>{d.referrals ?? 0} client(s)</dd>
+            <dd>{d.referrals ? <Link href={`/clients?referredBy=${d.id}`}>{d.referrals} client(s)</Link> : "0 client(s)"}</dd>
             <dt>Account manager</dt>
             <dd>
               {can("client.assign") ? (
@@ -598,9 +618,10 @@ export function ClientDetail({ id }: { id: string }) {
         )}
       </div>
       {can("mt5.view") && <TradingAccounts clientId={d.id} />}
-      {can("wallet.view") && (
+      {(can("wallet.view") || d.ib) && (
         <div className="columns columns-wide">
-          <ClientNotice notice={d.importantNotice} />
+          {can("wallet.view") && <ClientNotice notice={d.importantNotice} />}
+          {d.ib && <ClientIb clientId={d.id} ib={d.ib} />}
         </div>
       )}
       <div className="columns columns-wide">
@@ -859,6 +880,24 @@ function moneyDetail(a: Activity) {
   return typeof ref === "string" && ref ? `Request ${ref}` : null;
 }
 
+// For IB entries: the IB level, and what the client was told when an application was rejected or the status removed.
+function ibDetail(a: Activity) {
+  if (!a.action.startsWith("ib.")) return null;
+  let meta = a.meta;
+  if (typeof meta === "string") {
+    try {
+      meta = JSON.parse(meta);
+    } catch {
+      return null;
+    }
+  }
+  if (!meta || typeof meta !== "object") return null;
+  const m = meta as { tier?: { name?: unknown } | null; reason?: unknown };
+  const tier = typeof m.tier?.name === "string" ? `IB level ${m.tier.name}` : null;
+  const told = (a.action === "ib.rejected" || a.action === "ib.removed") && typeof m.reason === "string" && m.reason ? `Told the client: ${m.reason}` : null;
+  return [tier, told].filter(Boolean).join(" · ") || null;
+}
+
 function ActivityPanel({ id }: { id: string }) {
   const can = useCan();
   const reasons = can("kyc.documents") ? "all" : can("kyc.view") ? "client" : "none";
@@ -878,6 +917,7 @@ function ActivityPanel({ id }: { id: string }) {
             <strong>{actionLabel(a.action)}</strong>
             {kycDetail(a, reasons) && <small>{kycDetail(a, reasons)}</small>}
             {moneyDetail(a) && <small>{moneyDetail(a)}</small>}
+            {ibDetail(a) && <small>{ibDetail(a)}</small>}
             <small className="muted">
               {formatDate(a.at)} · {a.actorType === "staff" ? `by ${a.actor}` : a.actorType === "client" ? "by the client" : "system"}
               {a.ip ? ` · ${a.ip}` : ""}

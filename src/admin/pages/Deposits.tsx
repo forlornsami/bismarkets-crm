@@ -1,8 +1,6 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, CheckCircle2, Clock, Hourglass, Play, Users, X } from "lucide-react";
+import { CheckCircle2, Clock, Hourglass, Users } from "lucide-react";
 import { useState } from "react";
-import { Link, useLocation } from "wouter";
-import { DataGrid, gridQuery, type Column, type GridState } from "../components/DataGrid";
+import { Link } from "wouter";
 import {
   claimedAmount,
   CopyText,
@@ -10,39 +8,46 @@ import {
   daysAgo,
   DepositStatusBadge,
   formatDay,
-  HoldNotices,
   KIND_LABEL,
   minorText,
   money,
   networkLabel,
-  NotesTrail,
-  nothingLeft,
   parseAmountText,
-  QueueTabs,
-  queueTab,
   rateText,
-  SendBack,
-  SkippedNotice,
   textProblem,
-  Tile,
   today,
   toUsdCents,
   useDepositSummary,
-  useHold,
-  useNextItem,
   usePaymentMethods,
-  type CanDo,
-  type Claimer,
-  type MoneyNote,
-  type Person,
 } from "../components/money";
+import { HoldNotices, nothingLeft, queueTab, SendBack, useNextItem, type CanDo, type Claimer, type Person } from "../components/queue";
+import {
+  ClientCard,
+  clientColumn,
+  DecidedNotice,
+  decidedLine,
+  handledBy,
+  handledByColumn,
+  NextOnly,
+  NotYet,
+  positionText,
+  ReviewFootnote,
+  ReviewHistory,
+  ReviewItemMissing,
+  ReviewQueuePage,
+  statusColumn,
+  toldClient,
+  useReviewItem,
+  waitingColumn,
+  type CardClient,
+  type ListClient,
+  type TrailItem,
+} from "../components/review";
 import { DocumentViewer, ReviewDecision, ReviewLayout, Waiting, Warnings, type ReviewFile, type ReviewWarning } from "../components/ReviewWorkbench";
-import { Badge, ErrorText, Field, PageHeader, Spinner, useFeedback } from "../components/ui";
-import { ApiError, api, formatDate, qs, type Page } from "../lib/api";
+import { Badge, Field } from "../components/ui";
+import { formatDate } from "../lib/api";
 import { useCan, useSession } from "../lib/session";
 import { DEPOSIT_CHECKLIST, DEPOSIT_REJECT_REASONS, moneyReasonProblem, type ChecklistItem, type DepositStatus } from "../../shared/money";
-import { ClientStatus } from "./Clients";
-import { KycStatusBadge } from "./Kyc";
 
 type Stage = "first" | "second";
 type ClientState = "active" | "frozen" | "closed";
@@ -56,6 +61,8 @@ export interface DepositItem {
   clientEmail: string;
   clientStatus: ClientState;
   kycStatus: KycState;
+  /** The client as every review queue lists them. */
+  client?: ListClient & { country: string | null; status: ClientState };
   methodId: number;
   methodName: string;
   methodKind: "bank" | "crypto";
@@ -75,7 +82,7 @@ export interface DepositItem {
   warningCount: number;
 }
 
-interface DepositDetail extends DepositItem {
+interface DepositDetail extends Omit<DepositItem, "client"> {
   network: string;
   usdRate: string | number;
   receivedMinor: number | null;
@@ -85,9 +92,8 @@ interface DepositDetail extends DepositItem {
   rejectReason: string | null;
   /** Read when the server sends it (the list item has only who gave the first approval). */
   firstReviewedAt?: string | null;
-  notes: MoneyNote[] | null;
   proof: { mime: string; sizeBytes: number; width?: number; height?: number; sha256: string; editor: string | null; fileName: string; url: string } | null;
-  client: { id: number; name: string; email: string; status: ClientState; kycStatus: KycState; verifiedName: string; country: string | null; createdAt: string; assignedTo: Person | number | null };
+  client: CardClient & { verifiedName: string };
   method: { id: number; name: string; kind: "bank" | "crypto"; currency: string; bankName: string; accountTitle: string; accountNumber: string; iban: string; walletAddress: string; network: string };
   wallet: { availableCents: number; heldCents: number };
   history: { approvedCount: number; approvedTotalCents: number; firstDeposit: boolean; recent: { id: number; reference: string; status: DepositStatus; amountCents: number; createdAt: string }[] };
@@ -103,12 +109,17 @@ interface DepositDetail extends DepositItem {
   /** You set the method's account details or the rate: your approval goes to a second person. */
   setByYou?: boolean;
   expectedReference: string;
+  /** Where this deposit stands among those waiting at its step. */
+  queue?: { pending: number; position: number };
+  trail?: TrailItem[];
 }
 
 type Tab = "pending" | "second_approval" | "approved" | "rejected" | "all";
+type Kind = "approve" | "second" | "reject" | "return";
 const OPEN = (s: DepositStatus | undefined) => s === "pending" || s === "second_approval";
 const STAGE_WORD: Record<Stage, string> = { first: "first approvals", second: "second approvals" };
 const STAGE_LABEL: Record<Stage, string> = { first: "First approval", second: "Second approval" };
+const PATH: Record<Kind, string> = { approve: "approve", second: "second-approve", reject: "reject", return: "return" };
 const UNREADABLE = DEPOSIT_REJECT_REASONS.find((r) => r.includes("could not be read")) ?? DEPOSIT_REJECT_REASONS[0]!;
 
 const TAB = queueTab<Stage>("deposits", ["first", "second"]);
@@ -126,37 +137,18 @@ const checklistsOf = (d: DepositDetail) => {
   const c = d.checklist as { first?: unknown; second?: unknown } | null;
   return c && typeof c === "object" && Array.isArray(c.first) && Array.isArray(c.second) ? (c as { first: ChecklistItem[]; second: ChecklistItem[] }) : DEPOSIT_CHECKLIST;
 };
+const stageOf = (d: DepositDetail): Stage | null => d.stage ?? (d.status === "pending" ? "first" : d.status === "second_approval" ? "second" : null);
 
 const personName = (p: Person | null | undefined) => p?.name ?? "staff";
 
-function StatusCell({ d }: { d: DepositItem }) {
-  return (
-    <span className="stack-tight">
-      {OPEN(d.status) && d.claimedBy ? <Badge tone="info">Being reviewed by {d.claimedBy.name ?? "staff"}</Badge> : <DepositStatusBadge status={d.status} />}
-      {d.warningCount > 0 && <small className="error-text">{d.warningCount === 1 ? "1 warning" : `${d.warningCount} warnings`}</small>}
-    </span>
-  );
-}
-
-const columns: Column<DepositItem>[] = [
-  { key: "created_at", header: "Waiting", sortable: true, width: "110px", render: (d) => (OPEN(d.status) ? <Waiting since={d.createdAt} /> : <span className="muted">{formatDate(d.createdAt)}</span>) },
-  {
-    key: "client",
-    header: "Client",
-    render: (d) => (
-      <span className="stack-tight">
-        <strong>{d.clientName}</strong>
-        <small className="muted">
-          {d.clientEmail} · {d.clientId}
-        </small>
-      </span>
-    ),
-  },
+const columns = [
+  waitingColumn<DepositItem>("created_at", (d) => OPEN(d.status), (d) => d.createdAt),
+  clientColumn<DepositItem>((d) => d.client ?? { id: d.clientId, name: d.clientName, email: d.clientEmail }),
   {
     key: "amount_cents",
     header: "Amount",
     sortable: true,
-    render: (d) => (
+    render: (d: DepositItem) => (
       <span className="stack-tight">
         <strong>{claimedAmount(d)}</strong>
         {d.status === "approved" && d.creditedCents !== null && d.creditedCents !== d.amountCents && <small className="muted">Credited {money(d.creditedCents)}</small>}
@@ -168,143 +160,79 @@ const columns: Column<DepositItem>[] = [
     key: "method",
     header: "Method",
     optional: true,
-    render: (d) => (
+    render: (d: DepositItem) => (
       <span className="stack-tight">
         <span>{d.methodName}</span>
         <small className="muted mono">{d.reference}</small>
       </span>
     ),
   },
-  { key: "status", header: "Status", render: (d) => <StatusCell d={d} /> },
-  {
-    key: "reviewed",
-    header: "Reviewed by",
-    optional: true,
-    render: (d) =>
-      d.decidedBy ? (
-        `${personName(d.decidedBy)}, ${formatDate(d.decidedAt)}`
-      ) : d.firstReviewedBy ? (
-        <span>
-          {personName(d.firstReviewedBy)} <small className="muted">(first approval)</small>
-        </span>
-      ) : (
-        <span className="muted">Not yet</span>
-      ),
-  },
+  statusColumn<DepositItem>({ badge: (d) => <DepositStatusBadge status={d.status} />, open: (d) => OPEN(d.status), claimedBy: (d) => d.claimedBy, warnings: (d) => d.warningCount }),
+  handledByColumn<DepositItem>((d) =>
+    d.decidedBy ? (
+      handledBy(d.status === "rejected" ? "Rejected" : "Approved", d.decidedBy, d.decidedAt)
+    ) : d.firstReviewedBy ? (
+      <span>
+        {personName(d.firstReviewedBy)} <small className="muted">(first approval)</small>
+      </span>
+    ) : (
+      <NotYet />
+    ),
+  ),
 ];
-
-const initialClient = () => {
-  const v = new URLSearchParams(window.location.search).get("client");
-  return v && /^\d{1,12}$/.test(v) ? v : "";
-};
 
 export function DepositsQueue() {
   const can = useCan();
-  const [, navigate] = useLocation();
-  const [tab, setTab] = useState<Tab>("pending");
-  const [state, setState] = useState<GridState>(() => {
-    const clientId = initialClient();
-    const filters: Record<string, string> = clientId ? { clientId } : {};
-    return { page: 1, pageSize: 25, sort: "created_at", dir: "asc", filters };
-  });
   const summary = useDepositSummary();
   const methods = usePaymentMethods();
   const next = useDepositNext();
-  const queue = TAB.useTab();
   const mayFirst = can("deposit.process", "deposit.proof");
   const maySecond = can("deposit.approve_large", "deposit.proof");
-  const mayReview = mayFirst || maySecond;
-  const mayOpen = can("deposit.proof");
-  const list = useQuery({
-    queryKey: ["deposits", tab, state],
-    queryFn: () => api.get<Page<DepositItem>>(`/api/staff/deposits${qs({ ...gridQuery(state), status: tab })}`),
-    placeholderData: (prev) => prev,
-    refetchInterval: 30_000,
-  });
-  const changeTab = (t: Tab) => {
-    // Waiting items read oldest first, decided ones newest first.
-    setTab(t);
-    setState({ ...state, page: 1, dir: OPEN(t as DepositStatus) ? "asc" : "desc" });
-  };
   const s = summary.data;
-  const stage: Stage | null = tab === "pending" && mayFirst ? "first" : tab === "second_approval" && maySecond ? "second" : null;
-  const forMe = s ? (stage === "first" ? s.pending : stage === "second" ? s.secondApprovalForMe : (mayFirst ? s.pending : 0) + (maySecond ? s.secondApprovalForMe : 0)) : undefined;
-  const start = () => {
-    TAB.setStage(stage);
-    next.mutate({});
-  };
+  const f = s ? (s.forMe ?? { first: mayFirst ? s.pending : 0, second: maySecond ? s.secondApprovalForMe : 0 }) : undefined;
   const depositMethods = (methods.data?.items ?? []).filter((m) => m.direction === "deposit");
   return (
-    <>
-      <PageHeader
-        title="Deposits"
-        description="Deposit requests from the client portal and app. Find each payment in the bank statement or wallet history before you approve it; only then is the money added to the client's wallet."
-        actions={
-          mayReview && (
-            <button type="button" className="button button-primary" disabled={next.isPending || forMe === 0} onClick={start}>
-              {next.isPending ? <Spinner /> : <Play size={16} />} Start reviewing{stage ? ` ${STAGE_WORD[stage]}` : ""}
-              {forMe ? ` (${forMe})` : ""}
-            </button>
-          )
-        }
-      />
-      <ErrorText error={next.error} />
-      {mayReview && (
-        <SkippedNotice
-          count={queue.skipped.length}
-          busy={next.isPending}
-          onReview={() => {
-            TAB.remember([]);
-            start();
-          }}
-        />
-      )}
-      {summary.error && <p className="error-text">The queue summary could not be loaded. {summary.error instanceof Error ? summary.error.message : ""}</p>}
-      <div className="tiles">
-        <Tile icon={<Hourglass size={20} />} tone="warn" label="Waiting" value={s?.pending ?? "–"} foot={s ? (s.oldestOpenAt ? `Oldest sent ${formatDate(s.oldestOpenAt)}` : "Nothing waiting") : ""} />
-        <Tile icon={<Users size={20} />} tone="info" label="Second approval" value={s?.secondApproval ?? "–"} foot={s ? (maySecond ? `${s.secondApprovalForMe} for you` : "Above the approval limit") : ""} />
-        <Tile icon={<Clock size={20} />} tone="bad" label="Waiting over 24 hours" value={s?.overdue ?? "–"} foot="Aim to clear these first" />
-        <Tile icon={<CheckCircle2 size={20} />} tone="good" label="Decided today" value={s?.decidedToday ?? "–"} foot={s ? `${s.decidedTodayByMe} by you` : ""} />
-      </div>
-      <QueueTabs
-        value={tab}
-        onChange={changeTab}
-        options={[
-          { value: "pending", label: "Waiting", count: s?.pending },
-          { value: "second_approval", label: "Second approval", count: s?.secondApproval },
-          { value: "approved", label: "Approved" },
-          { value: "rejected", label: "Rejected" },
-          { value: "all", label: "All" },
-        ]}
-      />
-      <DataGrid
-        columns={columns}
-        rows={list.data?.items}
-        total={list.data?.total ?? 0}
-        pages={list.data?.pages ?? 1}
-        state={state}
-        onChange={setState}
-        rowKey={(d) => d.id}
-        onRowClick={mayOpen ? (d) => navigate(`/deposits/${d.id}`) : undefined}
-        loading={list.isLoading}
-        error={list.error}
-        searchPlaceholder="Search reference, client name, email or ID"
-        filters={[{ key: "methodId", label: "Method", options: depositMethods.map((m) => ({ value: String(m.id), label: m.isEnabled ? m.name : `${m.name} (off)` })) }]}
-        toolbar={
-          state.filters.clientId && (
-            <span className="review-filter">
-              Client {state.filters.clientId} only
-              <button type="button" className="icon-button" aria-label="Show every client" title="Show every client" onClick={() => setState({ ...state, page: 1, filters: { ...state.filters, clientId: "" } })}>
-                <X size={14} />
-              </button>
-            </span>
-          )
-        }
-        emptyTitle={tab === "pending" ? "Queue clear" : tab === "second_approval" ? "No second approvals waiting" : "Nothing here yet"}
-        emptyText={tab === "pending" ? "Nothing is waiting for review. Deposit requests appear here as soon as clients send them." : "Deposits appear here once they reach this step."}
-      />
-      {!mayOpen && <p className="muted tight">Your role shows deposit status only. Opening a deposit and its payment proof needs the deposit proof permission.</p>}
-    </>
+    <ReviewQueuePage<DepositItem, Tab, Stage>
+      title="Deposits"
+      description="Deposit requests from the client portal and app. Find each payment in the bank statement or wallet history before you approve it; only then is the money added to the client's wallet."
+      queue={TAB}
+      next={next}
+      mayReview={mayFirst || maySecond}
+      stageOf={(tab) => (tab === "pending" && mayFirst ? "first" : tab === "second_approval" && maySecond ? "second" : null)}
+      startLabel={(stage) => `Start reviewing${stage ? ` ${STAGE_WORD[stage]}` : ""}`}
+      forMe={(stage) => (f ? (stage === "first" ? f.first : stage === "second" ? f.second : f.first + f.second) : undefined)}
+      summaryError={summary.error}
+      tiles={[
+        { icon: <Hourglass size={20} />, tone: "warn", label: "Waiting", value: s?.pending ?? "–", foot: s ? (s.oldestOpenAt ? `Oldest sent ${formatDate(s.oldestOpenAt)}` : "Nothing waiting") : "" },
+        { icon: <Users size={20} />, tone: "info", label: "Second approval", value: s?.secondApproval ?? "–", foot: s && f ? (maySecond ? `${f.second} for you` : "Above the approval limit") : "" },
+        { icon: <Clock size={20} />, tone: "bad", label: "Waiting over 24 hours", value: s?.overdue ?? "–", foot: "Aim to clear these first" },
+        { icon: <CheckCircle2 size={20} />, tone: "good", label: "Decided today", value: s?.decidedToday ?? "–", foot: s ? `${s.decidedTodayByMe} by you` : "" },
+      ]}
+      tabs={[
+        { value: "pending", label: "Waiting", count: s?.pending, open: true },
+        { value: "second_approval", label: "Second approval", count: s?.secondApproval, open: true },
+        { value: "approved", label: "Approved", open: false },
+        { value: "rejected", label: "Rejected", open: false },
+        { value: "all", label: "All", open: false },
+      ]}
+      initialTab="pending"
+      listKey="deposits"
+      listUrl="/api/staff/deposits"
+      sort="created_at"
+      columns={columns}
+      rowKey={(d) => d.id}
+      filters={[{ key: "methodId", label: "Method", options: depositMethods.map((m) => ({ value: String(m.id), label: m.isEnabled ? m.name : `${m.name} (off)` })) }]}
+      searchPlaceholder="Search reference, client name, email or ID"
+      rowHref={can("deposit.proof") ? (d) => `/deposits/${d.id}` : null}
+      noOpenText="Your role shows deposit status only. Opening a deposit and its payment proof needs the deposit proof permission."
+      empty={(tab) =>
+        tab === "pending"
+          ? { title: "Queue clear", text: "Nothing is waiting for review. Deposit requests appear here as soon as clients send them." }
+          : tab === "second_approval"
+            ? { title: "No second approvals waiting", text: "Deposits appear here once they reach this step." }
+            : { title: "Nothing here yet", text: "Deposits appear here once they reach this step." }
+      }
+    />
   );
 }
 
@@ -339,40 +267,44 @@ function Found({ d }: { d: DepositDetail }) {
   );
 }
 
-/** `expectSecond` and `credits` are what this screen worked out, for the message when the server does not say. */
-type Decision = { kind: "approve" | "second" | "reject" | "return"; body: Record<string, unknown>; expectSecond?: boolean; credits?: number | null };
-const PATH: Record<Decision["kind"], string> = { approve: "approve", second: "second-approve", reject: "reject", return: "return" };
-
 export function DepositWorkbench({ id }: { id: string }) {
   const can = useCan();
   const me = useSession().staff.id;
-  const client = useQueryClient();
-  const [, navigate] = useLocation();
-  const { toast } = useFeedback();
   const next = useDepositNext();
   const queue = TAB.useTab();
   const sid = Number(id);
-  // Opening a deposit is audited, so do not refetch it in the background.
-  const detail = useQuery({ queryKey: ["deposit-detail", sid], queryFn: () => api.get<DepositDetail>(`/api/staff/deposits/${sid}`), staleTime: Infinity, refetchOnWindowFocus: false });
-  const d = detail.data;
-  const open = OPEN(d?.status);
-  const stage: Stage | null = d ? (d.stage ?? (d.status === "pending" ? "first" : d.status === "second_approval" ? "second" : null)) : null;
   const mayFirst = can("deposit.process", "deposit.proof");
-  const maySecond = can("deposit.approve_large", "deposit.proof") && d?.firstReviewedBy?.id !== me;
-  // Only someone who can give this step's approval holds the item; the person who gave the first approval leaves the second to a colleague.
-  const holdable = Boolean(open && ((stage === "first" && mayFirst) || (stage === "second" && maySecond)));
-  const hold = useHold({
+  const maySecondAtAll = can("deposit.approve_large", "deposit.proof");
+  // The person who gave the first approval leaves the second to a colleague.
+  const maySecondOf = (d: DepositDetail) => maySecondAtAll && d.firstReviewedBy?.id !== me;
+  const item = useReviewItem<DepositDetail, Kind, Partial<DepositDetail>, Stage>({
     base: "/api/staff/deposits",
+    route: "/deposits",
     id: sid,
+    detailKey: "deposit-detail",
+    queue: TAB,
+    next,
     me,
-    open,
-    holdable,
-    claimedBy: d?.claimedBy,
-    reload: async () => {
-      const r = await detail.refetch();
-      return r.data && OPEN(r.data.status) ? r.data.claimedBy : null;
+    isOpen: (d) => OPEN(d.status),
+    // Only someone who can give this step's approval holds the item.
+    holdable: (d) => OPEN(d.status) && ((stageOf(d) === "first" && mayFirst) || (stageOf(d) === "second" && maySecondOf(d))),
+    claimedBy: (d) => d.claimedBy,
+    paths: PATH,
+    toast: (x, res, d) => {
+      const who = d.client?.name ?? d.clientName;
+      const what = `${who}'s deposit ${d.reference}`;
+      const credited = res?.creditedCents ?? d.creditedCents ?? x.expect?.credits;
+      if (x.kind === "reject") return `Rejected ${what}. They have been told why.`;
+      if (x.kind === "return") return `Sent ${what} back for a new first approval.`;
+      if (x.kind === "approve" && (res?.status === "second_approval" || (res?.status === undefined && x.expect?.second))) return `${what} now waits for a second approval from another person.`;
+      return `Approved ${what}. ${credited ? `${money(credited)} is in their wallet` : "The money is in their wallet"} and they have been told.`;
     },
+    clientId: (d) => d.clientId,
+    invalidate: (d) => [["client-wallet", d.clientId]],
+    listKeys: ["deposits", "deposits-summary"],
+    mayContinue: mayFirst || maySecondAtAll,
   });
+  const { d, hold, decide } = item;
   const [viewed, setViewed] = useState(false);
   const [rejectWith, setRejectWith] = useState<{ reason: string; key: number } | null>(null);
   // What the reviewer found in the statement (first approval).
@@ -381,67 +313,18 @@ export function DepositWorkbench({ id }: { id: string }) {
   const [bankRef, setBankRef] = useState("");
   const [receivedOn, setReceivedOn] = useState("");
 
-  const decide = useMutation({
-    mutationFn: (x: Decision) => api.post<Partial<DepositDetail>>(`/api/staff/deposits/${sid}/${PATH[x.kind]}`, x.body),
-    onSuccess: (res, x) => {
-      hold.decided.current = true;
-      TAB.remember(TAB.skipped().filter((v) => v !== sid));
-      if (d) {
-        const who = d.client?.name ?? d.clientName;
-        const credited = res?.creditedCents ?? d.creditedCents ?? x.credits;
-        const toWallet = credited ? `${money(credited)} is in ${who}'s wallet` : `The money is in ${who}'s wallet`;
-        toast(
-          x.kind === "reject"
-            ? `Rejected ${d.reference}. ${who} has been told why.`
-            : x.kind === "return"
-              ? `Sent ${d.reference} back for a new first approval.`
-              : x.kind === "approve" && (res?.status === "second_approval" || (res?.status === undefined && x.expectSecond))
-                ? `${d.reference} now waits for a second approval from another person.`
-                : `Approved ${d.reference}. ${toWallet} and they have been told.`,
-        );
-        for (const key of [["client-wallet", d.clientId], ["client-activity", String(d.clientId)], ["client", String(d.clientId)]]) void client.invalidateQueries({ queryKey: key });
-      }
-      // Shown fresh if it is opened again, without fetching (and auditing) it now.
-      void client.invalidateQueries({ queryKey: ["deposit-detail", sid], refetchType: "none" });
-      for (const key of [["deposits"], ["deposits-summary"]]) void client.invalidateQueries({ queryKey: key });
-      // Staff who may only reject have no queue to be handed the next item from.
-      if (can("deposit.process", "deposit.proof") || can("deposit.approve_large", "deposit.proof")) next.mutate({});
-      else back();
-    },
-    // Someone else may have decided or taken the item, or the rules changed: show the item as it is now.
-    onError: (e) => {
-      if (e instanceof ApiError && e.code !== "STEP_UP_REQUIRED" && !e.details?.length && [400, 403, 409].includes(e.status)) void hold.refresh();
-    },
-  });
-  const skip = () => {
-    TAB.remember([...TAB.skipped().filter((x) => x !== sid), sid]);
-    hold.decided.current = true;
-    next.mutate({ release: sid });
-  };
-  const back = () => navigate("/deposits");
-
-  if (detail.error)
-    return (
-      <>
-        <Link href="/deposits" className="back-link">
-          <ArrowLeft size={15} /> Queue
-        </Link>
-        <ErrorText error={detail.error} />
-      </>
-    );
-  if (!d)
-    return (
-      <div className="center-screen loading-block">
-        <Spinner size={22} />
-      </div>
-    );
-
+  if (!d) return <ReviewItemMissing error={item.detail.error} route="/deposits" />;
+  const open = item.open;
+  const holdable = item.holdable;
+  const stage = stageOf(d);
+  const maySecond = maySecondOf(d);
   const lists = checklistsOf(d);
   const reasons = d.rejectReasons?.length ? d.rejectReasons : DEPOSIT_REJECT_REASONS;
   const proofFile: ReviewFile[] = d.proof ? [{ id: d.id, slot: 1, type: d.proof.mime, bytes: d.proof.sizeBytes, url: d.proof.url, label: "Payment proof" }] : [];
   const opened = d.proofOpenedByMe || viewed;
   const unopened = d.proof && !opened ? ["the payment proof"] : [];
   const crypto = d.methodKind === "crypto" || d.method?.kind === "crypto";
+  const sending = decide.isPending || next.isPending;
 
   // Who may do what at this step, as the server worked it out when the item was opened.
   const stageCan = stage === "first" ? d.can?.approve : stage === "second" ? d.can?.secondApprove : undefined;
@@ -492,11 +375,11 @@ export function DepositWorkbench({ id }: { id: string }) {
     ) : (
       <Link href={`/deposits/${r.id}`}>{r.reference}</Link>
     );
-  const assigned = d.client?.assignedTo && typeof d.client.assignedTo === "object" ? d.client.assignedTo.name : null;
+  const cardClient: CardClient = d.client ?? { id: d.clientId, name: d.clientName, email: d.clientEmail, status: d.clientStatus, kycStatus: d.kycStatus };
 
   return (
     <ReviewLayout
-      onBack={back}
+      onBack={item.back}
       title={
         <>
           {d.client?.name ?? d.clientName} <DepositStatusBadge status={d.status} />
@@ -513,19 +396,8 @@ export function DepositWorkbench({ id }: { id: string }) {
           )}
         </>
       }
-      headExtra={
-        open &&
-        holdable &&
-        queue.stage && (
-          <span className="review-filter">
-            Next: {STAGE_WORD[queue.stage]} only
-            <button type="button" className="icon-button" aria-label="Review every step next" title="Review every step next" onClick={() => TAB.setStage(null)}>
-              <X size={14} />
-            </button>
-          </span>
-        )
-      }
-      position={open && stage ? STAGE_LABEL[stage] : undefined}
+      headExtra={open && holdable && queue.stage && <NextOnly what={STAGE_WORD[queue.stage]} clearLabel="Review every step next" onClear={() => TAB.setStage(null)} />}
+      position={open && stage ? positionText(d.queue, STAGE_LABEL[stage]) : undefined}
       evidence={
         <DocumentViewer
           files={proofFile}
@@ -536,31 +408,7 @@ export function DepositWorkbench({ id }: { id: string }) {
       }
       side={
         <>
-          <h3 className="flush">Client</h3>
-          <dl className="details details-tight">
-            <dt>Verified name</dt>
-            <dd>
-              <strong>{d.client?.verifiedName || "–"}</strong>
-            </dd>
-            <dt>Client</dt>
-            <dd>
-              {/* A new tab, so the item stays held and the ticked checks stay. */}
-              <a href={`/clients/${d.clientId}`} target="_blank" rel="noreferrer">
-                {d.clientId} · {d.client?.email ?? d.clientEmail}
-              </a>
-            </dd>
-            <dt>Account</dt>
-            <dd>
-              <ClientStatus c={{ status: d.client?.status ?? d.clientStatus, lockedUntil: null }} /> <KycStatusBadge status={d.client?.kycStatus ?? d.kycStatus} />
-            </dd>
-            <dt>Joined</dt>
-            <dd>
-              {d.client?.createdAt ? formatDate(d.client.createdAt) : "–"}
-              {d.client?.country ? ` · ${d.client.country}` : ""}
-            </dd>
-            <dt>Assigned to</dt>
-            <dd>{assigned ?? <span className="muted">Nobody</span>}</dd>
-          </dl>
+          <ClientCard client={{ ...cardClient, kycStatus: cardClient.kycStatus ?? d.kycStatus }} />
 
           <h3>Payment</h3>
           <dl className="details details-tight">
@@ -661,43 +509,6 @@ export function DepositWorkbench({ id }: { id: string }) {
           {open ? (
             <>
               <HoldNotices away={hold.away} heldBy={hold.heldBy} holdable={holdable} busy={hold.claim.isPending} onResume={hold.resume} onTakeOver={() => hold.claim.mutate(true)} />
-              {stage === "first" && canDecide && approveOk && (
-                <fieldset className="flush stack">
-                  <h3 className="flush">What you found in the {crypto ? "wallet history" : "statement"}</h3>
-                  <Field
-                    label={`Amount received (${d.currency})`}
-                    hint={
-                      amountProblem ? (
-                        <span className="error-text">{amountProblem}</span>
-                      ) : parsed.minor !== undefined ? (
-                        <>
-                          {d.currency !== "USD" && credited !== null ? `Credits ${money(credited)} at ${rateText(d.usdRate)} ${d.currency} per US dollar. ` : `Credits ${money(credited)}. `}
-                          {differs && <span className="error-text">The client said {money(d.amountMinor, d.currency)}.</span>}
-                        </>
-                      ) : (
-                        `Exactly as the ${crypto ? "wallet history" : "statement"} shows it, such as ${minorText(d.amountMinor)}.`
-                      )
-                    }
-                  >
-                    <input className="input" inputMode="decimal" autoComplete="off" value={received} onChange={(e) => setReceived(e.target.value)} maxLength={16} />
-                  </Field>
-                  <Field
-                    label={crypto ? "Sent from" : "Sender name"}
-                    hint={senderProblem ? <span className="error-text">{senderProblem}</span> : crypto ? "The sending wallet or Binance account shown in the history." : "As the statement shows it."}
-                  >
-                    <input className="input" autoComplete="off" value={sender} onChange={(e) => setSender(e.target.value)} maxLength={160} />
-                  </Field>
-                  <Field
-                    label={crypto ? "Transaction ID" : "Bank reference"}
-                    hint={refProblem ? <span className="error-text">{refProblem}</span> : "Each payment can be credited only once, so this must be the payment's own reference."}
-                  >
-                    <input className="input mono" autoComplete="off" value={bankRef} onChange={(e) => setBankRef(e.target.value)} maxLength={80} />
-                  </Field>
-                  <Field label="Received on" hint={dateProblem ? <span className="error-text">{dateProblem}</span> : undefined}>
-                    <input className="input" type="date" value={receivedOn} min={daysAgo(180)} max={today()} onChange={(e) => setReceivedOn(e.target.value)} />
-                  </Field>
-                </fieldset>
-              )}
               {stage === "second" && (
                 <>
                   <h3 className="flush">What the first reviewer found</h3>
@@ -709,8 +520,8 @@ export function DepositWorkbench({ id }: { id: string }) {
                 resetKey={sid}
                 checklist={stage === "second" ? lists.second : lists.first}
                 reasons={reasons}
-                busy={decide.isPending || next.isPending}
-                error={(decide.variables?.kind === "return" ? null : decide.error) ?? next.error}
+                busy={sending}
+                error={(item.variables?.kind === "return" ? null : decide.error) ?? next.error}
                 canDecide={canDecide}
                 blockedText={blocked}
                 approveBlocked={approveBlocked}
@@ -721,52 +532,90 @@ export function DepositWorkbench({ id }: { id: string }) {
                 rejectWith={rejectWith}
                 approveLabel={needsSecond ? "Approve (needs a second approval)" : undefined}
                 notePlaceholder="For example: the bank shows a fee taken from the amount"
+                fields={
+                  stage === "first" &&
+                  canDecide &&
+                  approveOk && (
+                    <fieldset className="flush stack">
+                      <h3 className="flush">What you found in the {crypto ? "wallet history" : "statement"}</h3>
+                      <Field
+                        label={`Amount received (${d.currency})`}
+                        hint={
+                          amountProblem ? (
+                            <span className="error-text">{amountProblem}</span>
+                          ) : parsed.minor !== undefined ? (
+                            <>
+                              {d.currency !== "USD" && credited !== null ? `Credits ${money(credited)} at ${rateText(d.usdRate)} ${d.currency} per US dollar. ` : `Credits ${money(credited)}. `}
+                              {differs && <span className="error-text">The client said {money(d.amountMinor, d.currency)}.</span>}
+                            </>
+                          ) : (
+                            `Exactly as the ${crypto ? "wallet history" : "statement"} shows it, such as ${minorText(d.amountMinor)}.`
+                          )
+                        }
+                      >
+                        <input className="input" inputMode="decimal" autoComplete="off" value={received} onChange={(e) => setReceived(e.target.value)} maxLength={16} />
+                      </Field>
+                      <Field
+                        label={crypto ? "Sent from" : "Sender name"}
+                        hint={senderProblem ? <span className="error-text">{senderProblem}</span> : crypto ? "The sending wallet or Binance account shown in the history." : "As the statement shows it."}
+                      >
+                        <input className="input" autoComplete="off" value={sender} onChange={(e) => setSender(e.target.value)} maxLength={160} />
+                      </Field>
+                      <Field
+                        label={crypto ? "Transaction ID" : "Bank reference"}
+                        hint={refProblem ? <span className="error-text">{refProblem}</span> : "Each payment can be credited only once, so this must be the payment's own reference."}
+                      >
+                        <input className="input mono" autoComplete="off" value={bankRef} onChange={(e) => setBankRef(e.target.value)} maxLength={80} />
+                      </Field>
+                      <Field label="Received on" hint={dateProblem ? <span className="error-text">{dateProblem}</span> : undefined}>
+                        <input className="input" type="date" value={receivedOn} min={daysAgo(180)} max={today()} onChange={(e) => setReceivedOn(e.target.value)} />
+                      </Field>
+                    </fieldset>
+                  )
+                }
+                secondaryActions={
+                  stage === "second" &&
+                  canDecide && (
+                    <SendBack
+                      label="Send back to first approval"
+                      help="The first approval is cleared and the deposit goes back to the queue, so someone checks the statement again."
+                      blocked={d.can?.returnToFirst && !d.can.returnToFirst.ok ? d.can.returnToFirst.reason : null}
+                      busy={sending}
+                      error={item.variables?.kind === "return" ? decide.error : null}
+                      onSend={(note) => decide.mutate({ kind: "return", body: { note } })}
+                    />
+                  )
+                }
+                footnote={<ReviewFootnote recorded="Opening the payment proof" held={holdable && !hold.heldBy && !hold.away} />}
                 onApprove={(checklist, note) =>
                   stage === "second"
                     ? decide.mutate({
                         kind: "second",
                         body: { checklist, ...(note ? { note } : {}) },
-                        credits: d.receivedMinor ? toUsdCents(d.receivedMinor, d.currency, d.usdRate) : null,
+                        expect: { credits: d.receivedMinor ? toUsdCents(d.receivedMinor, d.currency, d.usdRate) : null },
                       })
                     : decide.mutate({
                         kind: "approve",
                         body: { receivedAmount: received.trim(), senderName: sender.trim(), bankReference: bankRef.trim(), receivedOn, checklist, ...(note ? { note } : {}) },
-                        expectSecond: needsSecond,
-                        credits: credited,
+                        expect: { second: needsSecond, credits: credited },
                       })
                 }
                 onReject={(reason, _checklist, note) => decide.mutate({ kind: "reject", body: { reason, ...(note ? { note } : {}) } })}
-                onSkip={holdable ? skip : undefined}
-                onBack={back}
+                onSkip={holdable ? item.skip : undefined}
+                onBack={item.back}
               />
-              {stage === "second" && canDecide && (
-                <SendBack
-                  label="Send back to first approval"
-                  help="The first approval is cleared and the deposit goes back to the queue, so someone checks the statement again."
-                  blocked={d.can?.returnToFirst && !d.can.returnToFirst.ok ? d.can.returnToFirst.reason : null}
-                  busy={decide.isPending || next.isPending}
-                  error={decide.variables?.kind === "return" ? decide.error : null}
-                  onSend={(note) => decide.mutate({ kind: "return", body: { note } })}
-                />
-              )}
-              <p className="muted tight">
-                Decisions ask for your 2FA code at most every few minutes. Opening the payment proof is recorded in the audit log.
-                {holdable && !hold.heldBy && !hold.away ? " This item is held for you while you work on it." : ""}
-              </p>
             </>
           ) : (
             <>
-              <div className="notice">
-                <p>
-                  {d.status === "approved"
-                    ? `Approved by ${personName(d.decidedBy)} on ${formatDate(d.decidedAt)}. ${money(d.creditedCents ?? d.amountCents)} was added to the wallet.`
-                    : `Rejected by ${personName(d.decidedBy)} on ${formatDate(d.decidedAt)}.${d.rejectReason ? ` Told the client: ${d.rejectReason}` : ""}`}
-                </p>
-              </div>
+              <DecidedNotice>
+                {d.status === "approved"
+                  ? `${decidedLine("Approved", d.decidedBy, d.decidedAt)} ${money(d.creditedCents ?? d.amountCents)} was added to the wallet.`
+                  : `${decidedLine("Rejected", d.decidedBy, d.decidedAt)}${toldClient(d.rejectReason)}`}
+              </DecidedNotice>
               <Found d={d} />
             </>
           )}
-          <NotesTrail notes={d.notes} />
+          <ReviewHistory items={d.trail} />
         </>
       }
     />

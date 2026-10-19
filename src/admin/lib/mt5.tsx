@@ -3,7 +3,7 @@ import { Check, Unplug, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { money, signedMoney, textProblem } from "../components/money";
 import { DecisionError } from "../components/ReviewWorkbench";
-import { Badge, Dialog, Field, Spinner, useFeedback, type Tone } from "../components/ui";
+import { Badge, Dialog, Field, reviewTone, Spinner, useFeedback, type Tone } from "../components/ui";
 import { ApiError, api, formatDate, type Page } from "./api";
 import { useSession } from "./session";
 
@@ -277,13 +277,15 @@ const TAKES_OUT: readonly OpPurpose[] = ["mt5_to_wallet", "staff_balance_out", "
 /** The amount as it moves the MT5 balance (or, for a credit change, the credit): negative takes it out. */
 export const opSignedCents = (op: Pick<Mt5Op, "purpose" | "amountCents">) => (TAKES_OUT.includes(op.purpose) ? -op.amountCents : op.amountCents);
 
+// The review colour rule: waiting for a second person and still being sent are later steps (blue).
 const OP_STATUS: Record<OpStatus, { label: string; tone: Tone }> = {
-  awaiting_approval: { label: "Awaiting approval", tone: "warn" },
-  sending: { label: "Sending", tone: "info" },
+  awaiting_approval: { label: "Awaiting approval", tone: reviewTone("later") },
+  sending: { label: "Sending", tone: reviewTone("later") },
+  // Not a review step: MT5 has not confirmed it, so someone has to check it by hand.
   unknown: { label: "Not confirmed", tone: "warn" },
-  completed: { label: "Completed", tone: "good" },
-  failed: { label: "Failed", tone: "bad" },
-  cancelled: { label: "Cancelled", tone: "neutral" },
+  completed: { label: "Completed", tone: reviewTone("done") },
+  failed: { label: "Failed", tone: reviewTone("refused") },
+  cancelled: { label: "Cancelled", tone: reviewTone("closed") },
 };
 export const OpStatusBadge = ({ status }: { status: OpStatus }) => <Badge tone={OP_STATUS[status]?.tone ?? "neutral"}>{OP_STATUS[status]?.label ?? status}</Badge>;
 
@@ -628,6 +630,7 @@ function RejectDialog({ o, own, onClose, onDone }: { o: Mt5Operation; own: boole
             {save.isPending ? <Spinner /> : <X size={16} />} {own ? "Cancel the change" : "Reject the change"}
           </button>
         </div>
+        <p className="muted tight">You'll be asked for your 2FA code.</p>
       </form>
     </Dialog>
   );
@@ -718,6 +721,10 @@ export interface ReconSummary {
 /** The reconciliation summary, issues and runs all start with this key. */
 export const RECON_KEY = ["mt5-recon"];
 export const RECON_SUMMARY_KEY = [...RECON_KEY, "summary"];
+
+/** Staff balance and credit changes waiting for this person's approval (never their own), for the Transfers badge. */
+export const useMt5OpsSummary = (enabled = true) =>
+  useQuery({ queryKey: [...OPERATIONS_KEY, "summary"], queryFn: () => api.get<{ awaitingForMe: number }>("/api/staff/mt5/operations/summary"), enabled, refetchInterval: 60_000 });
 
 /**
  * Open issues by severity, the last run and the one running (wallet.reconcile

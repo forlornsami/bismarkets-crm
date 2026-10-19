@@ -817,3 +817,7 @@ button.tile { width: 100%; }
 @media (max-width: 700px) {
   .run-details .button { width: 100%; justify-content: center; }
 }
+/* A review's evidence when it is facts, not a document (the IB application). */
+.evidence-panel { padding: 20px; }
+.evidence-panel h3 { margin: 20px 0 8px; }
+.evidence-panel .card-head { margin-bottom: 0; }

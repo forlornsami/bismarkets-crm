@@ -12,7 +12,6 @@ import { ClientDetail, ClientsList } from "./pages/Clients";
 import { Emails } from "./pages/Emails";
 import { EmailSettings } from "./pages/EmailSettings";
 import { ComposeEmail, EmailTemplates, SentEmailDetail, SentEmails } from "./pages/Messages";
-import { KycReview, KycWorkbench } from "./pages/Kyc";
 import { Account } from "./pages/Account";
 import { AuditLog } from "./pages/Audit";
 import { BrandingSettings } from "./pages/Branding";
@@ -23,7 +22,12 @@ import { AuthScreen, Login } from "./pages/Login";
 import { Roles } from "./pages/Roles";
 import { StaffDetail, StaffList } from "./pages/Staff";
 
-// The money screens load when first opened, so the rest of the CRM stays small.
+// The review queues load when first opened, so the rest of the CRM stays small.
+const KycReview = lazy(() => import("./pages/Kyc").then((m) => ({ default: m.KycReview })));
+const KycWorkbench = lazy(() => import("./pages/Kyc").then((m) => ({ default: m.KycWorkbench })));
+const IbApplications = lazy(() => import("./pages/Ib").then((m) => ({ default: m.IbApplications })));
+const IbApplicationWorkbench = lazy(() => import("./pages/Ib").then((m) => ({ default: m.IbApplicationWorkbench })));
+const IbPartners = lazy(() => import("./pages/Ib").then((m) => ({ default: m.IbPartners })));
 const DepositsQueue = lazy(() => import("./pages/Deposits").then((m) => ({ default: m.DepositsQueue })));
 const DepositWorkbench = lazy(() => import("./pages/Deposits").then((m) => ({ default: m.DepositWorkbench })));
 const WithdrawalsQueue = lazy(() => import("./pages/Withdrawals").then((m) => ({ default: m.WithdrawalsQueue })));
@@ -156,16 +160,43 @@ export function App() {
           </Route>
           <Route path="/kyc">
             <Guarded permission="kyc.view">
-              <KycReview />
+              <Loading>
+                <KycReview />
+              </Loading>
             </Guarded>
           </Route>
           <Route path="/kyc/:id">
             {(params) => (
               <Guarded permission={["kyc.view", "kyc.documents"]}>
                 {/* A fresh screen for every item, so nothing from the last one carries over. */}
-                <KycWorkbench key={`${params.id}:${visit}`} id={params.id} />
+                <Loading>
+                  <KycWorkbench key={`${params.id}:${visit}`} id={params.id} />
+                </Loading>
               </Guarded>
             )}
+          </Route>
+          <Route path="/ib">
+            <Guarded permission="ib.view">
+              <Loading>
+                <IbApplications />
+              </Loading>
+            </Guarded>
+          </Route>
+          <Route path="/ib/:id">
+            {(params) => (
+              <Guarded permission="ib.view">
+                <Loading>
+                  <IbApplicationWorkbench key={`${params.id}:${visit}`} id={params.id} />
+                </Loading>
+              </Guarded>
+            )}
+          </Route>
+          <Route path="/ib-partners">
+            <Guarded permission="ib.view">
+              <Loading>
+                <IbPartners />
+              </Loading>
+            </Guarded>
           </Route>
           <Route path="/deposits">
             <Guarded permission="deposit.view">

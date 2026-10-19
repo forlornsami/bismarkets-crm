@@ -43,6 +43,17 @@ export function Field({ label, children, hint }: { label: string; children: Reac
 export type Tone = "good" | "warn" | "bad" | "info" | "neutral";
 export const Badge = ({ tone, children }: { tone: Tone; children: ReactNode }) => <span className={`badge badge-${tone}`}>{children}</span>;
 
+/**
+ * Where an item stands in a review, for the one colour rule every approval
+ * queue follows (KYC, deposits, withdrawals, IB applications and MT5 transfers):
+ * waiting for a reviewer is amber, a later step still to do (second approval,
+ * to pay, sending) is blue, done is green, refused is red, and withdrawn,
+ * cancelled or removed is grey.
+ */
+export type ReviewState = "waiting" | "later" | "done" | "refused" | "closed";
+const REVIEW_TONE: Record<ReviewState, Tone> = { waiting: "warn", later: "info", done: "good", refused: "bad", closed: "neutral" };
+export const reviewTone = (state: ReviewState): Tone => REVIEW_TONE[state];
+
 export const Spinner = ({ size = 16 }: { size?: number }) => <Loader2 size={size} className="spin" aria-hidden />;
 
 export function CopyBox({ value }: { value: string }) {
