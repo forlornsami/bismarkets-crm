@@ -287,8 +287,8 @@ must be fully ticked, preset reasons, and a fresh 2FA code for every decision.
 A deposit can be approved only by someone who opened its payment screenshot in
 the review screen; the bank reference entered must not be on another deposit
 of the same method. Reasons the client sees are plain text, at most 240
-characters. Every view, proof opening, claim, take-over and decision is in the
-audit log. The client's activity feed shows review details only to staff who
+characters. Every view, proof opening, take-over and decision is in the audit
+log. The client's activity feed shows review details only to staff who
 review that kind of request.
 
 **Two people.**
@@ -502,8 +502,7 @@ approved KYC and an account that is neither frozen nor closed; rejecting is
 allowed for a frozen account; removing IB status is allowed whatever the
 account's state. Warnings name another client only to staff who may see that
 client, and money and trading facts appear only to staff with the matching
-view permission. Every opening, claim, take-over and decision is in the audit
-log; the client's activity feed keeps internal notes for `ib.view` holders and
+view permission. Every opening, take-over and decision is in the audit log; the client's activity feed keeps internal notes for `ib.view` holders and
 never shows warnings. Decisions reach the client as a notification and an
 email, never as a support event.
 

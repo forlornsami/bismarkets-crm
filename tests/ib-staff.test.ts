@@ -177,6 +177,9 @@ describe.skipIf(!hasDb)("staff IB applications and partners", () => {
       expect((await one<{ claimed_by: number | null }>(env.db, "SELECT claimed_by FROM ib_applications WHERE id = ?", [first]))!.claimed_by).toBeNull();
       expect((await post(admin, "/api/staff/ib/applications/next", { skip: [first, second] })).body).toEqual({ id: null });
       expect(closed).toBeGreaterThan(0);
+      // Opening the closed account's application counts it in its own position, so it never reads "2 of 1".
+      expect((await admin.agent.get(A(closed))).body.queue).toEqual({ position: 2, pending: 4 });
+      expect((await admin.agent.get(A(first))).body.queue).toEqual({ position: 2, pending: 3 });
       expect((await post(admin, "/api/staff/ib/applications/next", { stage: "first" })).status).toBe(400);
       expect((await post(compliance, "/api/staff/ib/applications/next", {})).status).toBe(403);
     });
@@ -425,7 +428,8 @@ describe.skipIf(!hasDb)("staff IB applications and partners", () => {
       const old = (await admin.agent.get(A(id))).body;
       expect(old.partner).toMatchObject({ status: "active", applicationId: again });
       expect(old.can.remove.ok).toBe(false);
-      expect(old.earlier.map((e: { id: number }) => e.id)).toEqual([again]);
+      expect(old.earlier.map((e: { id: number; newer: boolean }) => [e.id, e.newer])).toEqual([[again, true]]);
+      expect((await admin.agent.get(A(again))).body.earlier.map((e: { id: number; newer: boolean }) => [e.id, e.newer])).toEqual([[id, false]]);
     });
   });
 

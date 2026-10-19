@@ -80,7 +80,7 @@ interface IbDetail {
     referrals: { direct: number; funded: number; network: number; depositsUsd: number | null };
     sponsor: { id: number; name: string; isIb: boolean } | null;
   };
-  earlier: { id: number; status: IbStatus; submittedAt: string; decidedAt: string | null; reason: string | null }[];
+  earlier: { id: number; status: IbStatus; newer: boolean; submittedAt: string; decidedAt: string | null; reason: string | null }[];
   /** The client's partnership now, which may come from a newer application. */
   partner: {
     status: "active" | "removed";
@@ -284,13 +284,13 @@ function ApplicationPanel({ d, open }: { d: IbDetail; open: boolean }) {
         <p className="muted tight">The client signed up without a referral.</p>
       )}
 
-      <h3>Earlier applications</h3>
+      <h3>Other applications</h3>
       {d.earlier.length ? (
         <ul className="session-list">
           {d.earlier.map((e) => (
             <li key={e.id}>
               <div>
-                {link(`/ib/${e.id}`, `Sent ${formatDate(e.submittedAt)}`)} <IbStatusBadge status={e.status} />
+                {link(`/ib/${e.id}`, `Sent ${formatDate(e.submittedAt)}`)} <IbStatusBadge status={e.status} /> {e.newer && <Badge tone="neutral">Newer</Badge>}
               </div>
               <small className="muted">
                 {e.decidedAt ? `Decided ${formatDate(e.decidedAt)}` : "Not decided yet"}
@@ -300,7 +300,7 @@ function ApplicationPanel({ d, open }: { d: IbDetail; open: boolean }) {
           ))}
         </ul>
       ) : (
-        <p className="muted tight">This is the client's first application.</p>
+        <p className="muted tight">This is the client's only application.</p>
       )}
     </div>
   );

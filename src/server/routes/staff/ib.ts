@@ -87,14 +87,14 @@ export function staffIbRouter(deps: AppDeps): Router {
     warningCount: warningCount(r),
   });
 
-  /** Waiting applications in the reviewer's scope (accounts not closed), and where this one stands among them. */
+  /** Waiting applications in the reviewer's scope (accounts not closed, plus this one), and where this one stands among them. */
   async function queueOf(staff: StaffContext, r: ReviewRow) {
     const s = clientScope(staff);
     const q = await one<{ pending: number; ahead: string | null }>(
       db,
       `SELECT COUNT(*) AS pending, SUM(a.submitted_at < ? OR (a.submitted_at = ? AND a.id < ?)) AS ahead FROM ib_applications a JOIN clients c ON c.id = a.client_id
-       WHERE a.status = 'pending' AND c.status <> 'closed'${s.sql}`,
-      [r.submitted_at, r.submitted_at, r.id, ...s.params],
+       WHERE a.status = 'pending' AND (c.status <> 'closed' OR a.id = ?)${s.sql}`,
+      [r.submitted_at, r.submitted_at, r.id, r.id, ...s.params],
     );
     return { pending: Number(q?.pending ?? 0), position: r.status === "pending" ? Number(q?.ahead ?? 0) + 1 : null };
   }
@@ -182,7 +182,7 @@ export function staffIbRouter(deps: AppDeps): Router {
         sponsor: sponsor ? { id: sponsor.id, name: `${sponsor.first_name} ${sponsor.last_name}`.trim(), isIb: sponsorIsIb } : null,
       },
       earlier: earlier.map((e) => ({
-        id: e.id, status: e.status, submittedAt: e.submitted_at.toISOString(), decidedAt: iso(e.status === "removed" ? e.removed_at : e.decided_at), reason: e.reject_reason,
+        id: e.id, status: e.status, newer: e.id > r.id, submittedAt: e.submitted_at.toISOString(), decidedAt: iso(e.status === "removed" ? e.removed_at : e.decided_at), reason: e.reject_reason,
       })),
       // The client's current partnership, which may come from a newer application than this one.
       partner: partner
