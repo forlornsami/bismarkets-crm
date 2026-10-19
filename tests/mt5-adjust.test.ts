@@ -388,15 +388,19 @@ describe.skipIf(!hasDb)("staff MT5 balance and credit changes", () => {
     expect(short.status).toBe(400);
     expect(short.body.error.details).toEqual([{ field: "note", message: "Write a note saying what you checked (at least 10 characters)" }]);
     expect((await reject(ben, firstId, "See <script> here please")).status).toBe(400);
-    // No 2FA needed to say no.
-    const rejected = await reject(cal, firstId, "The outage did not affect this client");
+    // Saying no needs a fresh 2FA code, as saying yes does.
+    const noStep = await reject(cal, firstId, "The outage did not affect this client");
+    expect(noStep.status).toBe(403);
+    expect(noStep.body.error.code).toBe("STEP_UP_REQUIRED");
+    expect((await opRow(firstId)).status).toBe("awaiting_approval");
+    const rejected = await reject(ben, firstId, "The outage did not affect this client");
     expect(rejected.status).toBe(200);
     expect(rejected.body.operation).toMatchObject({
-      status: "cancelled", resolvedBy: { id: cal.staffId, name: "cal" }, completedAt: expect.stringMatching(ISO),
+      status: "cancelled", resolvedBy: { id: ben.staffId, name: "ben" }, completedAt: expect.stringMatching(ISO),
       change: { decidedNote: "The outage did not affect this client", approvedBy: null, canApprove: false, canReject: false },
     });
     expect((await audits("mt5.adjustment.rejected", c.id))[0]).toMatchObject({
-      actor_type: "staff", actor_id: cal.staffId, after_json: { status: "cancelled" }, meta_json: { opId: firstId, internalNote: "The outage did not affect this client" },
+      actor_type: "staff", actor_id: ben.staffId, after_json: { status: "cancelled" }, meta_json: { opId: firstId, internalNote: "The outage did not affect this client" },
     });
 
     // The requester may take back their own.
@@ -468,6 +472,44 @@ describe.skipIf(!hasDb)("staff MT5 balance and credit changes", () => {
     await exec(env.db, "UPDATE clients SET status = 'active' WHERE id = ?", [c.id]);
     expect(await opsOn(accountId)).toBe(1);
     expect(balanceCalls(waiting.body.operation.reference)).toEqual([]);
+    await clean();
+  });
+
+  it("counts the changes waiting for this person's approval, for the Transfers badge", async () => {
+    const summary = async (s: SignedIn) => {
+      const res = await s.agent.get("/api/staff/mt5/operations/summary");
+      expect(res.status).toBe(200);
+      expect(Object.keys(res.body)).toEqual(["awaitingForMe"]);
+      return res.body.awaitingForMe as number;
+    };
+    const before = { ann: await summary(ann), ben: await summary(ben), desk: await summary(desk) };
+    const { id: accountId } = await live();
+    const theirs = await live({ assignedTo: desk.staffId });
+    const a = await ask(ann, accountId, "balance_in", 1_000);
+    const b = await ask(ben, theirs.id, "credit_in", 1_000);
+    expect([a.status, b.status]).toEqual([201, 201]);
+    // Never the person's own request (another must approve it), and only the clients they may see.
+    expect(await summary(ann)).toBe(before.ann + 1);
+    expect(await summary(ben)).toBe(before.ben + 1);
+    expect(await summary(desk)).toBe(before.desk + 1);
+    // Without mt5.balance.adjust nothing waits for them.
+    expect(await summary(fin)).toBe(0);
+    expect(await summary(adm)).toBe(0);
+    // Once decided it no longer waits.
+    expect((await reject(ann, b.body.operation.id, "Asked for by mistake")).status).toBe(200);
+    expect(await summary(ann)).toBe(before.ann);
+    expect(await summary(desk)).toBe(before.desk);
+    expect(await summary(ben)).toBe(before.ben + 1);
+    expect((await approve(ben, a.body.operation.id)).status).toBe(200);
+    expect(await summary(ben)).toBe(before.ben);
+
+    // wallet.view is needed to ask at all, and a signed-out caller gets nothing.
+    const role = (await exec(env.db, "INSERT INTO roles (slug, name) VALUES ('no_wallet', 'No wallet')")).insertId;
+    await exec(env.db, "INSERT INTO role_permissions (role_id, permission) VALUES (?, 'client.view'), (?, 'mt5.balance.adjust')", [role, role]);
+    await createStaff(env.db, "nowallet@crm.test", "no_wallet");
+    const nowallet = await signIn(env, "nowallet@crm.test");
+    expect((await nowallet.agent.get("/api/staff/mt5/operations/summary")).status).toBe(403);
+    expect((await api().get("/api/staff/mt5/operations/summary")).status).toBe(401);
     await clean();
   });
 

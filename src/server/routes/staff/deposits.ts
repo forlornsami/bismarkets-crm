@@ -4,7 +4,7 @@ import { DEPOSIT_CHECKLIST, DEPOSIT_REJECT_REASONS, NOT_PLAIN, type DepositStatu
 import type { Permission } from "@shared/permissions";
 import type { AppDeps } from "../../app";
 import { lockClient } from "../../clients/kyc";
-import type { ClientRow } from "../../clients/model";
+import { clientPictureUrl, type ClientRow } from "../../clients/model";
 import { notifyClient } from "../../clients/notifications";
 import { auditContext, writeAudit } from "../../lib/audit";
 import { decryptBytes, sha256 } from "../../lib/crypto";
@@ -14,6 +14,7 @@ import { queueSupportEvent } from "../../lib/events";
 import { badRequest, conflict, forbidden, handler, HttpError, notFound, parse, unauthorized } from "../../lib/http";
 import { likeTerm, listQuery, toPage } from "../../lib/pagination";
 import { activeClaim, claim, CLAIM_MINUTES, release } from "../../lib/review";
+import { reviewClient, reviewTrail, tookOver, type TrailStep } from "../../lib/review-detail";
 import { AMOUNT_MESSAGES, money, parseAmount, toUsdCents } from "../../money/amounts";
 import { depositMethodAccount, lockWallet, postLedger, walletAccount, walletOf } from "../../money/ledger";
 import { compareNames, type NameMatch } from "../../money/names";
@@ -70,8 +71,10 @@ interface Row {
   email: string;
   client_status: ClientRow["status"];
   kyc_status: ClientRow["kyc_status"];
+  country: string | null;
   assigned_staff_id: number | null;
   client_created_at: Date;
+  picture_sha: string | null;
   method_kind: "bank" | "crypto";
   method_set_by: number | null;
   proof_sha: string | null;
@@ -86,14 +89,14 @@ interface Row {
 const SELECT = `SELECT d.id, d.reference, d.client_id, d.payment_method_id, d.method_name, d.status, d.currency, d.amount_minor, d.usd_rate, d.rate_set_by, d.amount_cents, d.network,
   d.received_minor, d.credited_cents, d.needs_second_approval, d.sent_back_at, d.sender_name, d.bank_reference, DATE_FORMAT(d.received_on, '%Y-%m-%d') AS received_on, d.reject_reason, d.checklist, d.notes,
   d.first_reviewed_by, fr.name AS first_reviewer_name, d.decided_by, d.decided_at, dc.name AS decider_name, d.claimed_by, d.claimed_until, cl.name AS claimer_name, d.created_at,
-  c.first_name, c.last_name, c.email, c.status AS client_status, c.kyc_status, c.assigned_staff_id, c.created_at AS client_created_at, pm.kind AS method_kind, pm.details_set_by AS method_set_by,
-  p.sha256 AS proof_sha, p.editor AS proof_editor,
+  c.first_name, c.last_name, c.email, c.status AS client_status, c.kyc_status, c.country, c.assigned_staff_id, c.created_at AS client_created_at, pp.sha256 AS picture_sha,
+  pm.kind AS method_kind, pm.details_set_by AS method_set_by, p.sha256 AS proof_sha, p.editor AS proof_editor,
   EXISTS (SELECT 1 FROM deposit_proofs p2 JOIN deposits d2 ON d2.id = p2.deposit_id WHERE p2.sha256 = p.sha256 AND d2.client_id <> d.client_id) AS shared_others,
   EXISTS (SELECT 1 FROM deposit_proofs p2 JOIN deposits d2 ON d2.id = p2.deposit_id WHERE p2.sha256 = p.sha256 AND d2.client_id = d.client_id AND d2.id <> d.id) AS reused_own,
   EXISTS (SELECT 1 FROM kyc_documents k WHERE k.sha256 = p.sha256) AS kyc_match,
   NOT EXISTS (SELECT 1 FROM deposits d3 WHERE d3.client_id = d.client_id AND d3.status = 'approved' AND d3.id <> d.id) AS first_deposit
   FROM deposits d JOIN clients c ON c.id = d.client_id JOIN payment_methods pm ON pm.id = d.payment_method_id
-  LEFT JOIN deposit_proofs p ON p.deposit_id = d.id
+  LEFT JOIN deposit_proofs p ON p.deposit_id = d.id LEFT JOIN profile_pictures pp ON pp.owner_type = 'client' AND pp.owner_id = d.client_id
   LEFT JOIN staff_users fr ON fr.id = d.first_reviewed_by LEFT JOIN staff_users dc ON dc.id = d.decided_by LEFT JOIN staff_users cl ON cl.id = d.claimed_by`;
 
 const person = (staffId: number | null, name: string | null) => (staffId ? { id: staffId, name: name ?? "Staff" } : null);
@@ -152,6 +155,8 @@ const present = (r: Row, threshold: number) => ({
   clientEmail: r.email,
   clientStatus: r.client_status,
   kycStatus: r.kyc_status,
+  // The client as every review queue lists them (the fields above stay for older screens).
+  client: { id: r.client_id, name: verifiedName(r), email: r.email, avatarUrl: clientPictureUrl("", r.client_id, r.picture_sha), country: r.country, status: r.client_status },
   methodId: r.payment_method_id,
   methodName: r.method_name,
   methodKind: r.method_kind,
@@ -180,6 +185,40 @@ const NEEDS: Record<Action, { permissions: Permission[]; denied: string }> = {
   reject: { permissions: ["deposit.reject", "deposit.proof"], denied: "You do not have permission to reject deposits." },
   returnToFirst: { permissions: ["deposit.approve_large", "deposit.proof"], denied: "Only staff who may approve large deposits can send one back." },
 };
+type Stage = "first" | "second";
+const STAGE_STATUS: Record<Stage, DepositStatus> = { first: "pending", second: "second_approval" };
+
+// What happened to a deposit, from the audit log: the decisions, never who opened it.
+const TRAIL: Record<string, TrailStep> = {
+  "deposit.requested": { action: "submitted", label: "Sent by the client" },
+  "deposit.first_approved": { action: "first_approved", label: "First approval, waiting for a second approval" },
+  "deposit.approved": { action: "approved", label: (meta) => (meta.stage === "second" ? "Second approval, added to the wallet" : "Approved and added to the wallet") },
+  "deposit.returned": { action: "returned", label: "Sent back for a new first approval" },
+  "deposit.rejected": { action: "rejected", label: "Rejected" },
+  "deposit.review_taken_over": { action: "review_taken_over", label: tookOver },
+};
+
+/**
+ * The deposits "next" may hand this staff member at these steps: waiting for a step they may take
+ * (never a second approval of their own first one), of an account that is not closed, held by nobody
+ * else, in their scope. The summary's "for me" counts use the same rule, so a count never promises an
+ * item "next" would not give. Null when they may take none of the steps.
+ */
+function waitingFor(staff: StaffContext, stages: readonly Stage[]) {
+  const has = (p: Permission) => staff.permissions.has(p);
+  if (!has("deposit.proof")) return null;
+  const parts: string[] = [];
+  const params: unknown[] = [];
+  if (stages.includes("first") && has("deposit.process")) parts.push("d.status = 'pending'");
+  if (stages.includes("second") && has("deposit.approve_large")) (parts.push("(d.status = 'second_approval' AND d.first_reviewed_by <> ?)"), params.push(staff.id));
+  if (!parts.length) return null;
+  const s = clientScope(staff);
+  return {
+    sql: `(${parts.join(" OR ")}) AND c.status <> 'closed' AND (d.claimed_by IS NULL OR d.claimed_until < CURRENT_TIMESTAMP(3) OR d.claimed_by = ?)${s.sql}`,
+    params: [...params, staff.id, ...s.params],
+  };
+}
+
 const STATUSES: Record<Action, DepositStatus[]> = {
   approve: ["pending"],
   secondApprove: ["second_approval"],
@@ -395,11 +434,6 @@ export function staffDepositsRouter(deps: AppDeps): Router {
     const r = await loadVisible(req, depositId);
     const settings = await loadMoneySettings(db);
     const threshold = settings.deposit_second_approval_cents;
-    const client = (await one<{ country: string | null; assigned_name: string | null }>(
-      db,
-      "SELECT c.country, a.name AS assigned_name FROM clients c LEFT JOIN staff_users a ON a.id = c.assigned_staff_id WHERE c.id = ?",
-      [r.client_id],
-    ))!;
     const method = (await one<{ id: number; name: string; kind: "bank" | "crypto"; currency: string; bank_name: string; account_title: string; account_number: string; iban: string; wallet_address: string; network: string }>(
       db,
       "SELECT id, name, kind, currency, bank_name, account_title, account_number, iban, wallet_address, network FROM payment_methods WHERE id = ?",
@@ -425,6 +459,16 @@ export function staffDepositsRouter(deps: AppDeps): Router {
       const block = blockOf(staff, r, a);
       return { ok: block === null, reason: block?.message ?? null };
     };
+    const stage = r.status === "pending" ? ("first" as const) : r.status === "second_approval" ? ("second" as const) : null;
+    // Where this deposit stands among those waiting for the same step, as the queue's tab lists them.
+    const s = clientScope(staff);
+    const queue = stage
+      ? await one<{ pending: number; ahead: string | null }>(
+          db,
+          `SELECT COUNT(*) AS pending, SUM(d.created_at < ? OR (d.created_at = ? AND d.id < ?)) AS ahead FROM deposits d JOIN clients c ON c.id = d.client_id WHERE d.status = ?${s.sql}`,
+          [r.created_at, r.created_at, r.id, STAGE_STATUS[stage], ...s.params],
+        )
+      : undefined;
     return {
       ...present(r, threshold),
       network: r.network,
@@ -440,17 +484,7 @@ export function staffDepositsRouter(deps: AppDeps): Router {
       proof: proof
         ? { mime: proof.mime, sizeBytes: Number(proof.size_bytes), sha256: proof.sha256, editor: proof.editor, fileName: proof.file_name, url: `/api/staff/deposits/${r.id}/proof` }
         : null,
-      client: {
-        id: r.client_id,
-        name: verifiedName(r),
-        email: r.email,
-        status: r.client_status,
-        kycStatus: r.kyc_status,
-        verifiedName: verifiedName(r),
-        country: client.country,
-        createdAt: r.client_created_at.toISOString(),
-        assignedTo: person(r.assigned_staff_id, client.assigned_name),
-      },
+      client: { ...(await reviewClient(db, r.client_id)), createdAt: r.client_created_at.toISOString() },
       method: {
         id: method.id, name: method.name, kind: method.kind, currency: method.currency, bankName: method.bank_name, accountTitle: method.account_title,
         accountNumber: method.account_number, iban: method.iban, walletAddress: method.wallet_address, network: method.network,
@@ -464,7 +498,9 @@ export function staffDepositsRouter(deps: AppDeps): Router {
       },
       warnings: await warningsFor(db, staff, r, threshold),
       proofOpenedByMe: await proofOpenedBy(db, staff.id, r),
-      stage: r.status === "pending" ? ("first" as const) : r.status === "second_approval" ? ("second" as const) : null,
+      stage,
+      queue: queue ? { pending: Number(queue.pending), position: Number(queue.ahead ?? 0) + 1 } : { pending: 0, position: 0 },
+      trail: await reviewTrail(db, { clientId: r.client_id, idKey: "depositId", id: r.id, steps: TRAIL }),
       /** This reviewer set the method's account details or the rate: their approval goes to a second person. */
       setByYou: r.status === "pending" && setsAny(setBy(r, staff.id)),
       can: { approve: action("approve"), secondApprove: action("secondApprove"), reject: action("reject"), returnToFirst: action("returnToFirst") },
@@ -564,18 +600,23 @@ export function staffDepositsRouter(deps: AppDeps): Router {
     handler(async (req, res) => {
       const staff = staffOf(req);
       const s = clientScope(staff);
-      const r = await one<{ pending: string | null; second: string | null; overdue: string | null; oldest: Date | null; today: string | null; mine: string | null; forMe: string | null }>(
+      const r = await one<{ pending: string | null; second: string | null; overdue: string | null; oldest: Date | null; today: string | null; mine: string | null }>(
         db,
         `SELECT SUM(d.status = 'pending') AS pending, SUM(d.status = 'second_approval') AS second,
            SUM(d.status IN ('pending', 'second_approval') AND d.created_at < CURRENT_TIMESTAMP(3) - INTERVAL 24 HOUR) AS overdue,
            MIN(IF(d.status IN ('pending', 'second_approval'), d.created_at, NULL)) AS oldest,
            SUM(d.status IN ('approved', 'rejected') AND d.decided_at >= CURRENT_DATE) AS today,
-           SUM(d.status IN ('approved', 'rejected') AND d.decided_at >= CURRENT_DATE AND d.decided_by = ?) AS mine,
-           SUM(d.status = 'second_approval' AND (d.first_reviewed_by IS NULL OR d.first_reviewed_by <> ?)) AS forMe
+           SUM(d.status IN ('approved', 'rejected') AND d.decided_at >= CURRENT_DATE AND d.decided_by = ?) AS mine
          FROM deposits d JOIN clients c ON c.id = d.client_id
          WHERE (d.status IN ('pending', 'second_approval') OR d.decided_at >= CURRENT_DATE)${s.sql}`,
-        [staff.id, staff.id, ...s.params],
+        [staff.id, ...s.params],
       );
+      // What "next" would hand this person now at each step.
+      const forStage = async (stage: Stage) => {
+        const w = waitingFor(staff, [stage]);
+        return w ? Number((await one<{ n: number }>(db, `SELECT COUNT(*) AS n FROM deposits d JOIN clients c ON c.id = d.client_id WHERE ${w.sql}`, w.params))?.n ?? 0) : 0;
+      };
+      const forMe = { first: await forStage("first"), second: await forStage("second") };
       res.json({
         pending: Number(r?.pending ?? 0),
         secondApproval: Number(r?.second ?? 0),
@@ -583,7 +624,8 @@ export function staffDepositsRouter(deps: AppDeps): Router {
         oldestOpenAt: r?.oldest?.toISOString() ?? null,
         decidedToday: Number(r?.today ?? 0),
         decidedTodayByMe: Number(r?.mine ?? 0),
-        secondApprovalForMe: staff.permissions.has("deposit.approve_large") ? Number(r?.forMe ?? 0) : 0,
+        secondApprovalForMe: forMe.second,
+        forMe,
       });
     }),
   );
@@ -595,20 +637,16 @@ export function staffDepositsRouter(deps: AppDeps): Router {
     handler(async (req, res) => {
       const body = parse(z.object({ stage: z.enum(["first", "second"]).optional(), skip: z.array(moneyId).max(200).default([]), release: moneyId.optional() }).strict(), req.body ?? {});
       const staff = staffOf(req);
-      const first = staff.permissions.has("deposit.process") && body.stage !== "second";
-      const second = staff.permissions.has("deposit.approve_large") && body.stage !== "first";
       const next = await transaction(db, async (conn) => {
         if (body.release) await release(conn, "deposits", body.release, staff.id);
-        if (!first && !second) return null;
-        const stages = [first ? "d.status = 'pending'" : "", second ? "(d.status = 'second_approval' AND d.first_reviewed_by <> ?)" : ""].filter(Boolean);
-        const where = [`(${stages.join(" OR ")})`, "c.status <> 'closed'", "(d.claimed_by IS NULL OR d.claimed_until < CURRENT_TIMESTAMP(3) OR d.claimed_by = ?)"];
-        const params: unknown[] = [...(second ? [staff.id] : []), staff.id];
-        const s = clientScope(staff);
-        if (s.sql) (where.push("c.assigned_staff_id = ?"), params.push(...s.params));
-        if (body.skip.length) (where.push(`d.id NOT IN (${body.skip.map(() => "?").join(",")})`), params.push(...body.skip));
+        const w = waitingFor(staff, body.stage ? [body.stage] : ["first", "second"]);
+        if (!w) return null;
+        let clause = w.sql;
+        const params = [...w.params];
+        if (body.skip.length) (clause += ` AND d.id NOT IN (${body.skip.map(() => "?").join(",")})`), params.push(...body.skip);
         const row = await one<{ id: number }>(
           conn,
-          `SELECT d.id FROM deposits d JOIN clients c ON c.id = d.client_id WHERE ${where.join(" AND ")} ORDER BY d.created_at, d.id LIMIT 1 FOR UPDATE OF d SKIP LOCKED`,
+          `SELECT d.id FROM deposits d JOIN clients c ON c.id = d.client_id WHERE ${clause} ORDER BY d.created_at, d.id LIMIT 1 FOR UPDATE OF d SKIP LOCKED`,
           params,
         );
         if (!row) return null;

@@ -4,6 +4,7 @@ import sharp from "sharp";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { DEPOSIT_CHECKLIST, DEPOSIT_REJECT_REASONS } from "@shared/money";
+import { auditStandalone } from "../src/server/lib/audit";
 import { encryptBytes, sha256 } from "../src/server/lib/crypto";
 import { exec, one, rows } from "../src/server/lib/db";
 import { syncDepositQrs } from "../src/server/lib/qr";
@@ -151,8 +152,11 @@ describe.skipIf(!hasDb)("staff deposits", () => {
       [
         "id", "reference", "clientId", "clientName", "clientEmail", "clientStatus", "kycStatus", "methodId", "methodName", "methodKind", "currency", "amountMinor", "amountCents",
         "creditedCents", "status", "needsSecondApproval", "sentBack", "twoPersonMark", "firstReviewedBy", "decidedBy", "createdAt", "decidedAt", "claimedBy", "warningCount",
+        "client",
       ].sort(),
     );
+    // The client as every review queue lists them.
+    expect(item.client).toEqual({ id: clientId, name: "Ali Khan", email: expect.stringMatching(/^dep\d+@client\.test$/), avatarUrl: null, country: null, status: "active" });
     expect(item).toMatchObject({ reference: d.reference, clientId, clientName: "Ali Khan", methodId: usdBank, methodKind: "bank", currency: "USD", amountMinor: 10_000, amountCents: 10_000, creditedCents: null, status: "pending", needsSecondApproval: false, firstReviewedBy: null, claimedBy: null });
     expect(item.warningCount).toBeGreaterThanOrEqual(1);
     // A sales agent sees only their own clients; this one is the finance agent's.
@@ -689,7 +693,8 @@ describe.skipIf(!hasDb)("staff deposits", () => {
 
   it("counts the queue for the badges", async () => {
     const s = (await agent.agent.get("/api/staff/deposits/summary")).body;
-    expect(Object.keys(s).sort()).toEqual(["decidedToday", "decidedTodayByMe", "oldestOpenAt", "overdue", "pending", "secondApproval", "secondApprovalForMe"]);
+    expect(Object.keys(s).sort()).toEqual(["decidedToday", "decidedTodayByMe", "forMe", "oldestOpenAt", "overdue", "pending", "secondApproval", "secondApprovalForMe"]);
+    expect(s.forMe).toEqual({ first: expect.any(Number), second: s.secondApprovalForMe });
     const open = (await agent.agent.get("/api/staff/deposits?pageSize=100")).body;
     expect(s.pending + s.secondApproval).toBe(open.total);
     expect(s.overdue).toBeGreaterThanOrEqual(1);
@@ -697,6 +702,111 @@ describe.skipIf(!hasDb)("staff deposits", () => {
     expect(s.decidedToday).toBeGreaterThanOrEqual(s.decidedTodayByMe);
     expect(new Date(s.oldestOpenAt).getTime()).toBe(new Date(open.items[0].createdAt).getTime());
     expect(s.secondApprovalForMe).toBe(0);
+  });
+
+  it("counts for each person only what \"next\" would hand them", async () => {
+    const forMe = async (s: SignedIn) => (await s.agent.get("/api/staff/deposits/summary")).body.forMe as { first: number; second: number };
+    const before = { agent: await forMe(agent), agent2: await forMe(agent2), manager: await forMe(manager), scoped: await forMe(scoped) };
+    // Looking at the queue is not reviewing it.
+    expect(await forMe(support)).toEqual({ first: 0, second: 0 });
+    expect(await forMe(auditor)).toEqual({ first: 0, second: 0 });
+    const clientId = await makeClient();
+    const d = await makeDeposit(clientId, usdBank);
+    expect(await forMe(agent)).toEqual({ first: before.agent.first + 1, second: before.agent.second });
+    // Not one someone else is reviewing (their own claim still counts for them)...
+    expect((await post(agent2, url(d.id, "/claim"), {})).status).toBe(200);
+    expect(await forMe(agent)).toEqual(before.agent);
+    expect((await forMe(agent2)).first).toBe(before.agent2.first + 1);
+    expect((await post(agent2, url(d.id, "/release"), {})).status).toBe(200);
+    // ...nor a closed account's, nor a client outside their scope.
+    const shut = await makeDeposit(await makeClient({ status: "closed" }), usdBank);
+    expect(await forMe(agent)).toEqual({ first: before.agent.first + 1, second: before.agent.second });
+    expect(await forMe(scoped)).toEqual(before.scoped);
+    // A second approval waits for someone who may give it, never the first approver.
+    const big = await makeDeposit(clientId, usdBank, { amountMinor: 650_000 });
+    await openProof(agent, big.id);
+    expect((await approve(agent, big.id, { receivedAmount: "6500" })).body.status).toBe("second_approval");
+    expect(await forMe(agent)).toEqual({ first: before.agent.first + 1, second: 0 });
+    const s = (await manager.agent.get("/api/staff/deposits/summary")).body;
+    expect(s.forMe).toEqual({ first: before.manager.first + 1, second: before.manager.second + 1 });
+    expect(s.secondApprovalForMe).toBe(s.forMe.second);
+    expect((await post(manager2, url(big.id, "/claim"), {})).status).toBe(200);
+    expect((await forMe(manager)).second).toBe(before.manager.second);
+    await post(manager2, url(big.id, "/release"), {});
+    for (const x of [d, shut, big]) expect((await reject(manager, x.id)).status).toBe(200);
+    expect(await forMe(agent)).toEqual(before.agent);
+  });
+
+  it("shows where a deposit stands in its queue, who the client is, and what happened to it", async () => {
+    const clientId = await makeClient({ assignedTo: scoped.staffId });
+    await exec(env.db, "UPDATE clients SET country = 'Pakistan', email_verified_at = CURRENT_TIMESTAMP(3) WHERE id = ?", [clientId]);
+    await exec(env.db, "INSERT INTO profile_pictures (owner_type, owner_id, mime, bytes, sha256, width, height) VALUES ('client', ?, 'image/png', ?, ?, 1, 1)", [
+      clientId, Buffer.from("png"), "ab".repeat(32),
+    ]);
+    const older = await makeDeposit(clientId, usdBank, { hoursOld: 0.5 });
+    const newer = await makeDeposit(clientId, usdBank, { hoursOld: 0.25 });
+    const big = await makeDeposit(clientId, usdBank, { amountMinor: 650_000, hoursOld: 0.1 });
+    const asked = { actor: { type: "client" as const, id: clientId, label: "client" }, ip: "127.0.0.1", userAgent: "vitest" };
+    await auditStandalone(env.db, asked, { action: "deposit.requested", entityType: "client", entityId: clientId, meta: { depositId: big.id, reference: big.reference } });
+
+    // Within the step it waits for, oldest first, among the clients this person may see.
+    const first = (await detail(scoped, older.id)).queue as { pending: number; position: number };
+    expect((await detail(scoped, newer.id)).queue).toEqual({ pending: first.pending, position: first.position + 1 });
+    expect((await detail(scoped, big.id)).queue).toEqual({ pending: first.pending, position: first.position + 2 });
+    expect(first.pending).toBeGreaterThanOrEqual(3);
+
+    const picture = expect.stringMatching(new RegExp(`^/api/pictures/client/${clientId}\\?v=`));
+    const card = (await detail(agent, older.id)).client;
+    expect(card).toEqual({
+      id: clientId, name: "Ali Khan", verifiedName: "Ali Khan", email: expect.stringMatching(/@client\.test$/), avatarUrl: picture, status: "active", kycStatus: "approved",
+      country: "Pakistan", joinedAt: expect.any(String), assignedTo: { id: scoped.staffId, name: "scoped" }, emailVerified: true, createdAt: expect.any(String),
+    });
+    expect(card.createdAt).toBe(card.joinedAt);
+    const listed = (await agent.agent.get(`/api/staff/deposits?clientId=${clientId}`)).body.items;
+    expect(listed.map((i: { client: { avatarUrl: string } }) => i.client.avatarUrl)).toEqual([picture, picture, picture]);
+
+    // Approved alone (before the return below makes the client's other open deposits need two people).
+    await openProof(agent, older.id);
+    expect((await approve(agent, older.id)).body.status).toBe("approved");
+    expect((await detail(agent, older.id)).trail).toEqual([expect.objectContaining({ action: "approved", label: "Approved and added to the wallet", staff: "agent" })]);
+
+    // Taken over, approved first, sent back, approved again and given the second approval.
+    expect((await post(agent2, url(big.id, "/claim"), {})).status).toBe(200);
+    expect((await post(agent, url(big.id, "/claim"), { takeOver: true })).status).toBe(200);
+    await openProof(agent, big.id);
+    expect((await approve(agent, big.id, { receivedAmount: "6500", note: "Matches the bank statement" })).body.status).toBe("second_approval");
+    const waiting = await detail(manager, big.id);
+    expect(waiting.stage).toBe("second");
+    expect(waiting.queue.position).toBeGreaterThanOrEqual(1);
+    expect(waiting.queue.pending).toBeGreaterThanOrEqual(waiting.queue.position);
+    expect((await post(manager, url(big.id, "/return"), { note: "The reference is from another payment" })).status).toBe(200);
+    expect((await approve(agent, big.id, { receivedAmount: "6500" })).body.status).toBe("second_approval");
+    await openProof(manager, big.id);
+    const done = await secondApprove(manager, big.id);
+    expect(done.body.status).toBe("approved");
+    expect(done.body.queue).toEqual({ pending: 0, position: 0 });
+    expect(done.body.trail.map((t: { action: string }) => t.action)).toEqual(["submitted", "review_taken_over", "first_approved", "returned", "first_approved", "approved"]);
+    expect(done.body.trail).toEqual([
+      { at: expect.any(String), action: "submitted", label: "Sent by the client", staff: null, reason: null, internalNote: null },
+      { at: expect.any(String), action: "review_taken_over", label: "Took over the review from agent2", staff: "agent", reason: null, internalNote: null },
+      { at: expect.any(String), action: "first_approved", label: "First approval, waiting for a second approval", staff: "agent", reason: null, internalNote: "Matches the bank statement" },
+      { at: expect.any(String), action: "returned", label: "Sent back for a new first approval", staff: "manager", reason: null, internalNote: "The reference is from another payment" },
+      { at: expect.any(String), action: "first_approved", label: "First approval, waiting for a second approval", staff: "agent", reason: null, internalNote: null },
+      { at: expect.any(String), action: "approved", label: "Second approval, added to the wallet", staff: "manager", reason: null, internalNote: null },
+    ]);
+    // Opening it is never part of the trail.
+    expect(Number((await one<{ n: number }>(env.db, "SELECT COUNT(*) AS n FROM audit_log WHERE action = 'deposit.viewed' AND meta_json->'$.depositId' = ?", [big.id]))!.n)).toBeGreaterThan(0);
+
+    // The queue moves up as items leave it.
+    expect((await detail(scoped, newer.id)).queue).toEqual({ pending: first.pending - 2, position: first.position });
+    const no = await reject(scoped, newer.id);
+    expect(no.status).toBe(200);
+    expect(no.body.stage).toBeNull();
+    expect(no.body.trail).toEqual([{ at: expect.any(String), action: "rejected", label: "Rejected", staff: "scoped", reason: DEPOSIT_REJECT_REASONS[0], internalNote: null }]);
+    // Someone who may not see the client gets nothing at all.
+    const other = await makeDeposit(await makeClient(), usdBank);
+    expect((await scoped.agent.get(url(other.id))).status).toBe(404);
+    expect((await reject(manager, other.id)).status).toBe(200);
   });
 
   describe("money settings", () => {

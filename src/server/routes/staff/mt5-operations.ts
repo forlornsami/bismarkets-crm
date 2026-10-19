@@ -31,9 +31,9 @@ import { requirePermission, requireStepUp, staffActor, staffOf, type StaffContex
 //
 // A staff change waiting for a second person is approved here (mt5.balance.adjust
 // and a fresh 2FA code, never by the person who asked for it, with the limits
-// checked again on MT5's figures now) and then sent at once, or rejected (the
-// requester may cancel their own). What staff/mt5-adjustments.ts needs to ask
-// for a change is exported from here too.
+// checked again on MT5's figures now) and then sent at once, or rejected (also
+// with a fresh 2FA code; the requester may cancel their own). What
+// staff/mt5-adjustments.ts needs to ask for a change is exported from here too.
 
 const NOT_FOUND = "That MT5 operation does not exist or its client is not assigned to you.";
 const SETTLED = "This operation is already settled.";
@@ -321,6 +321,27 @@ export function staffMt5OperationsRouter(deps: AppDeps): Router {
     }),
   );
 
+  // For the Transfers badge: changes waiting for this person's approval (never their own, which another must approve).
+  router.get(
+    "/summary",
+    requirePermission("wallet.view"),
+    handler(async (req, res) => {
+      const staff = staffOf(req);
+      let awaitingForMe = 0;
+      if (staff.permissions.has("mt5.balance.adjust")) {
+        const s = clientScope(staff);
+        const r = await one<{ n: number }>(
+          db,
+          `SELECT COUNT(*) AS n FROM mt5_balance_ops o JOIN clients c ON c.id = o.client_id
+           WHERE o.status = 'awaiting_approval' AND (o.requested_by IS NULL OR o.requested_by <> ?)${s.sql}`,
+          [staff.id, ...s.params],
+        );
+        awaitingForMe = Number(r?.n ?? 0);
+      }
+      res.json({ awaitingForMe });
+    }),
+  );
+
   router.get(
     "/:id",
     requirePermission("wallet.view"),
@@ -441,10 +462,11 @@ export function staffMt5OperationsRouter(deps: AppDeps): Router {
     }),
   );
 
-  // A no. Anyone with mt5.balance.adjust may reject a change; the requester rejecting their own cancels it.
+  // A no, with a fresh 2FA code like a yes. Anyone with mt5.balance.adjust may reject a change; the requester rejecting their own cancels it.
   router.post(
     "/:id/reject",
     requirePermission("mt5.balance.adjust"),
+    stepUp,
     handler(async (req, res) => {
       const { note } = parse(rejectBody, req.body ?? {});
       const staff = staffOf(req);
