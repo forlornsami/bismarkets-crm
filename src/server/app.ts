@@ -12,6 +12,7 @@ import { buildAllowList, isAllowed, normalizeIp } from "./lib/ip";
 import { loggablePath } from "./lib/logger";
 import { clientErrorMiddleware } from "./clients/errors";
 import { clientAuthRouter } from "./routes/client/auth";
+import { clientIbRouter } from "./routes/client/ib";
 import { clientKycRouter } from "./routes/client/kyc";
 import { clientAccountRouter } from "./routes/client/account";
 import { clientMoneyRouter } from "./routes/client/money";
@@ -23,6 +24,7 @@ import { staffBrandingRouter } from "./routes/staff/branding";
 import { staffClientsRouter } from "./routes/staff/clients";
 import { staffDepositsRouter } from "./routes/staff/deposits";
 import { staffEmailsRouter } from "./routes/staff/emails";
+import { staffIbRouter } from "./routes/staff/ib";
 import { staffKycRouter } from "./routes/staff/kyc";
 import { staffMailRouter } from "./routes/staff/mail";
 import { staffMessagesRouter } from "./routes/staff/messages";
@@ -140,6 +142,7 @@ export function createApp(deps: AppDeps): Express {
   staff.use("/clients", staffClientsRouter(deps));
   staff.use("/emails", staffEmailsRouter(deps));
   staff.use("/kyc", staffKycRouter(deps));
+  staff.use("/ib", staffIbRouter(deps));
   staff.use("/mail-settings", staffMailRouter(deps));
   staff.use("/messages", staffMessagesRouter(deps));
   staff.use("/deposits", staffDepositsRouter(deps));
@@ -184,7 +187,8 @@ export function createApp(deps: AppDeps): Express {
   client.use(clientMoneyRouter(deps));
   client.use(clientMt5Router(deps));
   client.use(clientTransfersRouter(deps));
-  // Later phases add the remaining portal endpoints (IB).
+  client.use(clientIbRouter(deps));
+  // Anything else the portal or app calls is not built.
   client.use((_req, _res, next) => next(new HttpError(404, "NOT_AVAILABLE", "This feature is not available yet.")));
   client.use(clientErrorMiddleware(log));
   app.use("/api", (req, res, next) => (req.path.startsWith("/staff/") || req.path === "/staff" ? next() : client(req, res, next)));

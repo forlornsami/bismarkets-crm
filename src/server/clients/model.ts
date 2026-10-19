@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { Config } from "../config";
 import { exec, one, type Conn } from "../lib/db";
 import { pictureVersion } from "../lib/pictures";
+import { clientIbStatus } from "../ib/model";
 
 export interface ClientRow {
   id: number;
@@ -38,13 +39,21 @@ export interface ClientRow {
   created_at: Date;
   updated_at: Date;
   picture_sha: string | null;
+  /** The sponsor's referral code (the client whose code they signed up with), or null. */
+  sponsor_code: string | null;
+  /** The status of the client's latest IB application, or null when they never applied. */
+  ib_application_status: "pending" | "approved" | "rejected" | "removed" | null;
+  /** 1 while the client is an IB (an active partnership). */
+  ib_active: number;
 }
 
 export const SELECT_CLIENT = `SELECT c.id, c.email, c.first_name, c.last_name, c.password_hash, c.status, c.status_reason, c.kyc_status, c.kyc_approved_at, c.marketing_opt_out_at, c.important_notice,
   c.email_verified_at, c.phone, c.phone_code, c.country, c.city, c.address, c.zipcode,
   DATE_FORMAT(c.dob, '%Y-%m-%d') AS dob, c.gender, c.bio, c.business_name, c.referral_code, c.referred_by, c.source,
   c.assigned_staff_id, c.failed_login_count, c.locked_until, c.last_login_at, c.last_login_ip, c.created_at, c.updated_at,
-  p.sha256 AS picture_sha
+  p.sha256 AS picture_sha, (SELECT sp.referral_code FROM clients sp WHERE sp.id = c.referred_by) AS sponsor_code,
+  (SELECT ia.status FROM ib_applications ia WHERE ia.client_id = c.id ORDER BY ia.submitted_at DESC, ia.id DESC LIMIT 1) AS ib_application_status,
+  EXISTS (SELECT 1 FROM ib_partners ip WHERE ip.client_id = c.id AND ip.status = 'active') AS ib_active
   FROM clients c LEFT JOIN profile_pictures p ON p.owner_type = 'client' AND p.owner_id = c.id`;
 
 export async function loadClient(conn: Conn, id: number, lock = false) {
@@ -83,7 +92,12 @@ export function presentForPortal(config: Config, c: ClientRow, sessionId?: strin
     image_url: picture,
     image_name: picture,
     profile_picture: picture,
-    referral_code: c.referral_code,
+    // The client's own code is not `referral_code`: the app shows that field as the code the account
+    // signed up with. `referred_by` is the sponsor's code.
+    own_referral_code: c.referral_code,
+    referred_by: c.sponsor_code,
+    is_ib: Number(c.ib_active) === 1 && c.status !== "closed",
+    ib_status: clientIbStatus(c.ib_application_status),
     status: c.status,
     important_notice: c.important_notice,
     kyc_status: c.kyc_status,

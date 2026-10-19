@@ -3,8 +3,8 @@ import { exec, one } from "./db";
 import { conflict } from "./http";
 
 /**
- * Review queue claims, shared by every approval queue (KYC, deposits and
- * withdrawals). Opening an item claims it for CLAIM_MINUTES so two reviewers
+ * Review queue claims, shared by every approval queue (KYC, deposits,
+ * withdrawals and IB applications). Opening an item claims it for CLAIM_MINUTES so two reviewers
  * never work the same item; the claim is refreshed while it is open and
  * cleared when the item is decided.
  */
@@ -15,8 +15,9 @@ const TABLES: Record<string, readonly string[]> = {
   kyc_submissions: ["pending"],
   deposits: ["pending", "second_approval"],
   withdrawals: ["pending", "second_approval", "approved"],
+  ib_applications: ["pending"],
 };
-export type ReviewTable = "kyc_submissions" | "deposits" | "withdrawals";
+export type ReviewTable = "kyc_submissions" | "deposits" | "withdrawals" | "ib_applications";
 const table = (name: string) => {
   if (!Object.hasOwn(TABLES, name)) throw new Error(`Not a review table: ${name}`);
   return name;

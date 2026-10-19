@@ -247,7 +247,7 @@ waiting marketing emails and is audited. Account emails are unaffected.
 
 **Keeping the evidence.** KYC submissions and documents cannot be deleted with their client or submission (foreign keys `ON DELETE RESTRICT`); nothing in the CRM deletes them. The retention period after an account closes is for compliance to set; a purge job will follow that decision.
 
-**Gated client features.** Money, trading-account and IB routes, as they are built, answer clients without approved KYC with `kycRequired()`: `403 { "message": "You must complete your KYC first." }`, the exact text the app looks for.
+**Gated client features.** Money and trading-account routes answer clients without approved KYC with `kycRequired()`: `403 { "message": "You must complete your KYC first." }`, the exact text the app looks for. GET /api/ib-request answers every signed-in client. Applying to the IB program and IB money moves answer clients without approved KYC with kycRequired(). IB dashboard and network reads need an active IB partnership and are kept when KYC is later withdrawn (staff remove the partnership if needed).
 
 ## Money: deposits and withdrawals (Phase 3)
 
@@ -287,8 +287,8 @@ must be fully ticked, preset reasons, and a fresh 2FA code for every decision.
 A deposit can be approved only by someone who opened its payment screenshot in
 the review screen; the bank reference entered must not be on another deposit
 of the same method. Reasons the client sees are plain text, at most 240
-characters. Every view, proof opening, claim, take-over and decision is in the
-audit log. The client's activity feed shows review details only to staff who
+characters. Every view, proof opening, take-over and decision is in the audit
+log. The client's activity feed shows review details only to staff who
 review that kind of request.
 
 **Two people.**
@@ -464,3 +464,50 @@ sign in to that trading account (the investor one can only watch), so:
 - Limit: a password the client changes in the MT5 terminal itself is not seen
   by the CRM, so the panel keeps showing the old one until the next change
   through the portal or app.
+
+## IB program (Phase 4)
+
+**Applying.** Any signed-in client can read their IB status; it is never a 401
+or a 404 (the app signs out on any 401 and shows no form on a 404). Applying
+needs the client's own session (not a staff "view as client" session),
+accepted terms, approved KYC and an account that is not frozen. A client has at
+most one pending or approved application: a unique key on a generated column
+refuses a second one, so a repeated or doubled submit is answered with the one
+already open. Five stored applications and twenty attempts an hour per client.
+The terms version, IP address and browser are kept with each application.
+
+**What an IB sees.** The dashboard, referral list, network and sub-IB lists
+need an active partnership on an account that is not closed; every other
+client gets a 403. Network rows carry names, levels, sponsors, whether each
+member is funded and their approved deposits, never emails, phones or MT5
+logins, and "active" means funded, never the account's own state (a freeze is
+not the IB's business). A partner whose account is closed is not an IB in any
+of these answers. The network is read with a recursive query that stops at 10
+levels and at 20,000 members and never visits a client twice on one path, so a
+loop in the referral chain cannot hang a request. Every IB read shares a limit
+of 120 a minute per client. Commission to wallet is refused (the IB wallet
+comes with commissions) after the same checks as other money moves.
+
+**Reviewing.** IB applications use the same review rules as KYC and money: a
+15-minute claim, warnings, a checklist that must be fully ticked, preset
+reasons the client reads as written (plain text, at most 240 characters), and a
+fresh 2FA code for every approval, rejection and removal. Staff without
+`client.view_all` see and decide only the applications of clients assigned to
+them; every decision first reads the client through that scope, then locks the
+client row and the application. Whoever created the client's account, is
+their account manager, or uploaded or approved without documents one of their
+current verified KYC submissions cannot approve their application (another
+person must); `next` and the "for me" count skip those too. Approving needs
+approved KYC and an account that is neither frozen nor closed; rejecting is
+allowed for a frozen account; removing IB status is allowed whatever the
+account's state. Warnings name another client only to staff who may see that
+client, and money and trading facts appear only to staff with the matching
+view permission. Every opening, take-over and decision is in the audit log; the client's activity feed keeps internal notes for `ib.view` holders and
+never shows warnings. Decisions reach the client as a notification and an
+email, never as a support event.
+
+**Referral links.** `clients.referred_by` is set once, at sign-up, from the
+code of a client whose account is not closed, and nothing changes it yet.
+Invariant for later rounds (history import, `ib.edit`): any code that sets or
+changes `referred_by` locks both client rows and refuses a sponsor that is the
+client or inside the client's own network.

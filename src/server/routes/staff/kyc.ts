@@ -14,10 +14,11 @@ import { exec, one, rows, transaction, type Conn } from "../../lib/db";
 import { queueEmail } from "../../lib/email";
 import { queueSupportEvent } from "../../lib/events";
 import { notifyClient } from "../../clients/notifications";
-import { badRequest, forbidden, handler, HttpError, notFound, parse } from "../../lib/http";
+import { badRequest, conflict, forbidden, handler, HttpError, notFound, parse } from "../../lib/http";
 import { likeTerm, listQuery, toPage } from "../../lib/pagination";
 import { requirePermission, requireStepUp, staffActor, staffOf, type StaffContext } from "../../staff/session";
-import { activeClaim, assertNotClaimedByOther, claim, CLAIM_MINUTES, release } from "../../lib/review";
+import { activeClaim, claim, CLAIM_MINUTES, release } from "../../lib/review";
+import { reviewClient } from "../../lib/review-detail";
 
 const id = z.coerce.number().int().positive();
 // The portal shows a rejection reason exactly as written, but only when it is plain text.
@@ -34,6 +35,7 @@ const internalNote = z
   .transform((v) => v || null);
 
 const CLOSED = "This account is closed.";
+const VIEW_ONLY = "You can look at this submission but not approve or reject it.";
 const WITHDRAWN = "The client took this document back.";
 const NOT_LATEST = "The client has a newer submission for this. Change that one instead.";
 
@@ -59,20 +61,33 @@ interface Row {
   email: string;
   country: string | null;
   client_status: ClientRow["status"];
+  email_verified_at: Date | null;
   picture_sha: string | null;
   documents: number;
+  /** Whether an earlier submission of this category was rejected. */
+  rejected_before: number;
 }
 
 const SELECT = `SELECT s.id, s.client_id, s.category, s.sub_type, s.source, s.uploaded_by, up.name AS uploader_name, s.staff_note, s.status, s.reject_reason, s.submitted_at, s.decided_at,
-  u.name AS decider_name, s.claimed_by, s.claimed_until, cl.name AS claimer_name, c.first_name, c.last_name, c.email, c.country, c.status AS client_status, pp.sha256 AS picture_sha,
-  (SELECT COUNT(*) FROM kyc_documents d WHERE d.submission_id = s.id) AS documents
+  u.name AS decider_name, s.claimed_by, s.claimed_until, cl.name AS claimer_name, c.first_name, c.last_name, c.email, c.country, c.status AS client_status, c.email_verified_at,
+  pp.sha256 AS picture_sha, (SELECT COUNT(*) FROM kyc_documents d WHERE d.submission_id = s.id) AS documents,
+  EXISTS (SELECT 1 FROM kyc_submissions e WHERE e.client_id = s.client_id AND e.category = s.category AND e.status = 'rejected' AND e.id < s.id) AS rejected_before
   FROM kyc_submissions s JOIN clients c ON c.id = s.client_id LEFT JOIN staff_users u ON u.id = s.decided_by LEFT JOIN staff_users cl ON cl.id = s.claimed_by
   LEFT JOIN staff_users up ON up.id = s.uploaded_by
   LEFT JOIN profile_pictures pp ON pp.owner_type = 'client' AND pp.owner_id = s.client_id`;
 
+/**
+ * What the queue can flag without opening the submission: the account is not active, the email is not
+ * verified, staff uploaded it, or an earlier one was rejected. The review screen works out the rest.
+ */
+const rowWarnings = (r: Row) => [r.client_status !== "active", r.email_verified_at === null, r.source === "staff", Number(r.rejected_before) === 1].filter(Boolean).length;
+
 const present = (r: Row) => ({
   id: r.id,
-  client: { id: r.client_id, name: clientName(r), email: r.email, country: r.country, pictureUrl: clientPictureUrl("", r.client_id, r.picture_sha) },
+  client: {
+    id: r.client_id, name: clientName(r), email: r.email, country: r.country, status: r.client_status,
+    pictureUrl: clientPictureUrl("", r.client_id, r.picture_sha), avatarUrl: clientPictureUrl("", r.client_id, r.picture_sha),
+  },
   category: r.category,
   categoryLabel: KYC_TYPES[r.category].label,
   documentType: subTypeOf(r.category, r.sub_type)?.name ?? `Type ${r.sub_type}`,
@@ -87,6 +102,7 @@ const present = (r: Row) => ({
   uploadedBy: r.source === "staff" ? (r.uploader_name ?? "staff") : null,
   staffNote: r.staff_note,
   claimedBy: activeClaim(r) ? { id: r.claimed_by!, name: r.claimer_name, until: r.claimed_until!.toISOString() } : null,
+  warningCount: rowWarnings(r),
 });
 
 interface DocRow {
@@ -144,7 +160,9 @@ const ageOn = (dob: string, now = new Date()) => {
   return age;
 };
 const longDate = (d: Date | null) => (d ?? new Date()).toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric", timeZone: "UTC" });
-type Warning = { tone: "bad" | "warn" | "info"; text: string; clientId?: number };
+type Warning = { tone: "bad" | "warn" | "info"; text: string; clientId?: number; href?: string; linkLabel?: string };
+/** A warning about another client, with the link the review screen offers (clientId stays for older screens). */
+const aboutClient = (tone: Warning["tone"], text: string, clientId: number): Warning => ({ tone, text, clientId, href: `/clients/${clientId}`, linkLabel: "Open that client" });
 
 const FIELD_LABEL: Record<SnapshotField, string> = {
   first_name: "first name", last_name: "last name", dob: "date of birth", country: "country", city: "city", address: "address", zipcode: "postcode",
@@ -166,6 +184,7 @@ const TRAIL: Record<string, string> = {
   "kyc.new_document_requested": "New document requested",
   "kyc.approved_without_documents": "Approved without documents",
   "kyc.withdrawn_by_client": "Taken back by the client",
+  "kyc.review_taken_over": "Took over the review",
 };
 const text = (v: unknown) => (typeof v === "string" && v ? v : null);
 
@@ -182,6 +201,26 @@ export function staffKycRouter(deps: AppDeps): Router {
     staff.permissions.has("client.view_all") ? { sql: "", params: [] as unknown[] } : { sql: " AND c.assigned_staff_id = ?", params: [staff.id] as unknown[] };
   /** Whether the staff member may see this client (for naming other clients in warnings). */
   const inScope = (staff: StaffContext, assignedTo: number | null) => staff.permissions.has("client.view_all") || assignedTo === staff.id;
+  const mayDecide = (staff: StaffContext) => staff.permissions.has("kyc.decide") && staff.permissions.has("kyc.documents");
+
+  /**
+   * What "next" may hand this staff member: pending items of accounts that are not closed, held by
+   * nobody else, except what they uploaded themselves (they may not approve it). The summary's "for me"
+   * counts use the same rule, so a count never promises an item "next" would not give. Null without
+   * the permissions to decide.
+   */
+  function waitingFor(staff: StaffContext, category?: KycCategory) {
+    if (!mayDecide(staff)) return null;
+    const where = [
+      "s.status = 'pending'", "c.status <> 'closed'", "(s.uploaded_by IS NULL OR s.uploaded_by <> ?)",
+      "(s.claimed_by IS NULL OR s.claimed_until < CURRENT_TIMESTAMP(3) OR s.claimed_by = ?)",
+    ];
+    const params: unknown[] = [staff.id, staff.id];
+    const s = scope(staff);
+    if (s.sql) (where.push("c.assigned_staff_id = ?"), params.push(...s.params));
+    if (category) (where.push("s.category = ?"), params.push(category));
+    return { where, params };
+  }
 
   async function loadVisible(req: Request, submissionId: number, conn: Conn = db, lock = false) {
     const s = scope(staffOf(req));
@@ -196,10 +235,13 @@ export function staffKycRouter(deps: AppDeps): Router {
    * first. The client id is read first, before the transaction starts (it never
    * changes): read through the pool inside it, a transaction would wait for a
    * second connection while holding one, which hangs the server once every
-   * connection does.
+   * connection does. Scoped, so nobody takes locks on a client they may not see.
    */
-  const clientOfSubmission = async (submissionId: number) =>
-    (await one<{ client_id: number }>(db, "SELECT client_id FROM kyc_submissions WHERE id = ?", [submissionId]))?.client_id ?? null;
+  async function clientOfSubmission(req: Request, submissionId: number) {
+    const s = scope(staffOf(req));
+    const ref = await one<{ client_id: number }>(db, `SELECT s.client_id FROM kyc_submissions s JOIN clients c ON c.id = s.client_id WHERE s.id = ?${s.sql}`, [submissionId, ...s.params]);
+    return ref?.client_id ?? null;
+  }
 
   async function lockClientOf(conn: Conn, clientId: number | null) {
     if (clientId !== null) await lockClient(conn, clientId);
@@ -284,7 +326,7 @@ export function staffKycRouter(deps: AppDeps): Router {
    * details the documents are checked against. GET /:id shows the same text.
    */
   function approvalBlock(staff: StaffContext, row: Row, missing: RequiredProfileField[], isLatest: boolean): HttpError | null {
-    if (!staff.permissions.has("kyc.decide") || !staff.permissions.has("kyc.documents")) return forbidden();
+    if (!mayDecide(staff)) return forbidden(VIEW_ONLY);
     if (row.client_status === "closed") return badRequest(CLOSED);
     if (row.status === "withdrawn") return badRequest(WITHDRAWN);
     if (row.status === "approved") return badRequest("This submission is already approved.");
@@ -294,6 +336,30 @@ export function staffKycRouter(deps: AppDeps): Router {
     if (missing.length) return badRequest(`Add the client's ${describeMissing(missing)} to their profile before approving.`);
     return null;
   }
+
+  /**
+   * Why this staff member may not decide this pending submission now (approve or reject), or null.
+   * The decision route throws it with the submission locked; GET /:id shows the same text as can.reject.
+   */
+  function decisionBlock(staff: StaffContext, row: Row): HttpError | null {
+    if (!mayDecide(staff)) return forbidden(VIEW_ONLY);
+    if (row.status === "withdrawn") return badRequest(WITHDRAWN);
+    if (row.status !== "pending") return badRequest(`This submission was already ${row.status}${row.decider_name ? ` by ${row.decider_name}` : ""}.`);
+    const holder = activeClaim(row);
+    if (holder && holder !== staff.id) return conflict(`${row.claimer_name ?? "Someone else"} is reviewing this item right now.`);
+    if (row.client_status === "closed") return badRequest(CLOSED);
+    return null;
+  }
+
+  /** Why this staff member may not ask for a new document instead of this approved one, or null (as decisionBlock). */
+  function requestNewBlock(staff: StaffContext, row: Row, isLatest: boolean): HttpError | null {
+    if (!mayDecide(staff)) return forbidden(VIEW_ONLY);
+    if (row.status !== "approved") return badRequest("Only an approved document can be requested again. Reject a pending one instead.");
+    if (row.client_status === "closed") return badRequest(CLOSED);
+    if (!isLatest) return badRequest(NOT_LATEST);
+    return null;
+  }
+  const can = (block: HttpError | null) => ({ ok: block === null, reason: block?.message ?? null });
 
   async function assertMayApprove(conn: Conn, req: Request, row: Row, latest: LatestSubmissions) {
     const client = await loadClient(conn, row.client_id);
@@ -354,8 +420,9 @@ export function staffKycRouter(deps: AppDeps): Router {
     "/summary",
     requirePermission("kyc.view"),
     handler(async (req, res) => {
-      const s = scope(staffOf(req));
-      const me = staffOf(req).id;
+      const staff = staffOf(req);
+      const s = scope(staff);
+      const me = staff.id;
       const r = await one<{ pending: number; overdue: number; oldest: Date | null; today: number; mine: number }>(
         db,
         `SELECT SUM(s.status = 'pending' AND c.status <> 'closed') AS pending,
@@ -366,12 +433,24 @@ export function staffKycRouter(deps: AppDeps): Router {
          FROM kyc_submissions s JOIN clients c ON c.id = s.client_id WHERE 1 = 1${s.sql}`,
         [me, ...s.params],
       );
+      // What "next" would hand this person now, by category (the Document filter picks one).
+      const w = waitingFor(staff);
+      const mine = w
+        ? await one<{ identity: string | null; address: string | null }>(
+            db,
+            `SELECT SUM(s.category = 'identity') AS identity, SUM(s.category = 'address') AS address FROM kyc_submissions s JOIN clients c ON c.id = s.client_id WHERE ${w.where.join(" AND ")}`,
+            w.params,
+          )
+        : undefined;
+      const forMeByCategory = { identity: Number(mine?.identity ?? 0), address: Number(mine?.address ?? 0) };
       res.json({
         pending: Number(r?.pending ?? 0),
         overdue: Number(r?.overdue ?? 0),
         oldestPendingAt: r?.oldest?.toISOString() ?? null,
         decidedToday: Number(r?.today ?? 0),
         decidedTodayByMe: Number(r?.mine ?? 0),
+        forMe: forMeByCategory.identity + forMeByCategory.address,
+        forMeByCategory,
       });
     }),
   );
@@ -382,21 +461,15 @@ export function staffKycRouter(deps: AppDeps): Router {
     "/next",
     decide,
     handler(async (req, res) => {
-      const body = parse(
-        z.object({ category: z.enum(["identity", "address"]).optional(), skip: z.array(id).max(200).default([]), release: id.optional() }).strict(),
-        req.body ?? {},
-      );
+      // `stage` is the shared review screens' name for the category.
+      const category = z.enum(["identity", "address"]).optional();
+      const body = parse(z.object({ category, stage: category, skip: z.array(id).max(200).default([]), release: id.optional() }).strict(), req.body ?? {});
       const staff = staffOf(req);
-      const s = scope(staff);
       const next = await transaction(db, async (conn) => {
         if (body.release) await release(conn, "kyc_submissions", body.release, staff.id);
-        const where = [
-          "s.status = 'pending'", "c.status <> 'closed'", "(s.uploaded_by IS NULL OR s.uploaded_by <> ?)",
-          "(s.claimed_by IS NULL OR s.claimed_until < CURRENT_TIMESTAMP(3) OR s.claimed_by = ?)",
-        ];
-        const params: unknown[] = [staff.id, staff.id];
-        if (s.sql) (where.push("c.assigned_staff_id = ?"), params.push(...s.params));
-        if (body.category) (where.push("s.category = ?"), params.push(body.category));
+        const w = waitingFor(staff, body.category ?? body.stage);
+        if (!w) return null;
+        const { where, params } = w;
         if (body.skip.length) (where.push(`s.id NOT IN (${body.skip.map(() => "?").join(",")})`), params.push(...body.skip));
         const row = await one<{ id: number }>(
           conn,
@@ -429,9 +502,10 @@ export function staffKycRouter(deps: AppDeps): Router {
     }),
   );
 
+  // The same permissions as claiming.
   router.post(
     "/:id/release",
-    requirePermission("kyc.decide"),
+    decide,
     handler(async (req, res) => {
       await release(db, "kyc_submissions", parse(id, req.params.id), staffOf(req).id);
       res.json({ ok: true });
@@ -463,9 +537,10 @@ export function staffKycRouter(deps: AppDeps): Router {
         ? { id: otherRow.id, category: otherRow.category, status: otherRow.status, documentType: present(otherRow).documentType, submittedAt: otherRow.submitted_at.toISOString(), decidedAt: otherRow.decided_at?.toISOString() ?? null, documents: Number(otherRow.documents), files: (await documentsOf(otherRow.id)).map(file) }
         : null;
 
-      const trailRows = await rows<{ occurred_at: Date; action: string; actor_type: string; staff_name: string | null; meta_json: Record<string, unknown> | null }>(
+      const trailRows = await rows<{ occurred_at: Date; action: string; actor_type: string; staff_name: string | null; from_name: string | null; meta_json: Record<string, unknown> | null }>(
         db,
-        `SELECT a.occurred_at, a.action, a.actor_type, u.name AS staff_name, a.meta_json FROM audit_log a LEFT JOIN staff_users u ON a.actor_type = 'staff' AND u.id = a.actor_id
+        `SELECT a.occurred_at, a.action, a.actor_type, u.name AS staff_name, f.name AS from_name, a.meta_json FROM audit_log a LEFT JOIN staff_users u ON a.actor_type = 'staff' AND u.id = a.actor_id
+           LEFT JOIN staff_users f ON a.action = 'kyc.review_taken_over' AND f.id = CAST(a.meta_json->>'$.from' AS UNSIGNED)
          WHERE a.entity_type = 'client' AND a.entity_id = ? AND a.action IN (${Object.keys(TRAIL).map(() => "?").join(",")}) AND a.meta_json->'$.submissionId' = ? ORDER BY a.id`,
         [String(row.client_id), ...Object.keys(TRAIL), row.id],
       );
@@ -474,7 +549,12 @@ export function staffKycRouter(deps: AppDeps): Router {
         return {
           at: a.occurred_at.toISOString(),
           action: a.action.replace(/^kyc\./, ""),
-          label: a.action === "kyc.decision_changed" && text(meta.from) && text(meta.to) ? `Decision changed from ${meta.from} to ${meta.to}` : TRAIL[a.action]!,
+          label:
+            a.action === "kyc.decision_changed" && text(meta.from) && text(meta.to)
+              ? `Decision changed from ${meta.from} to ${meta.to}`
+              : a.action === "kyc.review_taken_over" && a.from_name
+                ? `Took over the review from ${a.from_name}`
+                : TRAIL[a.action]!,
           staff: a.actor_type === "staff" ? (a.staff_name ?? "Staff") : null,
           reason: text(meta.reason) ?? text(meta.note),
           internalNote: text(meta.internalNote),
@@ -510,7 +590,7 @@ export function staffKycRouter(deps: AppDeps): Router {
           [...hashes, row.client_id],
         );
         for (const d of dupes.filter((d) => inScope(staff, d.assigned_staff_id))) {
-          warnings.push({ tone: "bad", text: `The same file was also uploaded by ${d.first_name} ${d.last_name} (client ${d.client_id}).`, clientId: d.client_id });
+          warnings.push(aboutClient("bad", `The same file was also uploaded by ${d.first_name} ${d.last_name} (client ${d.client_id}).`, d.client_id));
         }
         if (dupes.some((d) => !inScope(staff, d.assigned_staff_id))) warnings.push({ tone: "bad", text: "The same file was also uploaded by another client." });
         // The same client's own earlier files: a rejected file sent again, or the proof of identity reused as proof of address.
@@ -536,11 +616,13 @@ export function staffKycRouter(deps: AppDeps): Router {
           [client.id, client.dob, fullName],
         );
         for (const t of twins.filter((t) => inScope(staff, t.assigned_staff_id))) {
-          warnings.push({
-            tone: t.status === "active" ? "warn" : "bad",
-            text: `The same person may have another account: ${t.first_name} ${t.last_name} (client ${t.id}${t.status === "active" ? "" : `, ${t.status}`}) has the same name and date of birth.`,
-            clientId: t.id,
-          });
+          warnings.push(
+            aboutClient(
+              t.status === "active" ? "warn" : "bad",
+              `The same person may have another account: ${t.first_name} ${t.last_name} (client ${t.id}${t.status === "active" ? "" : `, ${t.status}`}) has the same name and date of birth.`,
+              t.id,
+            ),
+          );
         }
         const hidden = twins.filter((t) => !inScope(staff, t.assigned_staff_id));
         if (hidden.length) {
@@ -568,21 +650,33 @@ export function staffKycRouter(deps: AppDeps): Router {
       const rejected = history.filter((h) => h.status === "rejected" && h.id < row.id).length;
       if (rejected) warnings.push({ tone: "info", text: `${rejected} earlier attempt${rejected > 1 ? "s were" : " was"} rejected. See the history below.` });
 
+      // Where this item stands among those waiting in its category, as the queue lists them (this item
+      // included, even when its account is closed). Nothing for an item that no longer waits.
       const s = scope(staff);
-      const queue = await one<{ pending: number; ahead: number }>(
-        db,
-        `SELECT COUNT(*) AS pending, SUM(s.submitted_at < ?) AS ahead FROM kyc_submissions s JOIN clients c ON c.id = s.client_id WHERE s.status = 'pending' AND c.status <> 'closed'${s.sql}`,
-        [row.submitted_at, ...s.params],
-      );
+      const stage = row.status === "pending" ? row.category : null;
+      const queue = stage
+        ? await one<{ pending: number; ahead: string | null }>(
+            db,
+            `SELECT COUNT(*) AS pending, SUM(s.submitted_at < ? OR (s.submitted_at = ? AND s.id < ?)) AS ahead FROM kyc_submissions s JOIN clients c ON c.id = s.client_id
+             WHERE s.status = 'pending' AND s.category = ? AND (c.status <> 'closed' OR s.id = ?)${s.sql}`,
+            [row.submitted_at, row.submitted_at, row.id, stage, row.id, ...s.params],
+          )
+        : undefined;
       const block = approvalBlock(staff, row, missingProfileFields(client), isLatest);
+      const card = await reviewClient(db, row.client_id);
       await transaction(db, (conn) => writeAudit(conn, ctx(req), { action: "kyc.viewed", entityType: "client", entityId: row.client_id, meta: { submissionId: row.id } }));
       res.json({
         ...present(row),
-        client: { ...present(row).client, status: row.client_status },
+        client: { ...present(row).client, ...card },
+        stage,
         uploadedByMe: row.uploaded_by === staff.id && Number(row.documents) > 0,
         isLatest,
         mayApprove: block === null,
         approveBlockedReason: block?.message ?? null,
+        // What this person may do now, as the shared review screens read it. Approving stays possible
+        // for the latest rejected submission ("Approve now"), as mayApprove.
+        can: { approve: can(block), reject: can(decisionBlock(staff, row)), requestNew: can(requestNewBlock(staff, row, isLatest)) },
+        claimMinutes: CLAIM_MINUTES,
         files: docs.map(file),
         // The reviewer compares the documents with these details, so they are shown in full (kyc.documents).
         profile: { name: clientName(client), dob: client.dob, gender: client.gender, country: client.country, city: client.city, address: client.address, zipcode: client.zipcode },
@@ -592,9 +686,10 @@ export function staffKycRouter(deps: AppDeps): Router {
         warnings,
         checklist: checklistFor(row.category, row.sub_type),
         reasons: KYC_REJECT_REASONS[row.category],
+        rejectReasons: KYC_REJECT_REASONS[row.category],
         // Offered by the viewer when a document cannot be shown at all.
         unreadableReason: KYC_UNREADABLE_REASON,
-        queue: { pending: Number(queue?.pending ?? 0), position: Number(queue?.ahead ?? 0) + 1 },
+        queue: queue ? { pending: Number(queue.pending), position: Number(queue.ahead ?? 0) + 1 } : { pending: 0, position: 0 },
       });
     }),
   );
@@ -709,7 +804,7 @@ export function staffKycRouter(deps: AppDeps): Router {
     handler(async (req, res) => {
       const body = parse(
         z
-          .object({ decision: z.enum(["approve", "reject"]), reason: z.string().trim().max(500).optional(), checklist: z.array(z.string().max(32)).max(10).default([]), internalNote })
+          .object({ decision: z.enum(["approve", "reject"]), reason: z.string().trim().max(500).optional(), checklist: z.array(z.string().max(32)).max(10).default([]), internalNote, note: internalNote })
           .strict()
           .refine((v) => v.decision === "approve" || (v.reason && v.reason.length >= 5), { message: "Tell the client why, so they can fix it", path: ["reason"] })
           // The portal shows the reason exactly as written, but only when it is plain text.
@@ -718,14 +813,12 @@ export function staffKycRouter(deps: AppDeps): Router {
       );
       const staff = staffOf(req);
       const submissionId = parse(id, req.params.id);
-      const clientId = await clientOfSubmission(submissionId);
+      const clientId = await clientOfSubmission(req, submissionId);
       const updated = await transaction(db, async (conn) => {
         await lockClientOf(conn, clientId);
         const row = await loadVisible(req, submissionId, conn, true);
-        if (row.status === "withdrawn") throw badRequest(WITHDRAWN);
-        if (row.status !== "pending") throw badRequest(`This submission was already ${row.status}${row.decider_name ? ` by ${row.decider_name}` : ""}.`);
-        assertNotClaimedByOther(row, staff.id);
-        if (row.client_status === "closed") throw badRequest(CLOSED);
+        const block = decisionBlock(staff, row);
+        if (block) throw block;
         const required = checklistFor(row.category, row.sub_type).map((c) => c.key);
         const ticked = required.filter((k) => body.checklist.includes(k));
         if (body.decision === "approve") {
@@ -734,7 +827,7 @@ export function staffKycRouter(deps: AppDeps): Router {
           await assertDocumentsOpened(conn, staff, row);
         }
         const status = body.decision === "approve" ? "approved" : "rejected";
-        await settle(conn, req, row, { status, reason: body.reason ?? null, checklist: ticked, action: `kyc.${status}`, internalNote: body.internalNote });
+        await settle(conn, req, row, { status, reason: body.reason ?? null, checklist: ticked, action: `kyc.${status}`, internalNote: body.internalNote ?? body.note });
         return loadVisible(req, row.id, conn);
       });
       res.json(present(updated));
@@ -753,12 +846,12 @@ export function staffKycRouter(deps: AppDeps): Router {
         throw badRequest("To take back an approval, use \"Ask for a new document\". It tells the client what to send instead.");
       }
       const body = parse(
-        z.object({ status: z.literal("approved"), reason: reasonText, checklist: z.array(z.string().max(32)).max(10).default([]), internalNote }).strict(),
+        z.object({ status: z.literal("approved"), reason: reasonText, checklist: z.array(z.string().max(32)).max(10).default([]), internalNote, note: internalNote }).strict(),
         req.body,
       );
       const staff = staffOf(req);
       const submissionId = parse(id, req.params.id);
-      const clientId = await clientOfSubmission(submissionId);
+      const clientId = await clientOfSubmission(req, submissionId);
       const updated = await transaction(db, async (conn) => {
         await lockClientOf(conn, clientId);
         const row = await loadVisible(req, submissionId, conn, true);
@@ -772,7 +865,7 @@ export function staffKycRouter(deps: AppDeps): Router {
           await assertDocumentsOpened(conn, staff, row);
         }
         // The reason is for the audit log; the client is told the document is approved.
-        await settle(conn, req, row, { status: "approved", reason: body.reason, checklist, action: "kyc.decision_changed", meta: { from: row.status, to: "approved" }, internalNote: body.internalNote });
+        await settle(conn, req, row, { status: "approved", reason: body.reason, checklist, action: "kyc.decision_changed", meta: { from: row.status, to: "approved" }, internalNote: body.internalNote ?? body.note });
         return loadVisible(req, row.id, conn);
       });
       res.json(present(updated));
@@ -855,19 +948,19 @@ export function staffKycRouter(deps: AppDeps): Router {
     stepUp,
     handler(async (req, res) => {
       const body = parse(
-        z.object({ reason: z.string().trim().min(5, "Tell the client what to upload").max(500), internalNote }).strict()
+        z.object({ reason: z.string().trim().min(5, "Tell the client what to upload").max(500), internalNote, note: internalNote }).strict()
           .refine((v) => plain(v.reason), { message: PLAIN_MESSAGE, path: ["reason"] }),
         req.body,
       );
       const submissionId = parse(id, req.params.id);
-      const clientId = await clientOfSubmission(submissionId);
+      const clientId = await clientOfSubmission(req, submissionId);
       const updated = await transaction(db, async (conn) => {
         await lockClientOf(conn, clientId);
         const row = await loadVisible(req, submissionId, conn, true);
-        if (row.status !== "approved") throw badRequest("Only an approved document can be requested again. Reject a pending one instead.");
-        if (row.client_status === "closed") throw badRequest(CLOSED);
-        if ((await latestSubmissions(conn, row.client_id, true))[row.category]?.id !== row.id) throw badRequest(NOT_LATEST);
-        await settle(conn, req, row, { status: "rejected", reason: body.reason, action: "kyc.new_document_requested", askAgain: true, internalNote: body.internalNote });
+        const isLatest = (await latestSubmissions(conn, row.client_id, true))[row.category]?.id === row.id;
+        const block = requestNewBlock(staffOf(req), row, isLatest);
+        if (block) throw block;
+        await settle(conn, req, row, { status: "rejected", reason: body.reason, action: "kyc.new_document_requested", askAgain: true, internalNote: body.internalNote ?? body.note });
         return loadVisible(req, row.id, conn);
       });
       res.json(present(updated));

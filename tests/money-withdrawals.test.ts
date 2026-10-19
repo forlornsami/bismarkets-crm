@@ -246,6 +246,8 @@ describe.skipIf(!hasDb)("staff withdrawals", () => {
       methodName: "My HBL", typeName: "Bank transfer", kind: "bank", network: "", amountCents: 10_000, status: "pending", needsSecondApproval: false,
       firstReviewedBy: null, approvedBy: null, paidBy: null, createdAt: expect.any(String), approvedAt: null, paidAt: null, claimedBy: null, destinationEnding: "6702",
       firstReviewedAt: null, decidedBy: null, decidedAt: null,
+      client: { id: clientId, name: "Ali Khan", email: expect.stringMatching(/@client\.test$/), avatarUrl: null, country: "Pakistan", status: "active" },
+      warningCount: 0,
     });
 
     // View-only staff see the request and the last four characters, never the account number itself.
@@ -282,7 +284,14 @@ describe.skipIf(!hasDb)("staff withdrawals", () => {
       notes: [],
       payoutReference: null,
       paidOn: null,
-      client: { id: clientId, name: "Ali Khan", email: expect.any(String), status: "active", kycStatus: "approved", verifiedName: "Ali Khan", country: "Pakistan", createdAt: expect.any(String) },
+      client: {
+        id: clientId, name: "Ali Khan", email: expect.any(String), status: "active", kycStatus: "approved", verifiedName: "Ali Khan", country: "Pakistan", createdAt: expect.any(String),
+        avatarUrl: null, joinedAt: expect.any(String), assignedTo: null, emailVerified: false,
+      },
+      warningCount: 0,
+      queue: { pending: 1, position: 1 },
+      // Opening it is not part of what happened to it.
+      trail: [],
       wallet: { availableCents: 1_000_000 - 1000 - 10_000, heldCents: 10_000 },
       history: {
         deposits: { approvedCount: 1, approvedTotalCents: 1_000_000, byMethod: [{ methodName: "Meezan Bank", kind: "bank", totalCents: 1_000_000, lastAt: expect.any(String) }] },
@@ -635,6 +644,119 @@ describe.skipIf(!hasDb)("staff withdrawals", () => {
     for (const w of [big, small, late]) expect((await reject(managerB, w.id)).status).toBe(200);
   });
 
+  it("leaves out of each person's count what someone else holds and what a closed account asks for", async () => {
+    const before = { managerA: await summary(managerA), managerB: await summary(managerB) };
+    const { payout } = await regular();
+    const held = await withdraw(payout, 10_000);
+    const big = await withdraw(payout, 150_000);
+    expect((await approve(agentA, big.id)).body.status).toBe("second_approval");
+    const closed = await regular();
+    const shut = await withdraw(closed.payout, 10_000);
+    await exec(env.db, "UPDATE clients SET status = 'closed' WHERE id = ?", [closed.clientId]);
+    expect((await post(managerB, `${W(held.id)}/claim`)).status).toBe(200);
+    expect((await post(managerB, `${W(big.id)}/claim`)).status).toBe(200);
+
+    // The queue counts everything; "for me" only what "next" would hand this person now.
+    const a = await summary(managerA);
+    expect(a.review).toBe(before.managerA.review + 2);
+    expect(a.secondApproval).toBe(before.managerA.secondApproval + 1);
+    expect(a.forMe).toEqual(before.managerA.forMe);
+    expect((await summary(managerB)).forMe).toEqual({
+      review: before.managerB.forMe.review + 1, secondApproval: before.managerB.forMe.secondApproval + 1, toPay: before.managerB.forMe.toPay,
+    });
+    // Once let go they count for managerA again; the closed account's never does.
+    await post(managerB, `${W(held.id)}/release`);
+    await post(managerB, `${W(big.id)}/release`);
+    const after = await summary(managerA);
+    expect(after.forMe).toEqual({ review: before.managerA.forMe.review + 1, secondApproval: before.managerA.forMe.secondApproval + 1, toPay: before.managerA.forMe.toPay });
+    // Never more than "next" hands out: managerA gets every one it counted at each step, then nothing.
+    for (const [stage, n] of [["review", after.forMe.review], ["second", after.forMe.secondApproval], ["pay", after.forMe.toPay]] as const) {
+      const given: number[] = [];
+      for (let i = 0; i <= n; i++) given.push((await post(managerA, "/api/staff/withdrawals/next", { stage, skip: given })).body.id);
+      expect(given.slice(0, n).every((id) => typeof id === "number")).toBe(true);
+      expect(given[n]).toBeNull();
+      expect(given).not.toContain(shut.id);
+    }
+    await exec(env.db, "UPDATE withdrawals SET claimed_by = NULL, claimed_until = NULL");
+    await exec(env.db, "UPDATE clients SET status = 'active' WHERE id = ?", [closed.clientId]);
+    for (const x of [held, big, shut]) expect((await reject(managerA, x.id)).status).toBe(200);
+  });
+
+  it("shows where a withdrawal stands in its queue, who the client is, and what happened to it", async () => {
+    const clientId = await makeClient({ assigned: scoped.staffId });
+    await fund(clientId, 1_000_000);
+    const payout = await payoutMethod(clientId);
+    await paidEarlier(payout);
+    await exec(env.db, "UPDATE clients SET email_verified_at = CURRENT_TIMESTAMP(3) WHERE id = ?", [clientId]);
+    await exec(env.db, "INSERT INTO profile_pictures (owner_type, owner_id, mime, bytes, sha256, width, height) VALUES ('client', ?, 'image/png', ?, ?, 1, 1)", [
+      clientId, Buffer.from("png"), "cd".repeat(32),
+    ]);
+    const older = await withdraw(payout, 10_000, { createdAt: new Date(Date.now() - 2 * HOUR) });
+    const at = new Date(Date.now() - HOUR);
+    const single = await withdraw(payout, 10_000, { createdAt: at });
+    const big = await withdraw(payout, 150_000, { createdAt: at });
+    const clientActor = { actor: { type: "client" as const, id: clientId, label: "ali" }, ip: "", userAgent: "" };
+    await transaction(env.db, (conn) =>
+      writeAudit(conn, clientActor, { action: "withdrawal.requested", entityType: "client", entityId: clientId, meta: { withdrawalId: big.id, reference: big.reference } }),
+    );
+
+    // Within the step it waits for, oldest first (the same moment by id), among the clients this person may see.
+    const queueOf = async (s: SignedIn, id: number) => (await s.agent.get(W(id))).body.queue as { pending: number; position: number };
+    const first = await queueOf(scoped, older.id);
+    expect(first.pending).toBeGreaterThanOrEqual(3);
+    expect(await queueOf(scoped, single.id)).toEqual({ pending: first.pending, position: first.position + 1 });
+    expect(await queueOf(scoped, big.id)).toEqual({ pending: first.pending, position: first.position + 2 });
+
+    const picture = expect.stringMatching(new RegExp(`^/api/pictures/client/${clientId}\\?v=`));
+    expect((await agentA.agent.get(W(older.id))).body.client).toEqual({
+      id: clientId, name: "Ali Khan", verifiedName: "Ali Khan", email: expect.stringMatching(/@client\.test$/), avatarUrl: picture, status: "active", kycStatus: "approved",
+      country: "Pakistan", joinedAt: expect.any(String), assignedTo: { id: scoped.staffId, name: "scoped" }, emailVerified: true, createdAt: expect.any(String),
+    });
+    const listed = (await agentA.agent.get(`/api/staff/withdrawals?clientId=${clientId}`)).body.items as { client: { avatarUrl: string } }[];
+    expect(listed).toHaveLength(3);
+    for (const i of listed) expect(i.client.avatarUrl).toEqual(picture);
+
+    // Approved alone, ready to be paid.
+    const alone = await approve(agentA, single.id);
+    expect(alone.body.status).toBe("approved");
+    expect(alone.body.trail).toEqual([{ at: expect.any(String), action: "approved", label: "Approved, ready to be paid", staff: "agent.a", reason: null, internalNote: null }]);
+    expect(await queueOf(scoped, big.id)).toEqual({ pending: first.pending - 1, position: first.position + 1 });
+
+    // Taken over, approved first, sent back, approved again, given the second approval and paid.
+    expect((await post(agentB, `${W(big.id)}/claim`)).status).toBe(200);
+    expect((await post(agentA, `${W(big.id)}/claim`, { takeOver: true })).status).toBe(200);
+    expect((await approve(agentA, big.id, { note: "Called the client to confirm" })).body.status).toBe("second_approval");
+    const waiting = (await managerA.agent.get(W(big.id))).body;
+    expect(waiting.stage).toBe("second");
+    expect(waiting.queue.pending).toBeGreaterThanOrEqual(waiting.queue.position);
+    expect(waiting.queue.position).toBeGreaterThanOrEqual(1);
+    expect((await post(managerA, `${W(big.id)}/return`, { note: "The account name needs checking." })).status).toBe(200);
+    expect((await approve(agentA, big.id)).body.status).toBe("second_approval");
+    expect((await secondApprove(managerA, big.id)).body.status).toBe("approved");
+    const paid = await pay(managerB, big.id);
+    expect(paid.body.status).toBe("paid");
+    expect(paid.body.queue).toEqual({ pending: 0, position: 0 });
+    const reference = (await one<{ payout_reference: string }>(env.db, "SELECT payout_reference FROM withdrawals WHERE id = ?", [big.id]))!.payout_reference;
+    expect(paid.body.trail).toEqual([
+      { at: expect.any(String), action: "submitted", label: "Sent by the client", staff: null, reason: null, internalNote: null },
+      { at: expect.any(String), action: "review_taken_over", label: "Took over the review from agent.b", staff: "agent.a", reason: null, internalNote: null },
+      { at: expect.any(String), action: "first_approved", label: "First approval, waiting for a second approval", staff: "agent.a", reason: null, internalNote: "Called the client to confirm" },
+      { at: expect.any(String), action: "returned", label: "Sent back for a new review", staff: "manager.a", reason: null, internalNote: "The account name needs checking." },
+      { at: expect.any(String), action: "first_approved", label: "First approval, waiting for a second approval", staff: "agent.a", reason: null, internalNote: null },
+      { at: expect.any(String), action: "approved", label: "Second approval, ready to be paid", staff: "manager.a", reason: null, internalNote: null },
+      { at: expect.any(String), action: "paid", label: `Marked as paid, payout reference ${reference}`, staff: "manager.b", reason: null, internalNote: null },
+    ]);
+    expect((await auditOf("withdrawal.viewed", big.id)).length).toBeGreaterThan(0);
+
+    // Rejected, with the reason the client was given.
+    const no = await reject(managerA, older.id);
+    expect(no.body.trail).toEqual([
+      { at: expect.any(String), action: "rejected", label: "Rejected", staff: "manager.a", reason: "We could not send money to this account. Please check the account details and request again.", internalNote: null },
+    ]);
+    expect(no.body.queue).toEqual({ pending: 0, position: 0 });
+    expect((await reject(managerA, single.id)).status).toBe(200);
+  });
+
   it("warns about shared destinations, names, new accounts, security changes, fresh money and the closed loop", async () => {
     const clientId = await makeClient({ first: "Sara", last: "Ahmed", assigned: scoped.staffId });
     await fund(clientId, 10_000, { method: cryptoDeposit });
@@ -669,6 +791,10 @@ describe.skipIf(!hasDb)("staff withdrawals", () => {
       { tone: "warn", text: "This client deposited by crypto, but is withdrawing to bank." },
       { tone: "info", text: "Needs a second approval from another person." },
     ]);
+    expect(view.body.warningCount).toBe(7);
+    const counted = async (s: SignedIn) =>
+      new Map(((await s.agent.get(`/api/staff/withdrawals?clientId=${clientId}`)).body.items as { id: number; warningCount: number }[]).map((i) => [i.id, i.warningCount]));
+    expect((await counted(agentA)).get(w.id)).toBe(7);
     // A changed account number does.
     await transaction(env.db, (conn) =>
       writeAudit(conn, clientActor, { action: "payout_method.updated", entityType: "client", entityId: clientId, meta: { id: payout.id, fields: ["method_name", "account_number"] } }),
@@ -706,6 +832,16 @@ describe.skipIf(!hasDb)("staff withdrawals", () => {
     expect((await agentA.agent.get(W(w3.id))).body.warnings).toContainEqual({
       tone: "warn", text: "The client changed this payout account after asking for this withdrawal. The money goes to the details shown here, as they were when the client asked.",
     });
+    // Each row of the queue counts what its review screen shows, for whoever is looking.
+    for (const s of [agentA, scoped]) {
+      const listed = await counted(s);
+      expect([...listed.keys()].sort()).toEqual([w.id, w2.id, w3.id].sort());
+      for (const x of [w, w2, w3]) {
+        const one = (await s.agent.get(W(x.id))).body as { warningCount: number; warnings: { tone: string }[] };
+        expect(one.warningCount).toBe(one.warnings.filter((y) => y.tone !== "info").length);
+        expect(listed.get(x.id)).toBe(one.warningCount);
+      }
+    }
     for (const x of [w, w2, w3]) expect((await reject(agentA, x.id)).status).toBe(200);
   });
 

@@ -1,34 +1,34 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, BadgeCheck, CheckCircle2, Clock, ExternalLink, FileText, Hourglass, Play, UserCheck, X } from "lucide-react";
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
-import { Link, useLocation } from "wouter";
-import { DataGrid, gridQuery, type Column, type GridState } from "../components/DataGrid";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { CheckCircle2, Clock, ExternalLink, FileText, Hourglass } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Link } from "wouter";
+import { CATEGORY_LABEL, KycStatusBadge, useKycSummary, WHAT, type Category, type KycSubmission } from "../components/kyc";
+import { nothingLeft, queueTab, useNextItem, HoldNotices, type CanDo } from "../components/queue";
+import {
+  ClientCard,
+  clientColumn,
+  DecidedNotice,
+  decidedLine,
+  handledBy,
+  handledByColumn,
+  NextOnly,
+  NotYet,
+  positionText,
+  ReviewFootnote,
+  ReviewHistory,
+  ReviewItemMissing,
+  ReviewQueuePage,
+  statusColumn,
+  toldClient,
+  useReviewItem,
+  waitingColumn,
+  type CardClient,
+  type TrailItem,
+} from "../components/review";
 import { DecisionError, DocumentViewer, listOf, plainProblem, ReviewDecision, ReviewLayout, Waiting, Warnings, type ReviewFile, type ReviewWarning } from "../components/ReviewWorkbench";
-import { Avatar, Badge, Dialog, ErrorText, Field, PageHeader, Spinner, useFeedback } from "../components/ui";
-import { ApiError, api, formatDate, qs, type Page } from "../lib/api";
-import { KYC_TYPES } from "../../shared/kyc-types";
+import { Avatar, Badge, Spinner, useFeedback } from "../components/ui";
+import { ApiError, api, formatDate } from "../lib/api";
 import { useCan, useSession } from "../lib/session";
-
-type Category = "identity" | "address";
-
-export interface KycSubmission {
-  id: number;
-  /** `status` is read when the server sends it (not part of the current contract). */
-  client: { id: number; name: string; email: string; country: string | null; pictureUrl: string | null; status?: string };
-  category: Category;
-  categoryLabel: string;
-  documentType: string;
-  status: "pending" | "approved" | "rejected" | "withdrawn";
-  rejectReason: string | null;
-  submittedAt: string;
-  decidedAt: string | null;
-  decidedBy: string | null;
-  documents: number;
-  source: "client" | "staff";
-  uploadedBy: string | null;
-  staffNote: string | null;
-  claimedBy: { id: number; name: string | null; until: string } | null;
-}
 
 interface KycFile {
   id: number;
@@ -58,277 +58,105 @@ interface KycOther {
 }
 const otherFilesOf = (other: KycOther | null) => (other ? (other.files ?? (Array.isArray(other.documents) ? other.documents : [])) : []);
 
-interface KycTrailEntry {
-  at: string;
-  action: string;
-  label: string;
-  staff: string | null;
-  reason: string | null;
-  internalNote: string | null;
-}
-
-interface KycDetail extends KycSubmission {
+interface KycDetail extends Omit<KycSubmission, "client"> {
+  client: KycSubmission["client"] & Partial<CardClient>;
   files: KycFile[];
   profile: { name: string; dob: string | null; gender: string | null; country: string | null; city: string | null; address: string | null; zipcode: string | null } | null;
   history: (KycSubmission & { newer?: boolean })[];
   warnings: (ReviewWarning & { clientId?: number })[];
   checklist: { key: string; label: string }[];
   reasons: string[];
+  rejectReasons?: string[];
   /** The ready-made reason for a document that cannot be shown at all. */
   unreadableReason?: string;
+  /** The category while it waits for review. */
+  stage?: Category | null;
   queue: { pending: number; position: number };
+  can?: { approve: CanDo; reject: CanDo; requestNew: CanDo };
   mayApprove?: boolean;
   approveBlockedReason?: string | null;
-  /** This reviewer uploaded the documents (read when the server sends it; not part of the current contract). */
+  /** This reviewer uploaded the documents. */
   uploadedByMe?: boolean;
   isLatest?: boolean;
   other?: KycOther | null;
-  trail?: KycTrailEntry[];
+  trail?: TrailItem[];
 }
 
-interface Summary {
-  pending: number;
-  overdue: number;
-  oldestPendingAt: string | null;
-  decidedToday: number;
-  decidedTodayByMe: number;
-}
-
-const WHAT: Record<Category, string> = { identity: "proof of identity", address: "proof of address" };
-const CATEGORY_LABEL: Record<Category, string> = { identity: "Identity", address: "Proof of address" };
+type Tab = "pending" | "approved" | "rejected" | "withdrawn" | "all";
 // The server's approveBlockedReason for a closed account, where every decision is refused.
 const CLOSED = "This account is closed.";
 
-export const useKycSummary = (enabled = true) =>
-  useQuery({ queryKey: ["kyc-summary"], queryFn: () => api.get<Summary>("/api/staff/kyc/summary"), enabled, refetchInterval: 60_000 });
+// Items skipped in this browser tab, and the document type chosen with Start reviewing.
+const TAB = queueTab<Category>("kyc", ["identity", "address"]);
 
-export function KycStatusBadge({ status }: { status: KycSubmission["status"] | "none" | "partial" }) {
-  if (status === "approved") return <Badge tone="good">Approved</Badge>;
-  if (status === "partial") return <Badge tone="info">Partly verified</Badge>;
-  if (status === "rejected") return <Badge tone="bad">Rejected</Badge>;
-  if (status === "pending") return <Badge tone="warn">Waiting for review</Badge>;
-  if (status === "withdrawn") return <Badge tone="neutral">Taken back by client</Badge>;
-  return <Badge tone="neutral">Not submitted</Badge>;
-}
-
-// ---------- The reviewer's queue settings for this browser tab ----------
-// Items skipped in this tab, so "next" does not hand them straight back, and the
-// document type chosen with Start reviewing, so approve-and-next keeps to it.
-const SKIP_KEY = "kyc-skipped";
-const CATEGORY_KEY = "kyc-category";
-const queueListeners = new Set<() => void>();
-let queueVersion = 0;
-const readTab = (key: string): unknown => {
-  try {
-    return JSON.parse(sessionStorage.getItem(key) ?? "null");
-  } catch {
-    return null;
-  }
-};
-const writeTab = (key: string, value: unknown) => {
-  try {
-    if (value === null) sessionStorage.removeItem(key);
-    else sessionStorage.setItem(key, JSON.stringify(value));
-  } catch {
-    /* private mode */
-  }
-  queueVersion++;
-  queueListeners.forEach((fn) => fn());
-};
-const skipped = (): number[] => {
-  const v = readTab(SKIP_KEY);
-  return Array.isArray(v) ? v.filter((x): x is number => Number.isInteger(x)) : [];
-};
-const remember = (ids: number[]) => writeTab(SKIP_KEY, ids.length ? ids.slice(-200) : null);
-const nextCategory = (): Category | null => {
-  const v = readTab(CATEGORY_KEY);
-  return v === "identity" || v === "address" ? v : null;
-};
-const setNextCategory = (category: Category | null) => writeTab(CATEGORY_KEY, category);
-function useQueueTab() {
-  useSyncExternalStore(
-    (fn) => {
-      queueListeners.add(fn);
-      return () => queueListeners.delete(fn);
-    },
-    () => queueVersion,
-  );
-  return { skipped: skipped(), category: nextCategory() };
-}
-
-const nothingWaiting = (category: Category | null, skips: number) => {
-  const what = category ? `No more ${WHAT[category]} is` : "Nothing more is";
-  return skips ? `${what} waiting for you right now, apart from the ${skips === 1 ? "item" : `${skips} items`} you skipped.` : `${what} waiting for you right now.`;
-};
-
-function useNextItem() {
-  const [, navigate] = useLocation();
-  const { toast } = useFeedback();
-  const client = useQueryClient();
-  return useMutation({
-    mutationFn: (opts: { release?: number } = {}) => {
-      const category = nextCategory();
-      return api.post<{ id: number | null }>("/api/staff/kyc/next", { skip: skipped(), ...(category ? { category } : {}), ...opts });
-    },
-    onSuccess: (res) => {
-      void client.invalidateQueries({ queryKey: ["kyc-summary"] });
-      void client.invalidateQueries({ queryKey: ["kyc"] });
-      if (res.id) return navigate(`/kyc/${res.id}`);
-      toast(nothingWaiting(nextCategory(), skipped().length));
-      navigate("/kyc");
-    },
+const useKycNext = () =>
+  useNextItem({
+    base: "/api/staff/kyc",
+    route: "/kyc",
+    keys: ["kyc", "kyc-summary"],
+    tab: TAB,
+    nothing: (category, skips) => nothingLeft(category ? `No more ${WHAT[category]} is` : "Nothing more is", skips),
   });
-}
 
-const columns: Column<KycSubmission>[] = [
-  { key: "submitted_at", header: "Waiting", sortable: true, render: (s) => (s.status === "pending" ? <Waiting since={s.submittedAt} /> : <span className="muted">{formatDate(s.submittedAt)}</span>), width: "120px" },
-  {
-    key: "client",
-    header: "Client",
-    render: (s) => (
-      <span className="cell-person">
-        <Avatar name={s.client.name} src={s.client.pictureUrl} />
-        <span>
-          <strong>{s.client.name}</strong>
-          <small>
-            {s.client.email} · {s.client.id}
-          </small>
-        </span>
-      </span>
-    ),
-  },
-  { key: "what", header: "Document", render: (s) => `${s.categoryLabel}: ${s.documentType}` },
-  { key: "country", header: "Country", render: (s) => s.client.country ?? "–" },
-  {
-    key: "status",
-    header: "Status",
-    render: (s) =>
-      s.status === "pending" && s.claimedBy ? (
-        <Badge tone="info">Being reviewed by {s.claimedBy.name ?? "staff"}</Badge>
-      ) : (
-        <KycStatusBadge status={s.status} />
-      ),
-  },
-  { key: "decided", header: "Reviewed by", render: (s) => (s.decidedBy ? `${s.decidedBy}, ${formatDate(s.decidedAt)}` : <span className="muted">Not yet</span>) },
+const isPending = (s: { status: KycSubmission["status"] }) => s.status === "pending";
+
+const columns = [
+  waitingColumn<KycSubmission>("submitted_at", isPending, (s) => s.submittedAt),
+  clientColumn<KycSubmission>((s) => ({ ...s.client, avatarUrl: s.client.avatarUrl ?? s.client.pictureUrl })),
+  { key: "what", header: "Document", render: (s: KycSubmission) => `${s.categoryLabel}: ${s.documentType}` },
+  { key: "country", header: "Country", render: (s: KycSubmission) => s.client.country ?? "–" },
+  statusColumn<KycSubmission>({ badge: (s) => <KycStatusBadge status={s.status} />, open: isPending, claimedBy: (s) => s.claimedBy, warnings: (s) => s.warningCount }),
+  handledByColumn<KycSubmission>((s) =>
+    s.status === "withdrawn" ? <span className="muted">Taken back by the client</span> : s.decidedBy ? handledBy(s.status === "approved" ? "Approved" : "Rejected", s.decidedBy, s.decidedAt) : <NotYet />,
+  ),
 ];
-
-// The queue opens on what is waiting, oldest first; Clear comes back here.
-const QUEUE_FILTERS = { status: "pending" };
 
 export function KycReview() {
   const can = useCan();
-  const [, navigate] = useLocation();
-  const [state, setState] = useState<GridState>({ page: 1, pageSize: 25, sort: "submitted_at", dir: "asc", filters: { ...QUEUE_FILTERS } });
   const summary = useKycSummary();
-  const next = useNextItem();
-  const tab = useQueueTab();
-  const mayReview = can("kyc.decide", "kyc.documents");
-  const mayOpen = can("kyc.documents");
-  const status = state.filters.status ?? "";
-  const category = (state.filters.category || null) as Category | null;
-  const list = useQuery({
-    queryKey: ["kyc", state],
-    queryFn: () =>
-      api.get<Page<KycSubmission>>(
-        `/api/staff/kyc${qs({ ...gridQuery(state), status: status || "all", includeClosed: status === "pending" && state.filters.includeClosed === "1" ? "1" : undefined })}`,
-      ),
-    placeholderData: (prev) => prev,
-    refetchInterval: 30_000,
-  });
-  const onChange = (nextState: GridState) => {
-    // Waiting items read oldest first, decided ones newest first.
-    const newStatus = nextState.filters.status ?? "";
-    if (newStatus !== status && nextState.sort === state.sort && nextState.dir === state.dir) nextState = { ...nextState, dir: newStatus === "pending" ? "asc" : "desc" };
-    // "Show closed accounts" only applies to waiting items; a hidden filter must not look active.
-    if (newStatus !== "pending" && nextState.filters.includeClosed) {
-      const { includeClosed: _, ...rest } = nextState.filters;
-      nextState = { ...nextState, filters: rest };
-    }
-    setState(nextState);
-  };
-  const start = () => {
-    setNextCategory(category);
-    next.mutate({});
-  };
+  const next = useKycNext();
   const s = summary.data;
-  const tile = (icon: React.ReactNode, tone: string, label: string, value: React.ReactNode, foot: string) => (
-    <div className="tile">
-      <span className={`tile-icon ${tone}`}>{icon}</span>
-      <div>
-        <div className="tile-label">{label}</div>
-        <div className="tile-value">{value}</div>
-        <div className="tile-foot">{foot}</div>
-      </div>
-    </div>
-  );
   return (
-    <>
-      <PageHeader
-        title="KYC review"
-        description="Identity and proof-of-address documents from the client portal and app. Start reviewing to work through the queue oldest first, one item at a time."
-        actions={
-          mayReview && (
-            <button type="button" className="button button-primary" disabled={next.isPending || s?.pending === 0} onClick={start}>
-              {next.isPending ? <Spinner /> : <Play size={16} />} Start reviewing{category ? ` ${WHAT[category]}` : s?.pending ? ` (${s.pending})` : ""}
-            </button>
-          )
-        }
-      />
-      <ErrorText error={next.error} />
-      {mayReview && tab.skipped.length > 0 && (
-        <div className="notice notice-row">
-          <p>
-            You skipped {tab.skipped.length === 1 ? "an item" : `${tab.skipped.length} items`} in this tab, so Start reviewing passes over {tab.skipped.length === 1 ? "it" : "them"}.
-          </p>
-          <button
-            type="button"
-            className="button button-small"
-            disabled={next.isPending}
-            onClick={() => {
-              remember([]);
-              start();
-            }}
-          >
-            Review skipped items
-          </button>
-        </div>
-      )}
-      {summary.error && <p className="error-text">The queue summary could not be loaded. {summary.error instanceof Error ? summary.error.message : ""}</p>}
-      <div className="tiles">
-        {tile(<Hourglass size={20} />, "warn", "Waiting", s?.pending ?? "–", s ? (s.oldestPendingAt ? `Oldest sent ${formatDate(s.oldestPendingAt)}` : "Nothing waiting") : "")}
-        {tile(<Clock size={20} />, "bad", "Waiting over 24 hours", s?.overdue ?? "–", "Aim to clear these first")}
-        {tile(<CheckCircle2 size={20} />, "good", "Reviewed today", s?.decidedToday ?? "–", "By everyone")}
-        {tile(<UserCheck size={20} />, "", "Reviewed by you today", s?.decidedTodayByMe ?? "–", "Approved or rejected")}
-      </div>
-      <DataGrid
-        columns={columns}
-        rows={list.data?.items}
-        total={list.data?.total ?? 0}
-        pages={list.data?.pages ?? 1}
-        state={state}
-        onChange={onChange}
-        rowKey={(s) => s.id}
-        onRowClick={mayOpen ? (s) => navigate(`/kyc/${s.id}`) : undefined}
-        loading={list.isLoading}
-        error={list.error}
-        searchPlaceholder="Search client name, email or ID"
-        filters={[
-          { key: "status", label: "Status", options: [{ value: "pending", label: "Waiting for review" }, { value: "approved", label: "Approved" }, { value: "rejected", label: "Rejected" }] },
-          { key: "category", label: "Document", options: [{ value: "identity", label: "Identity" }, { value: "address", label: "Proof of address" }] },
-        ]}
-        defaultFilters={QUEUE_FILTERS}
-        toolbar={
-          status === "pending" && (
-            <label className="check grid-check">
-              <input type="checkbox" checked={state.filters.includeClosed === "1"} onChange={(e) => onChange({ ...state, page: 1, filters: { ...state.filters, includeClosed: e.target.checked ? "1" : "" } })} />
-              <span>Show closed accounts</span>
-            </label>
-          )
-        }
-        emptyTitle="Queue clear"
-        emptyText="Nothing is waiting for review. Documents appear here as soon as clients upload them."
-      />
-    </>
+    <ReviewQueuePage<KycSubmission, Tab, Category>
+      title="KYC review"
+      description="Identity and proof-of-address documents from the client portal and app. Start reviewing to work through the queue oldest first, one item at a time."
+      queue={TAB}
+      next={next}
+      mayReview={can("kyc.decide", "kyc.documents")}
+      // The Document filter on the Waiting tab keeps Start reviewing to that document type.
+      stageOf={(tab, filters) => (tab === "pending" && (filters.category === "identity" || filters.category === "address") ? filters.category : null)}
+      startLabel={(category) => (category ? `Start reviewing ${WHAT[category]}` : "Start reviewing")}
+      forMe={(category) => (s ? (category ? (s.forMeByCategory?.[category] ?? s.pending) : (s.forMe ?? s.pending)) : undefined)}
+      summaryError={summary.error}
+      tiles={[
+        { icon: <Hourglass size={20} />, tone: "warn", label: "Waiting", value: s?.pending ?? "–", foot: s ? (s.oldestPendingAt ? `Oldest sent ${formatDate(s.oldestPendingAt)}` : "Nothing waiting") : "" },
+        { icon: <Clock size={20} />, tone: "bad", label: "Waiting over 24 hours", value: s?.overdue ?? "–", foot: "Aim to clear these first" },
+        { icon: <CheckCircle2 size={20} />, tone: "good", label: "Decided today", value: s?.decidedToday ?? "–", foot: s ? `${s.decidedTodayByMe} by you` : "" },
+      ]}
+      tabs={[
+        { value: "pending", label: "Waiting", count: s?.pending, open: true },
+        { value: "approved", label: "Approved", open: false },
+        { value: "rejected", label: "Rejected", open: false },
+        { value: "withdrawn", label: "Taken back by client", open: false },
+        { value: "all", label: "All", open: false },
+      ]}
+      initialTab="pending"
+      listKey="kyc"
+      listUrl="/api/staff/kyc"
+      sort="submitted_at"
+      columns={columns}
+      rowKey={(s) => s.id}
+      filters={[{ key: "category", label: "Document", options: [{ value: "identity", label: "Identity" }, { value: "address", label: "Proof of address" }] }]}
+      searchPlaceholder="Search client name, email or ID"
+      rowHref={can("kyc.documents") ? (s) => `/kyc/${s.id}` : null}
+      noOpenText="Your role shows KYC status only. Opening a submission and its documents needs the KYC documents permission."
+      includeClosed
+      empty={(tab) =>
+        tab === "pending"
+          ? { title: "Queue clear", text: "Nothing is waiting for review. Documents appear here as soon as clients upload them." }
+          : { title: "Nothing here yet", text: "Submissions appear here once they reach this status." }
+      }
+    />
   );
 }
 
@@ -342,7 +170,7 @@ function ApproveLater({ id, clientId, checklist, hasFiles, blocked, unopened }: 
   const send = useMutation({
     mutationFn: () => api.post<KycSubmission>(`/api/staff/kyc/${id}/change`, { status: "approved", reason: reason.trim(), checklist: ticked }),
     onSuccess: (res) => {
-      toast(`Approved ${res.client.name}'s ${res.documentType}. The client has been told.`);
+      toast(`Approved ${res.client.name}'s ${res.documentType}. They have been told.`);
       setOpen(false);
       client.setQueryData(["kyc-detail", id], (old: KycDetail | undefined) => (old ? { ...old, ...res } : old));
       for (const key of [["kyc-detail", id], ["kyc"], ["kyc-summary"], ["client", String(clientId)], ["client-kyc", clientId], ["client-activity", String(clientId)]]) void client.invalidateQueries({ queryKey: key });
@@ -405,9 +233,9 @@ function RequestNewDocument({ id, clientId, reasons }: { id: number; clientId: n
   const [reason, setReason] = useState("");
   const [note, setNote] = useState("");
   const send = useMutation({
-    mutationFn: () => api.post<KycSubmission>(`/api/staff/kyc/${id}/request-new`, { reason: reason.trim(), ...(note.trim() ? { internalNote: note.trim() } : {}) }),
+    mutationFn: () => api.post<KycSubmission>(`/api/staff/kyc/${id}/request-new`, { reason: reason.trim(), ...(note.trim() ? { note: note.trim() } : {}) }),
     onSuccess: (res) => {
-      toast(`Asked ${res.client.name} for a new ${res.documentType}. The client has been told why.`);
+      toast(`Asked ${res.client.name} for a new ${res.documentType}. They have been told why.`);
       setOpen(false);
       setReason("");
       setNote("");
@@ -465,28 +293,6 @@ function RequestNewDocument({ id, clientId, reasons }: { id: number; clientId: n
 const fileLabel = (f: KycFile, count: number) => (count > 1 ? (f.slot === 1 ? "Front" : "Back") : "Document");
 const reviewFiles = (files: KycFile[]): ReviewFile[] => files.map((f) => ({ ...f, label: fileLabel(f, files.length) }));
 
-/** What happened to this submission, from the audit log, oldest first. */
-function Trail({ items }: { items: KycTrailEntry[] }) {
-  return (
-    <ol className="timeline trail">
-      {items.map((t, i) => {
-        const toClient = /(^|\.)(rejected|new_document_requested)$/.test(t.action);
-        return (
-          <li key={i} className={t.staff ? "by-staff" : ""}>
-            <strong>{t.label}</strong>
-            <small className="muted">
-              {formatDate(t.at)}
-              {t.staff ? ` · ${t.staff}` : ""}
-            </small>
-            {t.reason && <small>{toClient ? `Told the client: ${t.reason}` : t.action === "uploaded_by_staff" ? `Note: ${t.reason}` : `Reason: ${t.reason}`}</small>}
-            {t.internalNote && <small className="trail-note">Internal note: {t.internalNote}</small>}
-          </li>
-        );
-      })}
-    </ol>
-  );
-}
-
 /** The client's other document (identity when checking an address, and the other way round). */
 function OtherCategory({ category, other, showing, onToggle }: { category: Category; other: KycOther | null; showing: boolean; onToggle: () => void }) {
   const files = otherFilesOf(other);
@@ -520,35 +326,43 @@ function OtherCategory({ category, other, showing, onToggle }: { category: Categ
   );
 }
 
-const IDLE_MS = 10 * 60_000; // let go of an item after 10 minutes without any activity
-const RENEW_MS = 5 * 60_000; // the server holds a claim for 15 minutes
 
 export function KycWorkbench({ id }: { id: string }) {
   const can = useCan();
-  const session = useSession();
-  const me = session.staff.id;
-  const client = useQueryClient();
-  const [, navigate] = useLocation();
+  const me = useSession().staff.id;
   const { toast } = useFeedback();
-  const next = useNextItem();
-  const tab = useQueueTab();
+  const next = useKycNext();
+  const tab = TAB.useTab();
   const sid = Number(id);
-  // Opening a submission is audited, so do not refetch it in the background.
-  const detail = useQuery({ queryKey: ["kyc-detail", sid], queryFn: () => api.get<KycDetail>(`/api/staff/kyc/${sid}`), staleTime: Infinity, refetchOnWindowFocus: false });
-  const d = detail.data;
-  const pending = d?.status === "pending";
   const mayDecide = can("kyc.decide", "kyc.documents");
-  // Decisions on a closed account are refused, so there is nothing to hold or decide.
-  const closed = d?.client.status === "closed" || d?.approveBlockedReason === CLOSED;
-  // An item this reviewer can never finish (their own upload) stays free for colleagues. Until the server
-  // says which items are their own uploads, any item they may not approve counts as one.
-  const notForMe = typeof d?.uploadedByMe === "boolean" ? d.uploadedByMe || closed : d?.mayApprove === false;
-  // One already held for them (Start reviewing claims it) is always held, so it is renewed and let go properly.
-  const holdable = Boolean(pending && mayDecide && (!notForMe || d?.claimedBy?.id === me));
-  const heldByOther = useRef(false);
-  heldByOther.current = Boolean(d?.claimedBy && d.claimedBy.id !== me);
-  const [heldBy, setHeldBy] = useState<string | null>(null);
-  const [away, setAway] = useState(false);
+  const item = useReviewItem<KycDetail, "approve" | "reject", KycSubmission, Category>({
+    base: "/api/staff/kyc",
+    route: "/kyc",
+    id: sid,
+    detailKey: "kyc-detail",
+    queue: TAB,
+    next,
+    me,
+    isOpen: isPending,
+    holdable: (d) => {
+      // Decisions on a closed account are refused, so there is nothing to hold or decide.
+      const closed = d.client.status === "closed" || d.approveBlockedReason === CLOSED;
+      // An item this reviewer can never finish (their own upload) stays free for colleagues.
+      const notForMe = typeof d.uploadedByMe === "boolean" ? d.uploadedByMe || closed : d.mayApprove === false;
+      // One already held for them (Start reviewing claims it) is always held, so it is renewed and let go properly.
+      return isPending(d) && mayDecide && (!notForMe || d.claimedBy?.id === me);
+    },
+    claimedBy: (d) => d.claimedBy,
+    paths: { approve: "decision", reject: "decision" },
+    toast: (_x, res) =>
+      res.status === "approved" ? `Approved ${res.client.name}'s ${res.documentType}. They have been told.` : `Rejected ${res.client.name}'s ${res.documentType}. They have been told why.`,
+    clientId: (d) => d.client.id,
+    invalidate: (d) => [["clients"], ["client-kyc", d.client.id]],
+    listKeys: ["kyc", "kyc-summary"],
+    mayContinue: mayDecide,
+  });
+  const { d, hold } = item;
+  const pending = item.open;
   const [viewed, setViewed] = useState<ReadonlySet<number>>(() => new Set());
   // PDF pages seen so far, and each PDF's page count as the viewer read it.
   const [pagesSeen, setPagesSeen] = useState<ReadonlyMap<number, ReadonlySet<number>>>(() => new Map());
@@ -566,9 +380,6 @@ export function KycWorkbench({ id }: { id: string }) {
       if (!(e instanceof ApiError && e.code === "STEP_UP_REQUIRED")) toastRef.current(e instanceof ApiError ? e.message : "The file could not be downloaded.", "bad");
     });
   }, []);
-  const decided = useRef(false);
-  const lastActive = useRef(Date.now());
-  const lastRenew = useRef(0);
 
   // Documents the server already saw this reviewer open (for example before a reload) count as opened.
   useEffect(() => {
@@ -578,8 +389,7 @@ export function KycWorkbench({ id }: { id: string }) {
       for (const p of f.viewedPages ?? []) reported.current.add(`${f.id}:${p}`);
       if (f.viewedPages?.length) setPagesSeen((prev) => new Map(prev).set(f.id, new Set([...(prev.get(f.id) ?? []), ...f.viewedPages!])));
     }
-    if (d && d.status === "pending" && d.claimedBy && d.claimedBy.id !== me) setHeldBy(d.claimedBy.name ?? "Another reviewer");
-  }, [d, me]);
+  }, [d]);
   const markViewed = useCallback((fileId: number) => setViewed((prev) => (prev.has(fileId) ? prev : new Set(prev).add(fileId))), []);
   // Each PDF page drawn is reported once; it counts here only after the server recorded it, as approving checks there.
   // A dropped connection is retried a few times; after that the reviewer is told, and redrawing the page tries again.
@@ -602,117 +412,9 @@ export function KycWorkbench({ id }: { id: string }) {
     void send(0);
   }, []);
 
-  // Reload the item to learn who holds it now, or whether it was decided meanwhile.
-  const refresh = async () => {
-    const r = await detail.refetch();
-    const holder = r.data?.status === "pending" ? r.data.claimedBy : null;
-    setHeldBy(holder && holder.id !== me ? (holder.name ?? "Another reviewer") : null);
-  };
-  const claim = useMutation({
-    mutationFn: (takeOver: boolean) => api.post<{ claimedBy: KycSubmission["claimedBy"] }>(`/api/staff/kyc/${sid}/claim`, { takeOver }),
-    onSuccess: (res) => {
-      if (res.claimedBy?.id === me) {
-        lastRenew.current = Date.now();
-        setHeldBy(null);
-        setAway(false);
-      } else void refresh();
-    },
-    onError: (e) => {
-      if (e instanceof ApiError && (e.status === 409 || e.status === 400)) {
-        setAway(false);
-        void refresh();
-      }
-    },
-  });
-  const claimRef = useRef(claim.mutate);
-  claimRef.current = claim.mutate;
-
-  // Hold the item while the reviewer works on it. The hold is renewed only while
-  // they are active, given up after 10 idle minutes, and let go when they leave
-  // the item or close the tab.
-  useEffect(() => {
-    if (!holdable) return;
-    decided.current = false;
-    lastActive.current = Date.now();
-    // When someone else holds it, the screen already names them; claiming would only be refused (and reload the item).
-    if (!heldByOther.current) claimRef.current(false);
-    const release = () => void api.post(`/api/staff/kyc/${sid}/release`).catch(() => undefined);
-    const onActivity = () => {
-      lastActive.current = Date.now();
-    };
-    const activity = ["pointerdown", "pointermove", "keydown", "wheel", "scroll", "touchstart"];
-    activity.forEach((ev) => window.addEventListener(ev, onActivity, { capture: true, passive: true }));
-    const timer = setInterval(() => {
-      if (decided.current || !lastRenew.current) return;
-      const now = Date.now();
-      if (now - lastActive.current >= IDLE_MS) {
-        lastRenew.current = 0;
-        release();
-        setAway(true);
-      } else if (now - lastRenew.current >= RENEW_MS && lastActive.current > lastRenew.current) {
-        lastRenew.current = now;
-        claimRef.current(false);
-      }
-    }, 30_000);
-    const onHide = () => {
-      if (decided.current) return;
-      lastRenew.current = 0;
-      api.sendOnExit(`/api/staff/kyc/${sid}/release`);
-    };
-    const onShow = (e: PageTransitionEvent) => {
-      if (e.persisted && !decided.current) claimRef.current(false);
-    };
-    window.addEventListener("pagehide", onHide);
-    window.addEventListener("pageshow", onShow);
-    return () => {
-      clearInterval(timer);
-      activity.forEach((ev) => window.removeEventListener(ev, onActivity, { capture: true }));
-      window.removeEventListener("pagehide", onHide);
-      window.removeEventListener("pageshow", onShow);
-      lastRenew.current = 0;
-      if (!decided.current) release();
-    };
-  }, [sid, holdable]);
-
-  const decide = useMutation({
-    mutationFn: (body: { decision: "approve" | "reject"; reason?: string; checklist: string[]; internalNote?: string }) => api.post<KycSubmission>(`/api/staff/kyc/${sid}/decision`, body),
-    onSuccess: (res) => {
-      decided.current = true;
-      remember(skipped().filter((x) => x !== sid));
-      toast(res.status === "approved" ? `Approved ${res.client.name}'s ${res.documentType}. The client has been told.` : `Rejected ${res.client.name}'s ${res.documentType}. The client has been told why.`);
-      // Shown fresh if it is opened again, without fetching (and auditing) it now.
-      void client.invalidateQueries({ queryKey: ["kyc-detail", sid], refetchType: "none" });
-      for (const key of [["kyc"], ["kyc-summary"], ["client", String(res.client.id)], ["clients"], ["client-kyc", res.client.id], ["client-activity", String(res.client.id)]]) void client.invalidateQueries({ queryKey: key });
-      next.mutate({});
-    },
-    // Someone else may have decided or taken the item, or the rules changed: show the item as it is now.
-    // A refused field (such as a link in the note) is the reviewer's to fix, and reloading would audit another view.
-    onError: (e) => {
-      if (e instanceof ApiError && e.code !== "STEP_UP_REQUIRED" && !e.details?.length && [400, 403, 409].includes(e.status)) void refresh();
-    },
-  });
-  const skip = () => {
-    remember([...skipped().filter((x) => x !== sid), sid]);
-    decided.current = true;
-    next.mutate({ release: sid });
-  };
-  const back = () => navigate("/kyc");
-
-  if (detail.error)
-    return (
-      <>
-        <Link href="/kyc" className="back-link">
-          <ArrowLeft size={15} /> Queue
-        </Link>
-        <ErrorText error={detail.error} />
-      </>
-    );
-  if (!d)
-    return (
-      <div className="center-screen loading-block">
-        <Spinner size={22} />
-      </div>
-    );
+  if (!d || item.detail.error) return <ReviewItemMissing error={item.detail.error} route="/kyc" />;
+  const closed = d.client.status === "closed" || d.approveBlockedReason === CLOSED;
+  const heldBy = hold.heldBy;
   const p = d.profile;
   const files = reviewFiles(d.files);
   // What is left to open of each file, worded for the hint ("the back", "page 2 of the document"); null once fully opened.
@@ -732,12 +434,18 @@ export function KycWorkbench({ id }: { id: string }) {
   const other = d.other ?? null;
   const otherFiles = reviewFiles(otherFilesOf(other));
   const showingOther = showOther && otherFiles.length > 0;
-  const trail = d.trail ?? [];
   const latest = d.isLatest !== false;
   // History is newest first, so this is the client's current submission (a withdrawn upload does not count).
   const newer = d.history.find((h) => h.newer && h.status !== "withdrawn");
-  const approveBlocked = d.mayApprove === false ? (d.approveBlockedReason ?? "You cannot approve this submission.") : null;
-  const warnings: ReviewWarning[] = d.warnings.map((w) => (w.clientId ? { ...w, href: `/clients/${w.clientId}`, linkLabel: "Open that client" } : w));
+  const approveBlocked = d.can
+    ? d.can.approve.ok
+      ? null
+      : (d.can.approve.reason ?? "You cannot approve this submission.")
+    : d.mayApprove === false
+      ? (d.approveBlockedReason ?? "You cannot approve this submission.")
+      : null;
+  const reasons = d.rejectReasons?.length ? d.rejectReasons : d.reasons;
+  const warnings: ReviewWarning[] = d.warnings.map((w) => (w.clientId && !w.href ? { ...w, href: `/clients/${w.clientId}`, linkLabel: "Open that client" } : w));
   const blocked = !pending
     ? null
     : !mayDecide
@@ -745,12 +453,13 @@ export function KycWorkbench({ id }: { id: string }) {
       : closed
         ? "This account is closed. Reopen it before deciding."
         : heldBy
-        ? `${heldBy} is reviewing this right now.`
-        : null;
+          ? `${heldBy} is reviewing this right now.`
+          : null;
+  const requestNew = d.can?.requestNew ?? { ok: mayDecide, reason: null };
 
   return (
     <ReviewLayout
-      onBack={back}
+      onBack={item.back}
       title={
         <>
           {d.client.name} <KycStatusBadge status={d.status} />
@@ -767,19 +476,8 @@ export function KycWorkbench({ id }: { id: string }) {
           )}
         </>
       }
-      headExtra={
-        pending &&
-        mayDecide &&
-        tab.category && (
-          <span className="review-filter">
-            Next: {WHAT[tab.category]} only
-            <button type="button" className="icon-button" aria-label="Review every document type next" title="Review every document type next" onClick={() => setNextCategory(null)}>
-              <X size={14} />
-            </button>
-          </span>
-        )
-      }
-      position={pending ? `${d.queue.position} of ${d.queue.pending} waiting` : undefined}
+      headExtra={pending && mayDecide && tab.stage && <NextOnly what={WHAT[tab.stage]} clearLabel="Review every document type next" onClear={() => TAB.setStage(null)} />}
+      position={pending ? positionText(d.queue, `${WHAT[d.category].charAt(0).toUpperCase()}${WHAT[d.category].slice(1)}`) : undefined}
       evidence={
         <DocumentViewer
           files={showingOther ? otherFiles : files}
@@ -789,7 +487,7 @@ export function KycWorkbench({ id }: { id: string }) {
           onPageViewed={showingOther ? undefined : markPage}
           onDownload={can("kyc.download") ? download : undefined}
           onUnreadable={
-            !showingOther && pending && mayDecide && !heldBy && !away && !closed && d.unreadableReason ? () => setRejectWith({ reason: d.unreadableReason!, key: Date.now() }) : undefined
+            !showingOther && pending && mayDecide && !heldBy && !hold.away && !closed && d.unreadableReason ? () => setRejectWith({ reason: d.unreadableReason!, key: Date.now() }) : undefined
           }
           banner={
             showingOther &&
@@ -806,10 +504,11 @@ export function KycWorkbench({ id }: { id: string }) {
       }
       side={
         <>
-          <h3 className="flush">Compare with what the client entered</h3>
+          <ClientCard client={{ ...d.client, status: (d.client.status ?? "active") as CardClient["status"] }} picture={false} />
+          <h3>Compare with what the client entered</h3>
           <div className="review-person">
-            <Avatar name={d.client.name} src={d.client.pictureUrl} xl />
-            <small className="muted">{d.client.pictureUrl ? "Profile picture the client uploaded" : "No profile picture"}</small>
+            <Avatar name={d.client.name} src={d.client.avatarUrl ?? d.client.pictureUrl} xl />
+            <small className="muted">{(d.client.avatarUrl ?? d.client.pictureUrl) ? "Profile picture the client uploaded" : "No profile picture"}</small>
           </div>
           <dl className="details details-tight">
             <dt>Name</dt>
@@ -836,68 +535,35 @@ export function KycWorkbench({ id }: { id: string }) {
                 </dd>
               </>
             )}
-            <dt>Client</dt>
-            <dd>
-              {/* A new tab, so the item stays held and the ticked checks stay. */}
-              <a href={`/clients/${d.client.id}`} target="_blank" rel="noreferrer">
-                {d.client.id} · {d.client.email}
-              </a>
-            </dd>
           </dl>
           <OtherCategory category={otherCategory} other={other} showing={showingOther} onToggle={() => setShowOther(!showOther)} />
           <Warnings items={warnings} />
           {pending ? (
             <>
-              {away && (
-                <div className="notice notice-warn notice-row">
-                  <p>You were away for a while, so this item was released for other reviewers.</p>
-                  <button
-                    type="button"
-                    className="button button-small"
-                    disabled={claim.isPending}
-                    onClick={() => {
-                      lastActive.current = Date.now();
-                      claim.mutate(false);
-                    }}
-                  >
-                    Continue reviewing
-                  </button>
-                </div>
-              )}
-              {heldBy && holdable && (
-                <button type="button" className="button button-small" onClick={() => claim.mutate(true)} disabled={claim.isPending}>
-                  Take over the review
-                </button>
-              )}
+              <HoldNotices away={hold.away} heldBy={heldBy} holdable={item.holdable} busy={hold.claim.isPending} onResume={hold.resume} onTakeOver={() => hold.claim.mutate(true)} />
               <ReviewDecision
+                continues={item.mayContinue}
                 resetKey={sid}
                 checklist={d.checklist}
-                reasons={d.reasons}
-                busy={decide.isPending || next.isPending}
-                error={decide.error ?? next.error}
-                canDecide={mayDecide && !heldBy && !away && !closed}
+                reasons={reasons}
+                busy={item.decide.isPending || next.isPending}
+                error={item.decide.error ?? next.error}
+                canDecide={mayDecide && !heldBy && !hold.away && !closed}
                 blockedText={blocked}
                 approveBlocked={approveBlocked}
                 unopened={unopened}
                 rejectWith={rejectWith}
-                onApprove={(checklist, internalNote) => decide.mutate({ decision: "approve", checklist, internalNote })}
-                onReject={(reason, checklist, internalNote) => decide.mutate({ decision: "reject", reason, checklist, internalNote })}
-                onSkip={mayDecide ? skip : undefined}
-                onBack={back}
+                onApprove={(checklist, note) => item.decide.mutate({ kind: "approve", body: { decision: "approve", checklist, ...(note ? { note } : {}) } })}
+                onReject={(reason, checklist, note) => item.decide.mutate({ kind: "reject", body: { decision: "reject", reason, checklist, ...(note ? { note } : {}) } })}
+                onSkip={item.holdable ? item.skip : undefined}
+                onBack={item.back}
+                footnote={<ReviewFootnote recorded="Opening documents" held={item.holdable && !heldBy && !hold.away} />}
               />
-              <p className="muted tight">
-                Decisions ask for your 2FA code at most every few minutes. Opening documents is recorded in the audit log.
-                {holdable && !heldBy && !away ? " This item is held for you while you work on it." : ""}
-              </p>
             </>
           ) : (
-            <div className="notice">
-              <p>
-                {d.status === "withdrawn"
-                  ? "The client took this upload back before it was reviewed."
-                  : `${d.status === "approved" ? "Approved" : "Rejected"} by ${d.decidedBy ?? "staff"} on ${formatDate(d.decidedAt)}.${d.rejectReason ? ` Reason: ${d.rejectReason}` : ""}`}
-              </p>
-            </div>
+            <DecidedNotice>
+              {d.status === "withdrawn" ? "The client took this upload back before it was reviewed." : `${decidedLine(d.status === "approved" ? "Approved" : "Rejected", d.decidedBy, d.decidedAt)}${toldClient(d.rejectReason)}`}
+            </DecidedNotice>
           )}
           {!latest && newer && (
             <div className="notice notice-warn">
@@ -913,16 +579,11 @@ export function KycWorkbench({ id }: { id: string }) {
               </p>
             </div>
           )}
-          {latest && d.status === "approved" && mayDecide && <RequestNewDocument id={sid} clientId={d.client.id} reasons={d.reasons} />}
+          {latest && d.status === "approved" && mayDecide && (requestNew.ok ? <RequestNewDocument id={sid} clientId={d.client.id} reasons={reasons} /> : requestNew.reason && <p className="muted tight">{requestNew.reason}</p>)}
           {latest && d.status === "rejected" && mayDecide && (
             <ApproveLater id={sid} clientId={d.client.id} checklist={d.checklist} hasFiles={d.files.length > 0} blocked={approveBlocked} unopened={unopened} />
           )}
-          {trail.length > 0 && (
-            <>
-              <h3>What happened</h3>
-              <Trail items={trail} />
-            </>
-          )}
+          <ReviewHistory items={d.trail} />
           {d.history.length > 0 && (
             <>
               <h3>Other attempts</h3>
@@ -954,206 +615,5 @@ export function KycWorkbench({ id }: { id: string }) {
         </>
       }
     />
-  );
-}
-
-/** The KYC panel on a client's page. */
-export function ClientKyc({ clientId, status }: { clientId: number; status: "none" | "partial" | "pending" | "approved" | "rejected" }) {
-  const can = useCan();
-  const list = useQuery({
-    queryKey: ["client-kyc", clientId],
-    queryFn: () => api.get<Page<KycSubmission>>(`/api/staff/kyc${qs({ clientId, status: "all", pageSize: 50 })}`),
-    enabled: can("kyc.view"),
-  });
-  const mayOpen = can("kyc.documents");
-  // Newest first; an upload the client took back no longer counts.
-  const latest = (category: Category) => list.data?.items.find((s) => s.category === category && s.status !== "withdrawn");
-  const [action, setAction] = useState<{ category: Category; mode: "upload" | "approve" } | null>(null);
-  return (
-    <section className="panel">
-      <div className="card-head">
-        <h2 className="flush">
-          <BadgeCheck size={18} /> Verification
-        </h2>
-        <KycStatusBadge status={status} />
-      </div>
-      {!can("kyc.view") ? (
-        <p className="muted">You do not have access to KYC documents.</p>
-      ) : list.error ? (
-        <ErrorText error={list.error} />
-      ) : !list.data ? (
-        <Spinner />
-      ) : (
-        <dl className="details">
-          {(["identity", "address"] as const).map((cat) => {
-            const s = latest(cat);
-            const what = (
-              <>
-                <KycStatusBadge status={s?.status ?? "none"} /> {s?.documentType}
-              </>
-            );
-            return [
-              <dt key={`${cat}-t`}>{CATEGORY_LABEL[cat]}</dt>,
-              <dd key={`${cat}-d`}>
-                {s && mayOpen ? <Link href={`/kyc/${s.id}`}>{what}</Link> : what}
-                {s && (
-                  <small className="muted block">
-                    Sent {formatDate(s.submittedAt)}
-                    {s.decidedBy && (s.status === "approved" || s.status === "rejected") ? ` · ${s.status} by ${s.decidedBy}, ${formatDate(s.decidedAt)}` : ""}
-                  </small>
-                )}
-                {s?.rejectReason && <small className="muted block">Reason: {s.rejectReason}</small>}
-                {s?.source === "staff" && (
-                  <small className="muted block">
-                    {s.documents ? `Uploaded by ${s.uploadedBy}` : `Added without documents by ${s.uploadedBy}`}
-                    {s.staffNote ? `: ${s.staffNote}` : ""}
-                  </small>
-                )}
-                {(!s || s.status === "rejected") && (can("kyc.upload") || can("kyc.override")) && (
-                  <span className="kyc-actions">
-                    {can("kyc.upload") && (
-                      <button type="button" className="button button-small" onClick={() => setAction({ category: cat, mode: "upload" })}>
-                        Upload for client
-                      </button>
-                    )}
-                    {can("kyc.override") && (
-                      <button type="button" className="button button-small" onClick={() => setAction({ category: cat, mode: "approve" })}>
-                        Approve without documents
-                      </button>
-                    )}
-                  </span>
-                )}
-              </dd>,
-            ];
-          })}
-        </dl>
-      )}
-      {action && <StaffKycDialog clientId={clientId} category={action.category} mode={action.mode} onClose={() => setAction(null)} />}
-    </section>
-  );
-}
-
-/** A small preview of a chosen file, drawn on a canvas (blob: images are blocked by the CRM's content policy). */
-function ChosenFile({ file }: { file: File }) {
-  const ref = useRef<HTMLCanvasElement>(null);
-  const [preview, setPreview] = useState(false);
-  useEffect(() => {
-    let cancelled = false;
-    let bitmap: ImageBitmap | null = null;
-    setPreview(false);
-    if (!/^image\/(jpeg|png|webp)$/.test(file.type)) return;
-    createImageBitmap(file, { resizeWidth: 144, resizeQuality: "medium", imageOrientation: "from-image" })
-      .then((b) => {
-        bitmap = b;
-        const canvas = ref.current;
-        if (cancelled || !canvas) return;
-        canvas.width = b.width;
-        canvas.height = b.height;
-        canvas.getContext("2d")?.drawImage(b, 0, 0);
-        setPreview(true);
-      })
-      .catch(() => undefined);
-    return () => {
-      cancelled = true;
-      bitmap?.close();
-    };
-  }, [file]);
-  const size = file.size > 1024 * 1024 ? `${(file.size / 1024 / 1024).toFixed(1)} MB` : `${Math.ceil(file.size / 1024)} KB`;
-  return (
-    <span className="file-chosen">
-      <canvas ref={ref} className="file-thumb" hidden={!preview} aria-hidden />
-      {!preview && <FileText size={28} className="muted" />}
-      <span>
-        <strong>{file.name}</strong>
-        <small className="muted block">{size}</small>
-      </span>
-    </span>
-  );
-}
-
-/** Upload documents for the client, or approve without documents. Both ask for a 2FA code and are audited. */
-function StaffKycDialog({ clientId, category, mode, onClose }: { clientId: number; category: Category; mode: "upload" | "approve"; onClose: () => void }) {
-  const client = useQueryClient();
-  const { toast } = useFeedback();
-  const types = KYC_TYPES[category].subTypes;
-  const [subType, setSubType] = useState<number>(types[0]!.id);
-  const [files, setFiles] = useState<(File | null)[]>([null, null]);
-  const [note, setNote] = useState("");
-  const needs = types.find((t) => t.id === subType)?.documents ?? 1;
-  const what = WHAT[category];
-  const send = useMutation({
-    mutationFn: () => {
-      if (mode === "approve") return api.post<KycSubmission>("/api/staff/kyc/approve-without-documents", { clientId, category, subType, reason: note.trim() });
-      const form = new FormData();
-      form.set("client_id", String(clientId));
-      form.set("type", String(KYC_TYPES[category].type));
-      form.set("sub_type", String(subType));
-      form.set("note", note.trim());
-      files.slice(0, needs).forEach((f, i) => f && form.set(`document${i + 1}`, f));
-      return api.form<KycSubmission>("/api/staff/kyc/upload", form);
-    },
-    onSuccess: () => {
-      toast(mode === "approve" ? `The client's ${what} is approved without documents.` : `Uploaded. The ${what} is now waiting for another reviewer.`);
-      for (const key of [["kyc"], ["kyc-summary"], ["client", String(clientId)], ["client-kyc", clientId], ["client-activity", String(clientId)], ["clients"]]) void client.invalidateQueries({ queryKey: key });
-      onClose();
-    },
-  });
-  const ready = note.trim().length >= 5 && (mode === "approve" || files.slice(0, needs).every(Boolean));
-  return (
-    <Dialog open title={mode === "approve" ? `Approve ${what} without documents` : `Upload ${what} for the client`} onClose={onClose}>
-      <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          send.mutate();
-        }}
-      >
-        <p className="muted">
-          {mode === "approve"
-            ? "Use this only when the client was verified another way. The client is told they are verified, and the reason is kept in the audit log."
-            : "For documents the client sent another way, such as by email. Another reviewer approves them from the KYC queue."}
-        </p>
-        <Field label="Document type">
-          <select
-            className="input"
-            value={subType}
-            onChange={(e) => {
-              setSubType(Number(e.target.value));
-              // A file picked for another type must never go up unseen.
-              setFiles([null, null]);
-            }}
-          >
-            {types.map((t) => (
-              <option key={t.id} value={t.id}>
-                {t.name}
-              </option>
-            ))}
-          </select>
-        </Field>
-        {mode === "upload" &&
-          Array.from({ length: needs }, (_, i) => (
-            <Field key={`${subType}-${i}`} label={needs === 2 ? (i === 0 ? "Front" : "Back") : "Document"} hint="JPG, PNG, WebP or HEIC photo, or a PDF, up to 10 MB">
-              <input
-                className="input"
-                type="file"
-                accept="image/jpeg,image/png,image/webp,image/heic,.heic,application/pdf,.pdf"
-                onChange={(e) => setFiles((f) => f.map((old, j) => (j === i ? (e.target.files?.[0] ?? null) : old)))}
-              />
-              {files[i] && <ChosenFile file={files[i]} />}
-            </Field>
-          ))}
-        <Field label={mode === "approve" ? "How the client was verified" : "Where these documents came from"} hint="Kept in the audit log. You'll be asked for your 2FA code.">
-          <textarea className="input" value={note} onChange={(e) => setNote(e.target.value)} rows={2} maxLength={500} required />
-        </Field>
-        <ErrorText error={send.error} />
-        <div className="actions">
-          <button type="button" className="button" onClick={onClose}>
-            Cancel
-          </button>
-          <button type="submit" className="button button-primary" disabled={send.isPending || !ready}>
-            {send.isPending && <Spinner />} {mode === "approve" ? "Approve without documents" : "Upload"}
-          </button>
-        </div>
-      </form>
-    </Dialog>
   );
 }

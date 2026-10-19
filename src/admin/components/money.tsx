@@ -1,36 +1,19 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, Copy, RotateCcw, Wallet } from "lucide-react";
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
-import { Link, useLocation } from "wouter";
+import { useQuery } from "@tanstack/react-query";
+import { Check, Copy, Wallet } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Link } from "wouter";
 import { ApiError, api, formatDate } from "../lib/api";
 import { useCan } from "../lib/session";
-import { reopenItem } from "../lib/visits";
 import { DEPOSIT_STATUS_LABELS, NOT_PLAIN, WITHDRAWAL_STATUS_LABELS, type DepositStatus, type WithdrawalStatus } from "../../shared/money";
-import { DecisionError, plainProblem } from "./ReviewWorkbench";
-import { Badge, ErrorText, Spinner, useFeedback, type Tone } from "./ui";
+import { Badge, ErrorText, Spinner, reviewTone, type ReviewState } from "./ui";
 
 // Pieces shared by the deposit, withdrawal and payment method screens. Amounts
 // arrive from the staff API as integer cents (minor units) and are only ever
 // turned into text here, never into floats used for arithmetic.
 
-export interface Person {
-  id: number;
-  name: string | null;
-}
-export interface Claimer extends Person {
-  until: string;
-}
-/** Whether a step is possible for this reviewer right now, and why not. */
-export interface CanDo {
-  ok: boolean;
-  reason: string | null;
-}
-export interface MoneyNote {
-  at: string;
-  byName: string | null;
-  stage: string;
-  text: string;
-}
+// The queue plumbing (tiles, tabs, skipping, holding an item, sending it back)
+// moved to ./queue so KYC and IB applications share it too.
+export { HoldNotices, QueueTabs, SendBack, SkippedNotice, Tile, nothingLeft, queueTab, useHold, useNextItem, type CanDo, type Claimer, type Person, type QueueTab } from "./queue";
 
 // ---------- Amounts ----------
 
@@ -125,46 +108,18 @@ export function textProblem(text: string, label: string, min: number, max: numbe
 
 // ---------- Labels ----------
 
-const DEPOSIT_TONE: Record<DepositStatus, Tone> = { pending: "warn", second_approval: "info", approved: "good", rejected: "bad" };
-const WITHDRAWAL_TONE: Record<WithdrawalStatus, Tone> = { pending: "warn", second_approval: "info", approved: "info", paid: "good", rejected: "bad" };
+const DEPOSIT_STATE: Record<DepositStatus, ReviewState> = { pending: "waiting", second_approval: "later", approved: "done", rejected: "refused" };
+// An approved withdrawal still has to be paid: a later step, not done.
+const WITHDRAWAL_STATE: Record<WithdrawalStatus, ReviewState> = { pending: "waiting", second_approval: "later", approved: "later", paid: "done", rejected: "refused" };
 
-export const DepositStatusBadge = ({ status }: { status: DepositStatus }) => <Badge tone={DEPOSIT_TONE[status] ?? "neutral"}>{DEPOSIT_STATUS_LABELS[status] ?? status}</Badge>;
-export const WithdrawalStatusBadge = ({ status }: { status: WithdrawalStatus }) => <Badge tone={WITHDRAWAL_TONE[status] ?? "neutral"}>{WITHDRAWAL_STATUS_LABELS[status] ?? status}</Badge>;
+export const DepositStatusBadge = ({ status }: { status: DepositStatus }) => <Badge tone={DEPOSIT_STATE[status] ? reviewTone(DEPOSIT_STATE[status]) : "neutral"}>{DEPOSIT_STATUS_LABELS[status] ?? status}</Badge>;
+export const WithdrawalStatusBadge = ({ status }: { status: WithdrawalStatus }) => (
+  <Badge tone={WITHDRAWAL_STATE[status] ? reviewTone(WITHDRAWAL_STATE[status]) : "neutral"}>{WITHDRAWAL_STATUS_LABELS[status] ?? status}</Badge>
+);
 
 export const NETWORK_LABEL: Record<string, string> = { trc20: "TRC20", bep20: "BEP20", binance_pay: "Binance Pay" };
 export const networkLabel = (network: string | null | undefined) => (network ? (NETWORK_LABEL[network] ?? network) : "");
 export const KIND_LABEL: Record<string, string> = { bank: "Bank", crypto: "Crypto" };
-
-const NOTE_STAGE: Record<string, string> = {
-  first_approval: "First approval",
-  second_approval: "Second approval",
-  returned: "Sent back",
-  approved: "Approved",
-  paid: "Paid",
-  rejected: "Rejected",
-};
-
-/** Internal notes left at each step, oldest first. The client never sees them. */
-export function NotesTrail({ notes }: { notes: MoneyNote[] | null | undefined }) {
-  if (!notes?.length) return null;
-  return (
-    <>
-      <h3>Internal notes</h3>
-      <ol className="timeline trail">
-        {notes.map((n, i) => (
-          <li key={i} className="by-staff">
-            <strong>{NOTE_STAGE[n.stage] ?? n.stage}</strong>
-            <small className="muted">
-              {formatDate(n.at)}
-              {n.byName ? ` · ${n.byName}` : ""}
-            </small>
-            <small className="trail-note">{n.text}</small>
-          </li>
-        ))}
-      </ol>
-    </>
-  );
-}
 
 /** A value with a small copy button, for references, account numbers and addresses. */
 export function CopyText({ value, label }: { value: string; label: string }) {
@@ -189,34 +144,6 @@ export function CopyText({ value, label }: { value: string; label: string }) {
         {copied ? "Copied" : "Copy"}
       </button>
     </span>
-  );
-}
-
-/** A summary tile, as on the KYC queue. */
-export function Tile({ icon, tone, label, value, foot }: { icon: ReactNode; tone: string; label: string; value: ReactNode; foot: string }) {
-  return (
-    <div className="tile">
-      <span className={`tile-icon ${tone}`}>{icon}</span>
-      <div>
-        <div className="tile-label">{label}</div>
-        <div className="tile-value">{value}</div>
-        <div className="tile-foot">{foot}</div>
-      </div>
-    </div>
-  );
-}
-
-/** Status tabs above a queue, with the number waiting where it is known. */
-export function QueueTabs<T extends string>({ value, options, onChange }: { value: T; options: { value: T; label: string; count?: number }[]; onChange: (v: T) => void }) {
-  return (
-    <div className="tabs" role="tablist" aria-label="Status" style={{ marginBottom: 14 }}>
-      {options.map((o) => (
-        <button key={o.value} type="button" role="tab" aria-selected={value === o.value} onClick={() => onChange(o.value)}>
-          {o.label}
-          {o.count ? <Badge tone="warn">{o.count > 999 ? "999+" : o.count}</Badge> : null}
-        </button>
-      ))}
-    </div>
   );
 }
 
@@ -268,270 +195,6 @@ export function ImageCanvas({ url, size = 180, label }: { url: string; size?: nu
   );
 }
 
-// ---------- Queue position for this browser tab ----------
-// Items skipped in this tab, so "next" does not hand them straight back, and the
-// step chosen with Start reviewing, so approve-and-next keeps to it.
-
-export interface QueueTab<S extends string> {
-  skipped: () => number[];
-  remember: (ids: number[]) => void;
-  stage: () => S | null;
-  setStage: (stage: S | null) => void;
-  useTab: () => { skipped: number[]; stage: S | null };
-}
-
-export function queueTab<S extends string>(name: string, stages: readonly S[]): QueueTab<S> {
-  const skipKey = `${name}-skipped`;
-  const stageKey = `${name}-stage`;
-  const listeners = new Set<() => void>();
-  let version = 0;
-  const read = (key: string): unknown => {
-    try {
-      return JSON.parse(sessionStorage.getItem(key) ?? "null");
-    } catch {
-      return null;
-    }
-  };
-  const write = (key: string, value: unknown) => {
-    try {
-      if (value === null) sessionStorage.removeItem(key);
-      else sessionStorage.setItem(key, JSON.stringify(value));
-    } catch {
-      /* private mode */
-    }
-    version++;
-    listeners.forEach((fn) => fn());
-  };
-  const skipped = () => {
-    const v = read(skipKey);
-    return Array.isArray(v) ? v.filter((x): x is number => Number.isInteger(x)) : [];
-  };
-  const stage = () => {
-    const v = read(stageKey);
-    return (stages as readonly unknown[]).includes(v) ? (v as S) : null;
-  };
-  const subscribe = (fn: () => void) => {
-    listeners.add(fn);
-    return () => void listeners.delete(fn);
-  };
-  const snapshot = () => version;
-  return {
-    skipped,
-    remember: (ids) => write(skipKey, ids.length ? ids.slice(-200) : null),
-    stage,
-    setStage: (s) => write(stageKey, s),
-    useTab: () => {
-      useSyncExternalStore(subscribe, snapshot);
-      return { skipped: skipped(), stage: stage() };
-    },
-  };
-}
-
-/** "Start reviewing" and approve-and-next: claims the oldest item this reviewer can act on, or goes back to the queue. */
-export function useNextItem<S extends string>({ base, route, keys, tab, nothing }: { base: string; route: string; keys: string[]; tab: QueueTab<S>; nothing: (stage: S | null, skips: number) => string }) {
-  const [location, navigate] = useLocation();
-  const { toast } = useFeedback();
-  const client = useQueryClient();
-  return useMutation({
-    mutationFn: (opts: { release?: number } = {}) => {
-      const stage = tab.stage();
-      return api.post<{ id: number | null }>(`${base}/next`, { skip: tab.skipped(), ...(stage ? { stage } : {}), ...opts });
-    },
-    onSuccess: (res) => {
-      for (const key of keys) void client.invalidateQueries({ queryKey: [key] });
-      if (res.id) {
-        if (location === `${route}/${res.id}`) reopenItem();
-        return navigate(`${route}/${res.id}`);
-      }
-      toast(nothing(tab.stage(), tab.skipped().length));
-      navigate(route);
-    },
-  });
-}
-
-export const nothingLeft = (what: string, skips: number) =>
-  skips ? `${what} waiting for you right now, apart from the ${skips === 1 ? "item" : `${skips} items`} you skipped.` : `${what} waiting for you right now.`;
-
-/** The notice about skipped items, with a way to go through them again. */
-export function SkippedNotice({ count, busy, onReview }: { count: number; busy: boolean; onReview: () => void }) {
-  if (!count) return null;
-  return (
-    <div className="notice notice-row">
-      <p>
-        You skipped {count === 1 ? "an item" : `${count} items`} in this tab, so Start reviewing passes over {count === 1 ? "it" : "them"}.
-      </p>
-      <button type="button" className="button button-small" disabled={busy} onClick={onReview}>
-        Review skipped items
-      </button>
-    </div>
-  );
-}
-
-// ---------- Holding an item while it is reviewed ----------
-
-const IDLE_MS = 10 * 60_000; // let go of an item after 10 minutes without any activity
-const RENEW_MS = 5 * 60_000; // the server holds a claim for 15 minutes
-
-/**
- * Holds an item for this reviewer while they work on it, as on the KYC screen:
- * claimed when opened (unless someone else holds it), renewed only while they
- * are active, given up after 10 idle minutes, and let go when they leave the
- * item or close the tab. `reload` fetches the item again and returns who holds
- * it now (null when nobody does or it is no longer waiting).
- */
-export function useHold({ base, id, me, open, holdable, claimedBy, reload }: { base: string; id: number; me: number; open: boolean; holdable: boolean; claimedBy: Claimer | null | undefined; reload: () => Promise<Claimer | null | undefined> }) {
-  const heldByOther = useRef(false);
-  heldByOther.current = Boolean(claimedBy && claimedBy.id !== me);
-  const [heldBy, setHeldBy] = useState<string | null>(null);
-  const [away, setAway] = useState(false);
-  const decided = useRef(false);
-  const lastActive = useRef(Date.now());
-  const lastRenew = useRef(0);
-  const reloadRef = useRef(reload);
-  reloadRef.current = reload;
-
-  useEffect(() => {
-    if (open && claimedBy && claimedBy.id !== me) setHeldBy(claimedBy.name ?? "Another reviewer");
-  }, [open, claimedBy?.id, claimedBy?.name, me]);
-
-  const refresh = useCallback(async () => {
-    const holder = await reloadRef.current();
-    setHeldBy(holder && holder.id !== me ? (holder.name ?? "Another reviewer") : null);
-  }, [me]);
-
-  const claim = useMutation({
-    mutationFn: (takeOver: boolean) => api.post<{ claimedBy?: Claimer | null }>(`${base}/${id}/claim`, { takeOver }),
-    onSuccess: (res, takeOver) => {
-      const holder = res?.claimedBy;
-      if (holder === undefined || holder?.id === me) {
-        lastRenew.current = Date.now();
-        setHeldBy(null);
-        setAway(false);
-        // What this reviewer may do was worked out while a colleague held the item: load it again.
-        if (takeOver) void reloadRef.current();
-      } else void refresh();
-    },
-    onError: (e) => {
-      if (e instanceof ApiError && (e.status === 409 || e.status === 400)) {
-        setAway(false);
-        void refresh();
-      }
-    },
-  });
-  const claimRef = useRef(claim.mutate);
-  claimRef.current = claim.mutate;
-
-  useEffect(() => {
-    if (!holdable) return;
-    decided.current = false;
-    lastActive.current = Date.now();
-    // When someone else holds it, the screen already names them; claiming would only be refused.
-    if (!heldByOther.current) claimRef.current(false);
-    const release = () => void api.post(`${base}/${id}/release`).catch(() => undefined);
-    const onActivity = () => {
-      lastActive.current = Date.now();
-    };
-    const activity = ["pointerdown", "pointermove", "keydown", "wheel", "scroll", "touchstart"];
-    activity.forEach((ev) => window.addEventListener(ev, onActivity, { capture: true, passive: true }));
-    const timer = setInterval(() => {
-      if (decided.current || !lastRenew.current) return;
-      const now = Date.now();
-      if (now - lastActive.current >= IDLE_MS) {
-        lastRenew.current = 0;
-        release();
-        setAway(true);
-      } else if (now - lastRenew.current >= RENEW_MS && lastActive.current > lastRenew.current) {
-        lastRenew.current = now;
-        claimRef.current(false);
-      }
-    }, 30_000);
-    const onHide = () => {
-      if (decided.current) return;
-      lastRenew.current = 0;
-      api.sendOnExit(`${base}/${id}/release`);
-    };
-    const onShow = (e: PageTransitionEvent) => {
-      if (e.persisted && !decided.current) claimRef.current(false);
-    };
-    window.addEventListener("pagehide", onHide);
-    window.addEventListener("pageshow", onShow);
-    return () => {
-      clearInterval(timer);
-      activity.forEach((ev) => window.removeEventListener(ev, onActivity, { capture: true }));
-      window.removeEventListener("pagehide", onHide);
-      window.removeEventListener("pageshow", onShow);
-      lastRenew.current = 0;
-      if (!decided.current) release();
-    };
-  }, [base, id, holdable]);
-
-  const resume = () => {
-    lastActive.current = Date.now();
-    claim.mutate(false);
-  };
-  return { heldBy, away, claim, decided, refresh, resume };
-}
-
-/** The "released while you were away" notice and the take-over button, under the warnings. */
-export function HoldNotices({ away, heldBy, holdable, busy, onResume, onTakeOver }: { away: boolean; heldBy: string | null; holdable: boolean; busy: boolean; onResume: () => void; onTakeOver: () => void }) {
-  return (
-    <>
-      {away && (
-        <div className="notice notice-warn notice-row">
-          <p>You were away for a while, so this item was released for other reviewers.</p>
-          <button type="button" className="button button-small" disabled={busy} onClick={onResume}>
-            Continue reviewing
-          </button>
-        </div>
-      )}
-      {heldBy && holdable && (
-        <button type="button" className="button button-small" onClick={onTakeOver} disabled={busy}>
-          Take over the review
-        </button>
-      )}
-    </>
-  );
-}
-
-/** Sends an item back to the earlier step with a note for colleagues (second approval only). */
-export function SendBack({ label, help, blocked, busy, error, onSend }: { label: string; help: string; blocked: string | null; busy: boolean; error: unknown; onSend: (note: string) => void }) {
-  const [open, setOpen] = useState(false);
-  const [note, setNote] = useState("");
-  const problem = plainProblem(note, "note");
-  if (blocked) return <p className="muted tight">{blocked}</p>;
-  if (!open)
-    return (
-      <button type="button" className="button button-small" disabled={busy} onClick={() => setOpen(true)}>
-        <RotateCcw size={14} /> {label}
-      </button>
-    );
-  return (
-    <form
-      className="stack"
-      onSubmit={(e) => {
-        e.preventDefault();
-        if (note.trim().length >= 5 && !problem) onSend(note.trim());
-      }}
-    >
-      <p className="muted tight">{help}</p>
-      <label className="review-note">
-        <span className="field-label">What needs another look (internal, never shown to the client)</span>
-        <textarea className="input" rows={2} maxLength={500} value={note} onChange={(e) => setNote(e.target.value)} autoFocus />
-      </label>
-      {problem && <small className="error-text">{problem}</small>}
-      <DecisionError error={error} />
-      <div className="actions actions-left">
-        <button type="submit" className="button button-primary" disabled={busy || note.trim().length < 5 || !!problem}>
-          {busy && <Spinner />} {label}
-        </button>
-        <button type="button" className="button button-ghost" onClick={() => setOpen(false)}>
-          Cancel
-        </button>
-      </div>
-    </form>
-  );
-}
-
 // ---------- Queue summaries (also used for the navigation badges) ----------
 
 export interface DepositSummary {
@@ -542,6 +205,8 @@ export interface DepositSummary {
   decidedToday: number;
   decidedTodayByMe: number;
   secondApprovalForMe: number;
+  /** What Start reviewing would hand this reviewer now at each step (leaves out items colleagues hold). */
+  forMe?: { first: number; second: number };
 }
 
 export interface WithdrawalSummary {
@@ -551,7 +216,7 @@ export interface WithdrawalSummary {
   overdue: number;
   oldestOpenAt: string | null;
   decidedToday: number;
-  decidedTodayByMe?: number;
+  decidedTodayByMe: number;
   forMe: { review: number; secondApproval: number; toPay: number };
 }
 
@@ -567,6 +232,7 @@ export function useDepositsForMe() {
   const mine = can("deposit.view", "deposit.proof") && (can("deposit.process") || can("deposit.approve_large"));
   const s = useDepositSummary(mine).data;
   if (!mine || !s) return 0;
+  if (s.forMe) return s.forMe.first + s.forMe.second;
   return (can("deposit.process") ? s.pending : 0) + (can("deposit.approve_large") ? s.secondApprovalForMe : 0);
 }
 

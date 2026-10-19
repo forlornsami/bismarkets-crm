@@ -5,7 +5,7 @@ import type { Permission } from "@shared/permissions";
 import type { AppDeps } from "../../app";
 import { lockClient } from "../../clients/kyc";
 import { withdrawalDestinationContext } from "../../clients/money";
-import { clientName, type ClientRow } from "../../clients/model";
+import { clientName, clientPictureUrl, type ClientRow } from "../../clients/model";
 import { notifyClient } from "../../clients/notifications";
 import { auditContext, writeAudit } from "../../lib/audit";
 import { decryptBytes, sha256 } from "../../lib/crypto";
@@ -15,6 +15,7 @@ import { queueSupportEvent } from "../../lib/events";
 import { badRequest, conflict, forbidden, handler, HttpError, notFound, parse, unauthorized } from "../../lib/http";
 import { likeTerm, listQuery, toPage } from "../../lib/pagination";
 import { activeClaim, assertNotClaimedByOther, claim, CLAIM_MINUTES, release } from "../../lib/review";
+import { reviewClient, reviewTrail, tookOver, type TrailStep } from "../../lib/review-detail";
 import { money } from "../../money/amounts";
 import { holdAccount, lockWallet, payoutAccount, postLedger, walletAccount } from "../../money/ledger";
 import { compareNames } from "../../money/names";
@@ -130,6 +131,7 @@ interface Row {
   country: string | null;
   assigned_staff_id: number | null;
   client_created_at: Date;
+  picture_sha: string | null;
   type_name: string;
   kind: "bank" | "crypto";
   type_network: string;
@@ -143,10 +145,11 @@ const SELECT = `SELECT w.id, w.reference, w.client_id, w.wallet_id, w.payout_met
   w.first_reviewed_by, w.first_reviewed_at, fr.name AS first_reviewer_name, w.approved_by, w.approved_at, ap.name AS approver_name,
   w.paid_by, w.paid_at, pb.name AS payer_name, w.payout_reference, DATE_FORMAT(w.paid_on, '%Y-%m-%d') AS paid_on,
   w.decided_by, w.decided_at, dc.name AS decider_name, w.claimed_by, w.claimed_until, cl.name AS claimer_name, w.created_at,
-  c.first_name, c.last_name, c.email, c.status AS client_status, c.kyc_status, c.country, c.assigned_staff_id, c.created_at AS client_created_at,
+  c.first_name, c.last_name, c.email, c.status AS client_status, c.kyc_status, c.country, c.assigned_staff_id, c.created_at AS client_created_at, pp.sha256 AS picture_sha,
   pm.name AS type_name, pm.kind, pm.network AS type_network, pm.ask_qr AS type_ask_qr,
   EXISTS (SELECT 1 FROM withdrawals p WHERE p.client_id = w.client_id AND p.status = 'paid' AND p.id <> w.id) AS paid_before
   FROM withdrawals w JOIN clients c ON c.id = w.client_id JOIN payment_methods pm ON pm.id = w.payment_method_id
+  LEFT JOIN profile_pictures pp ON pp.owner_type = 'client' AND pp.owner_id = w.client_id
   LEFT JOIN staff_users fr ON fr.id = w.first_reviewed_by LEFT JOIN staff_users ap ON ap.id = w.approved_by LEFT JOIN staff_users pb ON pb.id = w.paid_by
   LEFT JOIN staff_users dc ON dc.id = w.decided_by LEFT JOIN staff_users cl ON cl.id = w.claimed_by`;
 
@@ -187,6 +190,17 @@ const SECURITY_ACTIONS: Record<string, string> = {
 };
 
 type Action = "approve" | "secondApprove" | "pay" | "reject" | "returnToReview";
+
+// What happened to a withdrawal, from the audit log: the decisions, never who opened it.
+const TRAIL: Record<string, TrailStep> = {
+  "withdrawal.requested": { action: "submitted", label: "Sent by the client" },
+  "withdrawal.first_approved": { action: "first_approved", label: "First approval, waiting for a second approval" },
+  "withdrawal.approved": { action: "approved", label: (meta) => (meta.stage === "second" ? "Second approval, ready to be paid" : "Approved, ready to be paid") },
+  "withdrawal.returned": { action: "returned", label: "Sent back for a new review" },
+  "withdrawal.paid": { action: "paid", label: (meta) => (typeof meta.payoutReference === "string" ? `Marked as paid, payout reference ${meta.payoutReference}` : "Marked as paid") },
+  "withdrawal.rejected": { action: "rejected", label: "Rejected" },
+  "withdrawal.review_taken_over": { action: "review_taken_over", label: tookOver },
+};
 const STAGE: Partial<Record<WithdrawalStatus, "review" | "second" | "pay">> = { pending: "review", second_approval: "second", approved: "pay" };
 
 /** Who alone approved this withdrawal for payment, or null when two people did. */
@@ -289,8 +303,10 @@ export function staffWithdrawalsRouter(deps: AppDeps): Router {
    * second connection while holding one, which hangs the server once every
    * connection does.
    */
-  async function clientOfWithdrawal(withdrawalId: number) {
-    const ref = await one<{ client_id: number }>(db, "SELECT client_id FROM withdrawals WHERE id = ?", [withdrawalId]);
+  async function clientOfWithdrawal(staff: StaffContext, withdrawalId: number) {
+    // Scoped first, so nobody takes locks on a client they may not see.
+    const s = clientScope(staff);
+    const ref = await one<{ client_id: number }>(db, `SELECT w.client_id FROM withdrawals w JOIN clients c ON c.id = w.client_id WHERE w.id = ?${s.sql}`, [withdrawalId, ...s.params]);
     if (!ref) throw notFound(NOT_FOUND);
     return ref.client_id;
   }
@@ -336,6 +352,8 @@ export function staffWithdrawalsRouter(deps: AppDeps): Router {
       clientEmail: r.email,
       clientStatus: r.client_status,
       kycStatus: r.kyc_status,
+      // The client as every review queue lists them (the fields above stay for older screens).
+      client: { id: r.client_id, name: clientName(r), email: r.email, avatarUrl: clientPictureUrl("", r.client_id, r.picture_sha), country: r.country, status: r.client_status },
       methodName: d?.methodName ?? r.method_name,
       typeName: d?.typeName ?? r.type_name,
       kind: d?.kind ?? r.kind,
@@ -367,9 +385,6 @@ export function staffWithdrawalsRouter(deps: AppDeps): Router {
     deleted_at: Date | null;
   }
 
-  const payoutMethodOf = (r: Row) =>
-    one<PayoutRow>(db, "SELECT id, client_id, fingerprint, qr_token, created_at, details_changed_at, deleted_at FROM client_payout_methods WHERE id = ?", [r.payout_method_id]);
-
   /** The QR image is shown only while it is still the one the client had when they asked. */
   const qrStillSame = (r: Row, d: Destination | null, payout: PayoutRow | undefined) =>
     Boolean(d?.qrToken && payout && payout.client_id === r.client_id && payout.qr_token === d.qrToken);
@@ -383,21 +398,109 @@ export function staffWithdrawalsRouter(deps: AppDeps): Router {
     last_at: Date | null;
   }
 
+  type OtherClient = { id: number; first_name: string; last_name: string; assigned_staff_id: number | null };
+
+  /**
+   * What the warnings read besides the withdrawal itself, for a page of withdrawals at once (one
+   * query each). The queue's warning counts and the review screen's warnings come from the same
+   * facts and the same rules (warningsOf), so they always agree.
+   */
+  interface Facts {
+    /** The first six clients (by id) who saved or were paid to each destination. */
+    sharing: Map<string, OtherClient[]>;
+    payouts: Map<number, PayoutRow>;
+    /** Each client's latest change of each kind in SECURITY_ACTIONS, oldest first. */
+    changes: Map<number, { action: string; at: Date }[]>;
+    /** By withdrawal: the client's approved deposits up to it, and those of the 72 hours before it. */
+    funding: Map<number, { total: number; recent: number }>;
+    /** Each client's approved deposits by method, largest first. */
+    byMethod: Map<number, MethodTotal[]>;
+  }
+
+  const marks = (n: number) => Array.from({ length: n }, () => "?").join(",");
+  const SECURITY = Object.keys(SECURITY_ACTIONS);
+  const add = <K, V>(map: Map<K, V[]>, key: K, value: V) => map.set(key, [...(map.get(key) ?? []), value]);
+
+  async function factsFor(list: Row[]): Promise<Facts> {
+    const facts: Facts = { sharing: new Map(), payouts: new Map(), changes: new Map(), funding: new Map(), byMethod: new Map() };
+    if (!list.length) return facts;
+    const ids = list.map((r) => r.id);
+    const clients = [...new Set(list.map((r) => r.client_id))];
+    const prints = [...new Set(list.map((r) => r.destination_fingerprint))];
+    const payoutIds = [...new Set(list.map((r) => r.payout_method_id))];
+
+    // Six per destination leaves five others whichever client's withdrawal it is.
+    const sharing = await rows<OtherClient & { fingerprint: string }>(
+      db,
+      `SELECT fingerprint, id, first_name, last_name, assigned_staff_id FROM (
+         SELECT x.fingerprint, c.id, c.first_name, c.last_name, c.assigned_staff_id, ROW_NUMBER() OVER (PARTITION BY x.fingerprint ORDER BY c.id) AS n
+         FROM (SELECT fingerprint, client_id FROM client_payout_methods WHERE fingerprint IN (${marks(prints.length)})
+               UNION SELECT destination_fingerprint, client_id FROM withdrawals WHERE destination_fingerprint IN (${marks(prints.length)})) x
+         JOIN clients c ON c.id = x.client_id
+       ) t WHERE n <= 6 ORDER BY fingerprint, id`,
+      [...prints, ...prints],
+    );
+    for (const o of sharing) add(facts.sharing, o.fingerprint, o);
+
+    const payouts = await rows<PayoutRow>(
+      db,
+      `SELECT id, client_id, fingerprint, qr_token, created_at, details_changed_at, deleted_at FROM client_payout_methods WHERE id IN (${marks(payoutIds.length)})`,
+      payoutIds,
+    );
+    for (const p of payouts) facts.payouts.set(p.id, p);
+
+    // Staff edits are logged as client.updated (or client.verified_details_changed) with the fields they changed.
+    // A payout account renamed or made the default (no detail among its fields) sends money nowhere new.
+    // From a week before the oldest request; warningsOf keeps each request's own week.
+    const since = new Date(Math.min(...list.map((r) => r.created_at.getTime())) - 7 * DAY);
+    const changes = await rows<{ entity_id: string; action: string; at: Date }>(
+      db,
+      `SELECT entity_id, action, MAX(occurred_at) AS at FROM (
+         SELECT entity_id,
+                CASE WHEN action IN ('client.updated', 'client.verified_details_changed') AND JSON_CONTAINS(JSON_EXTRACT(meta_json, '$.fields'), '"email"')
+                     THEN 'staff.email_changed' WHEN action = 'client.verified_details_changed' THEN 'staff.verified_changed'
+                     WHEN action = 'payout_method.updated'
+                       AND JSON_LENGTH(JSON_EXTRACT(meta_json, '$.fields')) <= JSON_CONTAINS(JSON_EXTRACT(meta_json, '$.fields'), '"method_name"')
+                     THEN 'payout_method.renamed' ELSE action END AS action,
+                occurred_at
+         FROM audit_log
+         WHERE entity_type = 'client' AND entity_id IN (${marks(clients.length)}) AND occurred_at >= ?
+           AND action IN (${marks(SECURITY.length)}, 'client.updated', 'client.verified_details_changed')
+       ) c WHERE action IN (${marks(SECURITY.length)}) GROUP BY entity_id, action ORDER BY at`,
+      [...clients.map(String), since, ...SECURITY, ...SECURITY],
+    );
+    for (const c of changes) add(facts.changes, Number(c.entity_id), { action: c.action, at: c.at });
+
+    const funding = await rows<{ id: number; total: string | null; recent: string | null }>(
+      db,
+      `SELECT w.id, SUM(d.credited_cents) AS total, SUM(IF(d.decided_at >= w.created_at - INTERVAL 72 HOUR, d.credited_cents, 0)) AS recent
+       FROM withdrawals w JOIN deposits d ON d.client_id = w.client_id AND d.status = 'approved' AND d.decided_at <= w.created_at
+       WHERE w.id IN (${marks(ids.length)}) GROUP BY w.id`,
+      ids,
+    );
+    for (const f of funding) facts.funding.set(Number(f.id), { total: Number(f.total ?? 0), recent: Number(f.recent ?? 0) });
+
+    const methods = await rows<MethodTotal & { client_id: number }>(
+      db,
+      `SELECT d.client_id, d.payment_method_id, pm.name, pm.kind, COUNT(*) AS n, SUM(d.credited_cents) AS total, MAX(d.decided_at) AS last_at
+       FROM deposits d JOIN payment_methods pm ON pm.id = d.payment_method_id
+       WHERE d.client_id IN (${marks(clients.length)}) AND d.status = 'approved'
+       GROUP BY d.client_id, d.payment_method_id, pm.name, pm.kind ORDER BY d.client_id, total DESC, d.payment_method_id`,
+      clients,
+    );
+    for (const m of methods) add(facts.byMethod, Number(m.client_id), m);
+    return facts;
+  }
+
   /** Checks a reviewer would otherwise work out by hand, worst first. */
-  async function warningsFor(staff: StaffContext, r: Row, d: Destination | null, payout: PayoutRow | undefined, byMethod: MethodTotal[], settings: MoneySettings) {
+  function warningsOf(staff: StaffContext, r: Row, d: Destination | null, f: Facts, settings: MoneySettings) {
     const warnings: Warning[] = [];
     const block = staffMoneyBlock({ status: r.client_status, kyc_status: r.kyc_status });
     if (block) warnings.push({ tone: "bad", text: block });
     if (!d) warnings.push({ tone: "bad", text: UNREADABLE });
 
     // The same account saved or paid out to by another client. Clients outside the reviewer's scope are not named.
-    const others = await rows<{ id: number; first_name: string; last_name: string; assigned_staff_id: number | null }>(
-      db,
-      `SELECT c.id, c.first_name, c.last_name, c.assigned_staff_id FROM clients c WHERE c.id IN (
-         SELECT client_id FROM client_payout_methods WHERE fingerprint = ? AND client_id <> ?
-         UNION SELECT client_id FROM withdrawals WHERE destination_fingerprint = ? AND client_id <> ?) ORDER BY c.id LIMIT 5`,
-      [r.destination_fingerprint, r.client_id, r.destination_fingerprint, r.client_id],
-    );
+    const others = (f.sharing.get(r.destination_fingerprint) ?? []).filter((o) => o.id !== r.client_id).slice(0, 5);
     for (const o of others.filter((o) => inScope(staff, o.assigned_staff_id))) {
       warnings.push({ tone: "bad", text: `The same destination is also saved or used by ${o.first_name} ${o.last_name} (client ${o.id}).`, href: `/clients/${o.id}` });
     }
@@ -421,6 +524,7 @@ export function staffWithdrawalsRouter(deps: AppDeps): Router {
 
     // A destination added or changed just before asking is a common sign of a taken-over account.
     const asked = r.created_at.getTime();
+    const payout = f.payouts.get(r.payout_method_id);
     if (payout) {
       const changed = payout.details_changed_at.getTime();
       if (changed > asked) {
@@ -438,42 +542,21 @@ export function staffWithdrawalsRouter(deps: AppDeps): Router {
       warnings.push({ tone: "warn", text: `${r.type_name} asks for the wallet's QR code, but this account had none when the client asked. Confirm the address with the client before paying.` });
     }
 
-    // Staff edits are logged as client.updated (or client.verified_details_changed) with the fields they changed.
-    // A payout account renamed or made the default (no detail among its fields) sends money nowhere new.
-    const changes = await rows<{ action: string; at: Date }>(
-      db,
-      `SELECT action, MAX(occurred_at) AS at FROM (
-         SELECT CASE WHEN action IN ('client.updated', 'client.verified_details_changed') AND JSON_CONTAINS(JSON_EXTRACT(meta_json, '$.fields'), '"email"')
-                     THEN 'staff.email_changed' WHEN action = 'client.verified_details_changed' THEN 'staff.verified_changed'
-                     WHEN action = 'payout_method.updated'
-                       AND JSON_LENGTH(JSON_EXTRACT(meta_json, '$.fields')) <= JSON_CONTAINS(JSON_EXTRACT(meta_json, '$.fields'), '"method_name"')
-                     THEN 'payout_method.renamed' ELSE action END AS action,
-                occurred_at
-         FROM audit_log
-         WHERE entity_type = 'client' AND entity_id = ? AND occurred_at >= ?
-           AND action IN (${Object.keys(SECURITY_ACTIONS).map(() => "?").join(",")}, 'client.updated', 'client.verified_details_changed')
-       ) c WHERE action IN (${Object.keys(SECURITY_ACTIONS).map(() => "?").join(",")}) GROUP BY action ORDER BY at`,
-      [String(r.client_id), new Date(asked - 7 * DAY), ...Object.keys(SECURITY_ACTIONS), ...Object.keys(SECURITY_ACTIONS)],
-    );
+    // Account changes in the week before asking, or since.
+    const changes = (f.changes.get(r.client_id) ?? []).filter((c) => c.at.getTime() >= asked - 7 * DAY);
     if (changes.length) {
       warnings.push({ tone: "warn", text: `Recent security changes on this account: ${listWords(changes.map((c) => `${SECURITY_ACTIONS[c.action]} on ${longDate(c.at)}`))}.` });
     }
 
     // Money that came in just before it is asked out again.
-    const funding = await one<{ total: string | null; recent: string | null }>(
-      db,
-      "SELECT SUM(credited_cents) AS total, SUM(IF(decided_at >= ?, credited_cents, 0)) AS recent FROM deposits WHERE client_id = ? AND status = 'approved' AND decided_at <= ?",
-      [new Date(asked - 72 * HOUR), r.client_id, r.created_at],
-    );
-    const total = Number(funding?.total ?? 0);
-    const recent = Number(funding?.recent ?? 0);
-    if (total > 0 && recent * 2 > total) {
-      warnings.push({ tone: "warn", text: `More than half of this client's deposits (${usd(recent)} of ${usd(total)}) arrived in the 72 hours before this request.` });
+    const funding = f.funding.get(r.id) ?? { total: 0, recent: 0 };
+    if (funding.total > 0 && funding.recent * 2 > funding.total) {
+      warnings.push({ tone: "warn", text: `More than half of this client's deposits (${usd(funding.recent)} of ${usd(funding.total)}) arrived in the 72 hours before this request.` });
     }
 
     // Closed loop: money should go back the way it came.
     const kind = d?.kind ?? r.kind;
-    const kinds = [...new Set(byMethod.map((m) => m.kind))];
+    const kinds = [...new Set((f.byMethod.get(r.client_id) ?? []).map((m) => m.kind))];
     if (!kinds.length) warnings.push({ tone: "warn", text: "This client has no approved deposits." });
     else if (!kinds.includes(kind)) warnings.push({ tone: "warn", text: `This client deposited by ${listWords(kinds.map((k) => KIND_WORD[k]))}, but is withdrawing to ${KIND_WORD[kind]}.` });
 
@@ -481,20 +564,19 @@ export function staffWithdrawalsRouter(deps: AppDeps): Router {
     return warnings.sort((a, b) => TONE_ORDER[a.tone] - TONE_ORDER[b.tone]);
   }
 
+  /** The warnings the queue counts: bad and warn (an info line only explains). */
+  const counted = (warnings: Warning[]) => warnings.filter((w) => w.tone !== "info").length;
+
   /** Everything the review screen shows. Account details are shown in full only to those who check and pay withdrawals. */
   async function detail(staff: StaffContext, r: Row) {
     const settings = await loadMoneySettings(db);
     const d = readDestination(r);
     const full = seesFull(staff);
-    const payout = await payoutMethodOf(r);
+    const facts = await factsFor([r]);
+    const payout = facts.payouts.get(r.payout_method_id);
     const hasQr = qrStillSame(r, d, payout);
     const wallet = await one<{ available_cents: number; held_cents: number }>(db, "SELECT available_cents, held_cents FROM wallets WHERE id = ?", [r.wallet_id]);
-    const byMethod = await rows<MethodTotal>(
-      db,
-      `SELECT d.payment_method_id, pm.name, pm.kind, COUNT(*) AS n, SUM(d.credited_cents) AS total, MAX(d.decided_at) AS last_at FROM deposits d JOIN payment_methods pm ON pm.id = d.payment_method_id
-       WHERE d.client_id = ? AND d.status = 'approved' GROUP BY d.payment_method_id, pm.name, pm.kind ORDER BY total DESC, d.payment_method_id`,
-      [r.client_id],
-    );
+    const byMethod = facts.byMethod.get(r.client_id) ?? [];
     const paid = await one<{ n: number; total: string | null }>(db, "SELECT COUNT(*) AS n, SUM(amount_cents) AS total FROM withdrawals WHERE client_id = ? AND status = 'paid'", [r.client_id]);
     const recent = await rows<{ id: number; reference: string; status: WithdrawalStatus; amount_cents: number; created_at: Date; paid_at: Date | null }>(
       db,
@@ -506,8 +588,19 @@ export function staffWithdrawalsRouter(deps: AppDeps): Router {
       return { ok: block === null, reason: block?.message ?? null };
     };
     const shown = (v: string) => (full ? v : (masked(v) ?? ""));
+    const warnings = warningsOf(staff, r, d, facts, settings);
+    // Where this withdrawal stands among those waiting for the same step, as the queue's tab lists them.
+    const s = clientScope(staff);
+    const queue = OPEN.includes(r.status)
+      ? await one<{ pending: number; ahead: string | null }>(
+          db,
+          `SELECT COUNT(*) AS pending, SUM(w.created_at < ? OR (w.created_at = ? AND w.id < ?)) AS ahead FROM withdrawals w JOIN clients c ON c.id = w.client_id WHERE w.status = ?${s.sql}`,
+          [r.created_at, r.created_at, r.id, r.status, ...s.params],
+        )
+      : undefined;
     return {
       ...present(r, settings, d),
+      warningCount: counted(warnings),
       destination: {
         methodName: d?.methodName ?? r.method_name,
         typeName: d?.typeName ?? r.type_name,
@@ -526,16 +619,7 @@ export function staffWithdrawalsRouter(deps: AppDeps): Router {
       ticked: { first: r.checklist?.first ?? [], second: r.checklist?.second ?? [], pay: r.checklist?.pay ?? [] },
       rejectReasons: WITHDRAWAL_REJECT_REASONS,
       rejectReason: r.reject_reason,
-      client: {
-        id: r.client_id,
-        name: clientName(r),
-        email: r.email,
-        status: r.client_status,
-        kycStatus: r.kyc_status,
-        verifiedName: clientName(r),
-        country: r.country,
-        createdAt: r.client_created_at.toISOString(),
-      },
+      client: { ...(await reviewClient(db, r.client_id)), createdAt: r.client_created_at.toISOString() },
       wallet: { availableCents: Number(wallet?.available_cents ?? 0), heldCents: Number(wallet?.held_cents ?? 0) },
       history: {
         deposits: {
@@ -549,8 +633,10 @@ export function staffWithdrawalsRouter(deps: AppDeps): Router {
           recent: recent.map((w) => ({ id: w.id, reference: w.reference, status: w.status, amountCents: Number(w.amount_cents), createdAt: w.created_at.toISOString(), paidAt: w.paid_at?.toISOString() ?? null })),
         },
       },
-      warnings: await warningsFor(staff, r, d, payout, byMethod, settings),
+      warnings,
       stage: STAGE[r.status] ?? null,
+      queue: queue ? { pending: Number(queue.pending), position: Number(queue.ahead ?? 0) + 1 } : { pending: 0, position: 0 },
+      trail: await reviewTrail(db, { clientId: r.client_id, idKey: "withdrawalId", id: r.id, steps: TRAIL }),
       can: { approve: can("approve"), secondApprove: can("secondApprove"), pay: can("pay"), reject: can("reject"), returnToReview: can("returnToReview") },
       payoutReference: r.payout_reference,
       paidOn: r.paid_on,
@@ -573,7 +659,8 @@ export function staffWithdrawalsRouter(deps: AppDeps): Router {
         }),
         req.query,
       );
-      const s = clientScope(staffOf(req));
+      const staff = staffOf(req);
+      const s = clientScope(staff);
       let clause = ` WHERE 1 = 1${s.sql}`;
       const params: unknown[] = [...s.params];
       const statuses = TABS[query.status];
@@ -593,12 +680,41 @@ export function staffWithdrawalsRouter(deps: AppDeps): Router {
       const total = await one<{ n: number }>(db, `SELECT COUNT(*) AS n${from}${clause}`, params);
       const items = await rows<Row>(db, `${SELECT}${clause} ORDER BY ${order} ${dir}, w.id ${dir} LIMIT ? OFFSET ?`, [...params, query.pageSize, (query.page - 1) * query.pageSize]);
       const settings = await loadMoneySettings(db);
-      res.json(toPage(items.map((r) => present(r, settings, readDestination(r))), Number(total?.n ?? 0), query.page, query.pageSize));
+      const facts = await factsFor(items);
+      const listed = items.map((r) => {
+        const d = readDestination(r);
+        return { ...present(r, settings, d), warningCount: counted(warningsOf(staff, r, d, facts, settings)) };
+      });
+      res.json(toPage(listed, Number(total?.n ?? 0), query.page, query.pageSize));
     }),
   );
 
   /** SQL for "this staff member may pay it": not when they alone approved it. */
   const PAYABLE_BY = "w.approved_by IS NOT NULL AND NOT (w.approved_by = ? AND (w.first_reviewed_by IS NULL OR w.first_reviewed_by = w.approved_by))";
+  /** Each step "next" hands out: who may take it, and what waits for them there (`mine` marks SQL that names them). */
+  const STEPS = {
+    review: { permission: "withdrawal.process", sql: "w.status = 'pending'", mine: false },
+    second: { permission: "withdrawal.approve", sql: "(w.status = 'second_approval' AND (w.first_reviewed_by IS NULL OR w.first_reviewed_by <> ?))", mine: true },
+    pay: { permission: "withdrawal.pay", sql: `(w.status = 'approved' AND ${PAYABLE_BY})`, mine: true },
+  } as const satisfies Record<string, { permission: Permission; sql: string; mine: boolean }>;
+  type Step = keyof typeof STEPS;
+
+  /**
+   * The withdrawals "next" may hand this staff member at these steps: waiting for a step they may take
+   * (never a second approval of their own first one, never paying what they alone approved), of an
+   * account that is not closed, held by nobody else, in their scope. The summary's "for me" counts use
+   * the same rule, so a count never promises an item "next" would not give. Null when they may take
+   * none of the steps.
+   */
+  function waitingFor(staff: StaffContext, steps: readonly Step[]) {
+    const allowed = steps.filter((k) => staff.permissions.has(STEPS[k].permission));
+    if (!staff.permissions.has("withdrawal.view") || !allowed.length) return null;
+    const s = clientScope(staff);
+    return {
+      sql: `c.status <> 'closed' AND (w.claimed_by IS NULL OR w.claimed_until < CURRENT_TIMESTAMP(3) OR w.claimed_by = ?) AND (${allowed.map((k) => STEPS[k].sql).join(" OR ")})${s.sql}`,
+      params: [staff.id, ...allowed.flatMap((k) => (STEPS[k].mine ? [staff.id] : [])), ...s.params],
+    };
+  }
 
   router.get(
     "/summary",
@@ -606,22 +722,23 @@ export function staffWithdrawalsRouter(deps: AppDeps): Router {
     handler(async (req, res) => {
       const staff = staffOf(req);
       const s = clientScope(staff);
-      const r = await one<Record<"review" | "second" | "pay" | "overdue" | "today" | "mine" | "for_review" | "for_second" | "for_pay", string | null> & { oldest: Date | null }>(
+      const r = await one<Record<"review" | "second" | "pay" | "overdue" | "today" | "mine", string | null> & { oldest: Date | null }>(
         db,
         `SELECT SUM(w.status = 'pending') AS review, SUM(w.status = 'second_approval') AS second, SUM(w.status = 'approved') AS pay,
            SUM(w.status IN ('pending', 'second_approval', 'approved') AND w.created_at < CURRENT_TIMESTAMP(3) - INTERVAL 24 HOUR) AS overdue,
            MIN(IF(w.status IN ('pending', 'second_approval', 'approved'), w.created_at, NULL)) AS oldest,
            SUM(w.status IN ('paid', 'rejected') AND w.decided_at >= CURRENT_DATE) AS today,
-           SUM(w.status IN ('paid', 'rejected') AND w.decided_at >= CURRENT_DATE AND w.decided_by = ?) AS mine,
-           SUM(w.status = 'pending' AND c.status <> 'closed') AS for_review,
-           SUM(w.status = 'second_approval' AND c.status <> 'closed' AND (w.first_reviewed_by IS NULL OR w.first_reviewed_by <> ?)) AS for_second,
-           SUM(w.status = 'approved' AND c.status <> 'closed' AND ${PAYABLE_BY}) AS for_pay
+           SUM(w.status IN ('paid', 'rejected') AND w.decided_at >= CURRENT_DATE AND w.decided_by = ?) AS mine
          FROM withdrawals w JOIN clients c ON c.id = w.client_id
          WHERE (w.status IN ('pending', 'second_approval', 'approved') OR w.decided_at >= CURRENT_DATE)${s.sql}`,
-        [staff.id, staff.id, staff.id, ...s.params],
+        [staff.id, ...s.params],
       );
-      const n = (v: string | null | undefined) => Number(v ?? 0);
-      const has = (p: Permission) => staff.permissions.has(p);
+      const n = (v: string | number | null | undefined) => Number(v ?? 0);
+      // What "next" would hand this person now at each step.
+      const forStep = async (step: Step) => {
+        const w = waitingFor(staff, [step]);
+        return w ? n((await one<{ n: number }>(db, `SELECT COUNT(*) AS n FROM withdrawals w JOIN clients c ON c.id = w.client_id WHERE ${w.sql}`, w.params))?.n) : 0;
+      };
       res.json({
         review: n(r?.review),
         secondApproval: n(r?.second),
@@ -630,11 +747,7 @@ export function staffWithdrawalsRouter(deps: AppDeps): Router {
         oldestOpenAt: r?.oldest?.toISOString() ?? null,
         decidedToday: n(r?.today),
         decidedTodayByMe: n(r?.mine),
-        forMe: {
-          review: has("withdrawal.process") ? n(r?.for_review) : 0,
-          secondApproval: has("withdrawal.approve") ? n(r?.for_second) : 0,
-          toPay: has("withdrawal.pay") ? n(r?.for_pay) : 0,
-        },
+        forMe: { review: await forStep("review"), secondApproval: await forStep("second"), toPay: await forStep("pay") },
       });
     }),
   );
@@ -650,20 +763,13 @@ export function staffWithdrawalsRouter(deps: AppDeps): Router {
         req.body ?? {},
       );
       const staff = staffOf(req);
-      const stages = {
-        review: { permission: "withdrawal.process", sql: "w.status = 'pending'", params: [] as unknown[] },
-        second: { permission: "withdrawal.approve", sql: "(w.status = 'second_approval' AND (w.first_reviewed_by IS NULL OR w.first_reviewed_by <> ?))", params: [staff.id] },
-        pay: { permission: "withdrawal.pay", sql: `(w.status = 'approved' AND ${PAYABLE_BY})`, params: [staff.id] },
-      } as const;
-      if (body.stage && !staff.permissions.has(stages[body.stage].permission)) throw forbidden();
-      const keys: (keyof typeof stages)[] = body.stage ? [body.stage] : ["review", "second", "pay"];
-      const allowed = keys.filter((k) => staff.permissions.has(stages[k].permission)).map((k) => stages[k]);
-      const s = clientScope(staff);
+      if (body.stage && !staff.permissions.has(STEPS[body.stage].permission)) throw forbidden();
+      const w = waitingFor(staff, body.stage ? [body.stage] : ["review", "second", "pay"]);
       const next = await transaction(db, async (conn) => {
         if (body.release) await release(conn, "withdrawals", body.release, staff.id);
-        if (!allowed.length) return null;
-        const params: unknown[] = [staff.id, ...allowed.flatMap((a) => a.params), ...s.params];
-        let clause = `c.status <> 'closed' AND (w.claimed_by IS NULL OR w.claimed_until < CURRENT_TIMESTAMP(3) OR w.claimed_by = ?) AND (${allowed.map((a) => a.sql).join(" OR ")})${s.sql}`;
+        if (!w) return null;
+        let clause = w.sql;
+        const params = [...w.params];
         if (body.skip.length) (clause += ` AND w.id NOT IN (${body.skip.map(() => "?").join(",")})`), params.push(...body.skip);
         const row = await one<{ id: number }>(
           conn,
@@ -771,7 +877,7 @@ export function staffWithdrawalsRouter(deps: AppDeps): Router {
   async function decide(req: Request, action: Action, work: (conn: Conn, r: Row, d: Destination | null) => Promise<void>) {
     const staff = staffOf(req);
     const withdrawalId = parse(moneyId, req.params.id);
-    const clientId = await clientOfWithdrawal(withdrawalId);
+    const clientId = await clientOfWithdrawal(staff, withdrawalId);
     await transaction(db, async (conn) => {
       await lockClientOf(conn, clientId);
       const r = await loadVisible(staff, withdrawalId, conn, true);

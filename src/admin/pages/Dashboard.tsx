@@ -1,8 +1,11 @@
 import { useQuery } from "@tanstack/react-query";
-import { ArrowRight, BadgeCheck, Check, Clock, KeyRound, Mail, Network, Scale, ShieldCheck, UserPlus, Users, UserCog } from "lucide-react";
+import { ArrowDownToLine, ArrowRight, ArrowUpFromLine, BadgeCheck, Check, Clock, Handshake, KeyRound, Mail, Network, Scale, ShieldCheck, UserPlus, Users, UserCog } from "lucide-react";
+import type { ReactNode } from "react";
 import { Link } from "wouter";
 import { PageHeader } from "../components/ui";
-import { useKycSummary } from "./Kyc";
+import { useIbSummary } from "../components/ib";
+import { useKycSummary } from "../components/kyc";
+import { useDepositsForMe, useDepositSummary, useWithdrawalsForMe, useWithdrawalSummary } from "../components/money";
 import { api, formatDate, type Page, type StaffMember } from "../lib/api";
 import { useReconSummary, type ReconSummary } from "../lib/mt5";
 import { useCan, useSession } from "../lib/session";
@@ -12,7 +15,7 @@ const greeting = () => {
   return h < 12 ? "Good morning" : h < 18 ? "Good afternoon" : "Good evening";
 };
 
-const UPCOMING = [{ icon: Network, label: "IB partners", phase: "Phase 4" }];
+const UPCOMING = [{ icon: Network, label: "IB commissions and wallet", phase: "Phase 4, round B" }];
 
 const useStaffCount = (filter: string, enabled: boolean) =>
   useQuery({
@@ -38,7 +41,14 @@ export function Dashboard() {
     enabled: can("client.view"),
   });
   const kyc = useKycSummary(can("kyc.view"));
-  const kycWaiting = kyc.data?.pending;
+  const deposits = useDepositSummary(can("deposit.view"));
+  const withdrawals = useWithdrawalSummary(can("withdrawal.view"));
+  const ib = useIbSummary(can("ib.view"));
+  const depositsForMe = useDepositsForMe();
+  const withdrawalsForMe = useWithdrawalsForMe();
+  const d = deposits.data;
+  const w = withdrawals.data;
+  const queues = can("kyc.view") || can("deposit.view") || can("withdrawal.view") || can("ib.view");
   const reconciles = can("wallet.reconcile") || can("wallet.view");
   const recon = useReconSummary(reconciles);
   const critical = recon.data?.open.critical;
@@ -48,19 +58,47 @@ export function Dashboard() {
     <>
       <PageHeader title={`${greeting()}, ${session.staff.name.split(" ")[0]}`} description="What needs attention today, and shortcuts to the work you do most." />
       <QuickActions />
-      {(can("staff.view") || can("client.view") || can("kyc.view") || reconciles) && (
+      {(can("staff.view") || can("client.view") || queues || reconciles) && (
         <div className="tiles">
           {can("kyc.view") && (
-            <Link href="/kyc" className="tile tile-button">
-              <span className={kycWaiting === undefined ? "tile-icon" : kycWaiting ? "tile-icon warn" : "tile-icon good"}>
-                <BadgeCheck size={20} />
-              </span>
-              <div>
-                <div className="tile-label">KYC waiting for review</div>
-                <div className="tile-value">{show(kycWaiting)}</div>
-                <div className="tile-foot">{kyc.error ? "Could not load" : kycWaiting === undefined ? "Checking the queue" : kycWaiting ? "Open the queue to review" : "Nothing waiting"}</div>
-              </div>
-            </Link>
+            <QueueTile
+              href="/kyc"
+              icon={<BadgeCheck size={20} />}
+              label="KYC waiting for review"
+              waiting={kyc.data?.pending}
+              forMe={can("kyc.decide", "kyc.documents") ? (kyc.data?.forMe ?? kyc.data?.pending) : undefined}
+              error={kyc.error}
+            />
+          )}
+          {can("deposit.view") && (
+            <QueueTile
+              href="/deposits"
+              icon={<ArrowDownToLine size={20} />}
+              label="Deposits waiting"
+              waiting={d ? d.pending + d.secondApproval : undefined}
+              forMe={can("deposit.process") || can("deposit.approve_large") ? depositsForMe : undefined}
+              error={deposits.error}
+            />
+          )}
+          {can("withdrawal.view") && (
+            <QueueTile
+              href="/withdrawals"
+              icon={<ArrowUpFromLine size={20} />}
+              label="Withdrawals waiting"
+              waiting={w ? w.review + w.secondApproval + w.toPay : undefined}
+              forMe={can("withdrawal.process") || can("withdrawal.approve") || can("withdrawal.pay") ? withdrawalsForMe : undefined}
+              error={withdrawals.error}
+            />
+          )}
+          {can("ib.view") && (
+            <QueueTile
+              href="/ib"
+              icon={<Handshake size={20} />}
+              label="IB applications waiting"
+              waiting={ib.data?.pending}
+              forMe={can("ib.decide") ? ib.data?.forMe : undefined}
+              error={ib.error}
+            />
           )}
           {reconciles && (
             <Link href="/reconciliation?severity=critical" className="tile tile-button">
@@ -185,6 +223,31 @@ export function Dashboard() {
   );
 }
 
+/** One approval queue on the dashboard: how many items wait, and how many of them are for this person. */
+function QueueTile({ href, icon, label, waiting, forMe, error }: { href: string; icon: ReactNode; label: string; waiting: number | undefined; forMe: number | undefined; error: unknown }) {
+  const foot = error
+    ? "Could not load"
+    : waiting === undefined
+      ? "Checking the queue"
+      : !waiting
+        ? "Nothing waiting"
+        : forMe === undefined
+          ? "Open the queue to look"
+          : forMe
+            ? `${forMe.toLocaleString()} waiting for you`
+            : "None waiting for you";
+  return (
+    <Link href={href} className="tile tile-button">
+      <span className={waiting === undefined ? "tile-icon" : waiting ? "tile-icon warn" : "tile-icon good"}>{icon}</span>
+      <div>
+        <div className="tile-label">{label}</div>
+        <div className="tile-value">{waiting === undefined ? "–" : waiting.toLocaleString()}</div>
+        <div className="tile-foot">{foot}</div>
+      </div>
+    </Link>
+  );
+}
+
 /** Under the open critical count: what to do, or when MT5 was last checked against the CRM. */
 function reconFoot(s: ReconSummary | undefined) {
   if (!s) return "Checking";
@@ -199,6 +262,9 @@ function QuickActions() {
   const can = useCan();
   const items = [
     can("kyc.view") && { href: "/kyc", icon: BadgeCheck, label: "Review KYC" },
+    can("deposit.view") && { href: "/deposits", icon: ArrowDownToLine, label: "Review deposits" },
+    can("withdrawal.view") && { href: "/withdrawals", icon: ArrowUpFromLine, label: "Review withdrawals" },
+    can("ib.view") && { href: "/ib", icon: Handshake, label: "Review IB applications" },
     can("client.view") && { href: "/clients", icon: Users, label: "Find a client" },
     can("client.create") && { href: "/clients?new=1", icon: UserPlus, label: "Add a client" },
     can("comms.send") && { href: "/messages/new", icon: Mail, label: "Send an email" },

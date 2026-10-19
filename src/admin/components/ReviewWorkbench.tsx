@@ -663,10 +663,22 @@ export interface ReviewDecisionProps {
   /** An example for the internal note box. */
   notePlaceholder?: string;
   approveLabel?: string;
+  /** Whether a decision opens the next item (default yes); false for staff who may only reject, who go back to the list. */
+  continues?: boolean;
   /** Opens the rejection with this reason filled in; each new `key` opens it again. */
   rejectWith?: { reason: string; key: number } | null;
   /** Extra rules for the reason, such as what the app can show. */
   reasonRule?: (reason: string) => string | null;
+  /** What to fill in before approving (what the payment showed, the IB level), between the checklist and the buttons. */
+  fields?: ReactNode;
+  /** Other steps while the item is in review (send back), under the buttons. */
+  secondaryActions?: ReactNode;
+  /** The line about 2FA and the audit log, at the bottom. */
+  footnote?: ReactNode;
+  /** False when there is no document viewer, so the shortcut help leaves out its keys. */
+  hasDocuments?: boolean;
+  /** Label above the rejection reason. */
+  reasonLabel?: string;
   onApprove: (ticked: string[], internalNote?: string) => void;
   onReject: (reason: string, ticked: string[], internalNote?: string) => void;
   onSkip?: () => void;
@@ -678,6 +690,7 @@ export interface ReviewDecisionProps {
 export function ReviewDecision(props: ReviewDecisionProps) {
   const { checklist, reasons, busy, canDecide } = props;
   const unopened = props.unopened ?? [];
+  const hasDocuments = props.hasDocuments ?? true;
   const [ticked, setTicked] = useState<string[]>([]);
   const [rejecting, setRejecting] = useState(false);
   const [reason, setReason] = useState("");
@@ -754,6 +767,7 @@ export function ReviewDecision(props: ReviewDecisionProps) {
         ))}
       </ul>
       {props.blockedText && <p className="notice notice-warn tight">{props.blockedText}</p>}
+      {props.fields}
       {canDecide &&
         (noteOpen ? (
           <label className="review-note">
@@ -775,7 +789,7 @@ export function ReviewDecision(props: ReviewDecisionProps) {
             reject();
           }}
         >
-          <span className="field-label">Reason the client will see</span>
+          <span className="field-label">{props.reasonLabel ?? "Reason the client will see"}</span>
           <div className="chips">
             {reasons.map((r) => (
               <button key={r} type="button" className={reason === r ? "chip active" : "chip"} onClick={() => (setReason(r), reasonRef.current?.focus())}>
@@ -799,7 +813,7 @@ export function ReviewDecision(props: ReviewDecisionProps) {
               Back <kbd>Esc</kbd>
             </button>
             <button type="submit" className="button button-danger-solid" disabled={busy || reason.trim().length < 5 || !!reasonProblem || !!noteProblem}>
-              {busy && <Spinner />} Reject and next <kbd>Ctrl ↵</kbd>
+              {busy && <Spinner />} Reject{props.continues === false ? "" : " and next"} <kbd>Ctrl ↵</kbd>
             </button>
           </div>
         </form>
@@ -830,13 +844,15 @@ export function ReviewDecision(props: ReviewDecisionProps) {
             !allTicked &&
             canDecide && (
               <p className="muted tight">
-                Tick every check to approve{keysOn && <span className="shortcut-hint">, or press C to tick them all after checking</span>}.
+                Tick every check to approve{keysOn && <span className="shortcut-hint">, or press C to tick them all {hasDocuments ? "after checking" : "once you have checked"}</span>}.
               </p>
             )
           )}
           {canDecide && props.rejectBlocked && <p className="muted tight">{props.rejectBlocked}</p>}
         </div>
       )}
+      {props.secondaryActions}
+      {props.footnote}
       <Dialog open={help} title="Keyboard shortcuts" onClose={() => setHelp(false)}>
         <label className="check shortcut-toggle">
           <input type="checkbox" checked={keysOn} onChange={(e) => setKeysOn(e.target.checked)} />
@@ -850,11 +866,15 @@ export function ReviewDecision(props: ReviewDecisionProps) {
           <dt><kbd>R</kbd></dt><dd>Reject (pick or write a reason, then Ctrl + Enter)</dd>
           <dt><kbd>S</kbd></dt><dd>Skip to the next item</dd>
           <dt><kbd>1</kbd>–<kbd>{checklist.length}</kbd></dt><dd>Tick a check</dd>
-          <dt><kbd>C</kbd></dt><dd>Tick or untick every check, once every document is open</dd>
-          <dt><kbd>←</kbd> <kbd>→</kbd></dt><dd>Pages, front and back of the document</dd>
-          <dt><kbd>+</kbd> <kbd>−</kbd> <kbd>0</kbd></dt><dd>Zoom in, out, fit to the screen</dd>
-          <dt><kbd>[</kbd> <kbd>]</kbd></dt><dd>Turn left or right</dd>
-          <dt><kbd>F</kbd></dt><dd>Show the document full screen, or leave full screen</dd>
+          <dt><kbd>C</kbd></dt><dd>{hasDocuments ? "Tick or untick every check, once every document is open" : "Tick or untick every check"}</dd>
+          {hasDocuments && (
+            <>
+              <dt><kbd>←</kbd> <kbd>→</kbd></dt><dd>Pages, front and back of the document</dd>
+              <dt><kbd>+</kbd> <kbd>−</kbd> <kbd>0</kbd></dt><dd>Zoom in, out, fit to the screen</dd>
+              <dt><kbd>[</kbd> <kbd>]</kbd></dt><dd>Turn left or right</dd>
+              <dt><kbd>F</kbd></dt><dd>Show the document full screen, or leave full screen</dd>
+            </>
+          )}
           <dt><kbd>Esc</kbd></dt><dd>Back to the queue</dd>
         </dl>
       </Dialog>

@@ -307,7 +307,8 @@ describe.skipIf(!hasDb)("KYC", () => {
     expect(detail.trail).toEqual([expect.objectContaining({ action: "submitted", label: "Sent by the client", staff: null, reason: null, internalNote: null })]);
     expect(detail.checklist.map((c: { key: string }) => c.key)).toEqual(ALL.identity);
     expect(detail.reasons.length).toBeGreaterThan(3);
-    expect(detail.queue).toMatchObject({ pending: 2 });
+    // Counted within its own category, as the Document filter lists it.
+    expect(detail).toMatchObject({ stage: "identity", queue: { pending: 1, position: 1 } });
 
     const file = await view(reviewer, detail.files[0].url);
     expect(file.headers["content-type"]).toBe("image/png");
@@ -374,6 +375,13 @@ describe.skipIf(!hasDb)("KYC", () => {
       expect.arrayContaining([expect.stringMatching(/^The client sent the same file that was rejected on \d{1,2} [A-Z][a-z]+ \d{4}\.$/), "1 earlier attempt was rejected. See the history below."]),
     );
     expect(resentDetail.history).toEqual([expect.objectContaining({ id: identity.id, status: "rejected", newer: false })]);
+    // Taking over a colleague's review shows in What happened, naming the colleague, as on the other queues.
+    await post(second, `/api/staff/kyc/${resent.id}/claim`, {});
+    expect((await post(reviewer, `/api/staff/kyc/${resent.id}/claim`, { takeOver: true })).body.claimedBy.name).toBe("comp");
+    expect((await reviewer.agent.get(`/api/staff/kyc/${resent.id}`)).body.trail.at(-1)).toEqual({
+      at: expect.any(String), action: "review_taken_over", label: "Took over the review from comp2", staff: "comp", reason: null, internalNote: null,
+    });
+    await post(reviewer, `/api/staff/kyc/${resent.id}/release`, {});
     const earlier = (await reviewer.agent.get(`/api/staff/kyc/${identity.id}`)).body;
     expect(earlier).toMatchObject({ isLatest: false, mayApprove: false, approveBlockedReason: "The client has a newer submission for this. Change that one instead." });
     expect(earlier.history[0]).toMatchObject({ id: resent.id, newer: true });
@@ -698,6 +706,11 @@ describe.skipIf(!hasDb)("KYC", () => {
     ]));
     expect(limited.join(" ")).not.toContain(`client ${annA.id}`);
     expect(limited.join(" ")).not.toContain("Ann Twin");
+    // A warning about a client the reviewer may see links to them; one about a client they may not see does not.
+    const linked = ((await reviewer.agent.get(`/api/staff/kyc/${bIdentity}`)).body.warnings as { text: string; href?: string }[]).filter((w) => w.text.includes(`client ${annA.id}`));
+    expect(linked).toHaveLength(2);
+    for (const w of linked) expect(w).toMatchObject({ clientId: annA.id, href: `/clients/${annA.id}`, linkLabel: "Open that client" });
+    expect(((await scoped.agent.get(`/api/staff/kyc/${bIdentity}`)).body.warnings as { href?: string }[]).some((w) => w.href)).toBe(false);
     expect((await scoped.agent.get(`/api/staff/kyc/${aIdentity}`)).status).toBe(404);
     expect(await warnings(scoped, bAddress!)).toContain("This file is the same as one the client sent as proof of identity.");
   });
@@ -811,6 +824,158 @@ describe.skipIf(!hasDb)("KYC", () => {
     expect(limited.status).toBe(429);
     expect(Number(limited.headers["retry-after"])).toBeGreaterThan(0);
     expect(limited.body).toEqual({ message: "Too many uploads. Please wait before trying again." });
+  });
+
+  it("answers the review screen in the shape the other review queues use", async () => {
+    const VIEW_ONLY = "You can look at this submission but not approve or reject it.";
+    // A reviewer for their own clients only, one who may decide but not open documents, and one who may only look.
+    const roles = [
+      ["kyc_desk", ["kyc.view", "kyc.documents", "kyc.decide", "client.view"]],
+      ["kyc_decide_only", ["kyc.view", "kyc.decide", "client.view", "client.view_all"]],
+      ["kyc_looker", ["kyc.view", "kyc.documents", "client.view", "client.view_all"]],
+    ] as const;
+    for (const [slug, perms] of roles) {
+      const role = (await exec(env.db, "INSERT INTO roles (slug, name) VALUES (?, ?)", [slug, slug])).insertId;
+      for (const p of perms) await exec(env.db, "INSERT INTO role_permissions (role_id, permission) VALUES (?, ?)", [role, p]);
+    }
+    await createStaff(env.db, "desk@bis.test", "kyc_desk");
+    await createStaff(env.db, "decider@bis.test", "kyc_decide_only");
+    await createStaff(env.db, "looker@bis.test", "kyc_looker");
+    const desk = await signIn(env, "desk@bis.test");
+    const decider = await signIn(env, "decider@bis.test");
+    const looker = await signIn(env, "looker@bis.test");
+    type Counts = { forMe: number; forMeByCategory: { identity: number; address: number } };
+    const counts = async (s: SignedIn): Promise<Counts> => {
+      const b = (await s.agent.get("/api/staff/kyc/summary")).body;
+      return { forMe: b.forMe, forMeByCategory: b.forMeByCategory };
+    };
+    const plus = (c: Counts, identity: number, address: number): Counts => ({
+      forMe: c.forMe + identity + address, forMeByCategory: { identity: c.forMeByCategory.identity + identity, address: c.forMeByCategory.address + address },
+    });
+    const before = { reviewer: await counts(reviewer), second: await counts(second), desk: await counts(desk) };
+    expect(before.reviewer.forMe).toBe(before.reviewer.forMeByCategory.identity + before.reviewer.forMeByCategory.address);
+    // Looking is not deciding.
+    for (const s of [support, scoped, decider, looker]) expect(await counts(s)).toEqual({ forMe: 0, forMeByCategory: { identity: 0, address: 0 } });
+
+    const kim = await register("kim@client.test", "Kim", "Lee");
+    await api().patch("/api/user").set(bearer(kim.token)).send({ ...PROFILE, dob: "1991-06-06" });
+    expect((await upload(3, 2, [await photo("#1a2b3c")], kim.token)).status).toBe(201);
+    expect((await upload(4, 1, [await photo("#3c2b1a")], kim.token)).status).toBe(201);
+    const [identity, address] = (await rows<{ id: number }>(env.db, "SELECT id FROM kyc_submissions WHERE client_id = ? ORDER BY id", [kim.id])).map((r) => r.id) as [number, number];
+    const detail = async (s: SignedIn, submissionId: number) => (await s.agent.get(`/api/staff/kyc/${submissionId}`)).body;
+    const listed = async (status = "pending") =>
+      new Map(((await reviewer.agent.get(`/api/staff/kyc?status=${status}&clientId=${kim.id}`)).body.items as { id: number; warningCount: number; client: { avatarUrl: string | null } }[]).map((i) => [i.id, i]));
+
+    const d = await detail(reviewer, identity);
+    expect(d).toMatchObject({
+      stage: "identity", claimMinutes: 15, rejectReasons: d.reasons, mayApprove: true, approveBlockedReason: null, uploadedByMe: false, isLatest: true,
+      can: {
+        approve: { ok: true, reason: null }, reject: { ok: true, reason: null },
+        requestNew: { ok: false, reason: "Only an approved document can be requested again. Reject a pending one instead." },
+      },
+    });
+    expect(d.client).toEqual({
+      id: kim.id, name: "Kim Lee", verifiedName: "Kim Lee", email: "kim@client.test", avatarUrl: null, pictureUrl: null, status: "active", kycStatus: "pending",
+      country: "United Kingdom", joinedAt: expect.any(String), assignedTo: null, emailVerified: true,
+    });
+    // Within its own category, newest last, counted as the list counts it.
+    expect(d.queue.position).toBe(d.queue.pending);
+    expect(d.queue.pending).toBe((await reviewer.agent.get("/api/staff/kyc?category=identity&pageSize=1")).body.total);
+    const a = await detail(reviewer, address);
+    expect(a).toMatchObject({ stage: "address", queue: { position: a.queue.pending } });
+    expect(a.queue.pending).toBe((await reviewer.agent.get("/api/staff/kyc?category=address&pageSize=1")).body.total);
+    expect((await listed()).get(identity)).toMatchObject({ warningCount: 0, client: { avatarUrl: null } });
+
+    // Someone who may only look is told so for each action.
+    const looking = await detail(looker, identity);
+    expect(looking.can).toEqual({ approve: { ok: false, reason: VIEW_ONLY }, reject: { ok: false, reason: VIEW_ONLY }, requestNew: { ok: false, reason: VIEW_ONLY } });
+    expect(looking).toMatchObject({ mayApprove: false, approveBlockedReason: VIEW_ONLY });
+
+    // "For me" counts what "next" would hand out: both new items, until someone else holds one.
+    expect(await counts(reviewer)).toEqual(plus(before.reviewer, 1, 1));
+    expect((await post(second, `/api/staff/kyc/${identity}/claim`, {})).status).toBe(200);
+    expect(await counts(reviewer)).toEqual(plus(before.reviewer, 0, 1));
+    expect(await counts(second)).toEqual(plus(before.second, 1, 1));
+    expect((await detail(reviewer, identity)).can.reject).toEqual({ ok: false, reason: "comp2 is reviewing this item right now." });
+    // Letting go needs the same permissions as taking it.
+    expect((await post(decider, `/api/staff/kyc/${identity}/claim`, {})).status).toBe(403);
+    expect((await post(decider, `/api/staff/kyc/${identity}/release`, {})).status).toBe(403);
+    expect((await post(support, `/api/staff/kyc/${identity}/release`, {})).status).toBe(403);
+    expect((await post(second, `/api/staff/kyc/${identity}/release`, {})).status).toBe(200);
+    expect(await counts(reviewer)).toEqual(plus(before.reviewer, 1, 1));
+    // Only the clients a reviewer may see.
+    expect(await counts(desk)).toEqual(before.desk);
+    expect((await desk.agent.get(`/api/staff/kyc/${identity}`)).status).toBe(404);
+    await exec(env.db, "UPDATE clients SET assigned_staff_id = ? WHERE id = ?", [desk.staffId, kim.id]);
+    expect(await counts(desk)).toEqual(plus(before.desk, 1, 1));
+    expect((await detail(desk, identity)).queue).toEqual({ pending: 1, position: 1 });
+    expect((await detail(reviewer, identity)).client.assignedTo).toEqual({ id: desk.staffId, name: "desk" });
+    // Never a closed account's.
+    await exec(env.db, "UPDATE clients SET status = 'closed' WHERE id = ?", [kim.id]);
+    expect(await counts(reviewer)).toEqual(before.reviewer);
+    expect((await detail(reviewer, identity)).can).toMatchObject({ approve: { ok: false, reason: "This account is closed." }, reject: { ok: false, reason: "This account is closed." } });
+    await exec(env.db, "UPDATE clients SET status = 'active' WHERE id = ?", [kim.id]);
+
+    // "stage" picks the category for "next", as on the other review queues.
+    expect((await post(reviewer, "/api/staff/kyc/next", { stage: "passport" })).status).toBe(400);
+    const handed = (await post(reviewer, "/api/staff/kyc/next", { stage: "address" })).body.id as number;
+    expect((await detail(reviewer, handed)).stage).toBe("address");
+    expect((await post(reviewer, `/api/staff/kyc/${handed}/release`, {})).status).toBe(200);
+
+    // "note" is the internal note, as on the other review screens.
+    await stepUp(env, reviewer);
+    const unsafe = await post(reviewer, `/api/staff/kyc/${identity}/decision`, { decision: "reject", reason: "The photo is too dark to read", note: "<b>no</b>" });
+    expect(unsafe.status).toBe(400);
+    expect((await detail(reviewer, identity)).stage).toBe("identity");
+    const rejected = await post(reviewer, `/api/staff/kyc/${identity}/decision`, { decision: "reject", reason: "The photo is too dark to read", note: "Glare across the name" });
+    expect(rejected.status).toBe(200);
+    const afterReject = await detail(reviewer, identity);
+    expect(afterReject.trail.at(-1)).toMatchObject({ action: "rejected", reason: "The photo is too dark to read", internalNote: "Glare across the name" });
+    expect(afterReject).toMatchObject({ stage: null, queue: { pending: 0, position: 0 } });
+    // A rejected document can still be approved on a second look, while it is the latest.
+    expect(afterReject.can).toMatchObject({ approve: { ok: true, reason: null }, reject: { ok: false, reason: "This submission was already rejected by comp." } });
+
+    // The queue flags, without opening it, what the review screen warns about.
+    expect((await upload(3, 2, [await photo("#4d5e6f")], kim.token)).status).toBe(201);
+    const again = (await rows<{ id: number }>(env.db, "SELECT id FROM kyc_submissions WHERE client_id = ? AND category = 'identity' ORDER BY id DESC LIMIT 1", [kim.id]))[0]!.id;
+    expect((await listed()).get(again)!.warningCount).toBe(1);
+    expect((await detail(reviewer, again)).warnings.map((w: { text: string }) => w.text)).toContain("1 earlier attempt was rejected. See the history below.");
+    await exec(env.db, "UPDATE clients SET status = 'frozen', email_verified_at = NULL WHERE id = ?", [kim.id]);
+    expect((await listed()).get(again)!.warningCount).toBe(3);
+    const flagged = (await detail(reviewer, again)).client;
+    expect(flagged).toMatchObject({ status: "frozen", emailVerified: false });
+    await exec(env.db, "UPDATE clients SET status = 'active', email_verified_at = CURRENT_TIMESTAMP(3) WHERE id = ?", [kim.id]);
+    // The client takes it back: nothing left to decide.
+    expect((await withdraw(3, kim.token)).status).toBe(200);
+    expect(await detail(reviewer, again)).toMatchObject({ stage: null, queue: { pending: 0, position: 0 }, can: { reject: { ok: false, reason: "The client took this document back." } } });
+
+    // An approved document can be asked for again; then changed back, each with a note.
+    expect((await approve(reviewer, address)).status).toBe(200);
+    const approved = await detail(reviewer, address);
+    expect(approved).toMatchObject({ stage: null, can: { approve: { ok: false, reason: "This submission is already approved." }, requestNew: { ok: true, reason: null } } });
+    expect(approved.can.reject).toEqual({ ok: false, reason: "This submission was already approved by comp." });
+    expect((await detail(looker, address)).can.requestNew).toEqual({ ok: false, reason: VIEW_ONLY });
+    const asked = await post(reviewer, `/api/staff/kyc/${address}/request-new`, { reason: "Please send a bill from this year", note: "The bill is from 2023" });
+    expect(asked.status).toBe(200);
+    const afterAsk = await detail(reviewer, address);
+    expect(afterAsk.trail.at(-1)).toMatchObject({ action: "new_document_requested", internalNote: "The bill is from 2023" });
+    expect(afterAsk.can.requestNew.ok).toBe(false);
+    const changed = await post(reviewer, `/api/staff/kyc/${address}/change`, { status: "approved", reason: "The bill is recent enough", checklist: ALL.address, note: "Checked the date again" });
+    expect(changed.status).toBe(200);
+    const afterChange = await detail(reviewer, address);
+    expect(afterChange.trail.at(-1)).toMatchObject({ action: "decision_changed", internalNote: "Checked the date again" });
+    expect(afterChange.can.requestNew).toEqual({ ok: true, reason: null });
+
+    // A staff upload waits for another reviewer, so it counts for them and not for the uploader.
+    const now = { reviewer: await counts(reviewer), second: await counts(second) };
+    const staffUpload = await reviewer.agent.post("/api/staff/kyc/upload").set("Origin", ORIGIN).set("X-CSRF-Token", reviewer.csrf)
+      .field("client_id", String(kim.id)).field("type", "3").field("sub_type", "2").field("note", "Sent by email on 18 October")
+      .attach("document1", await photo("#7f8e9d"), { filename: "passport.png", contentType: "image/png" });
+    expect(staffUpload.status).toBe(201);
+    expect(await counts(reviewer)).toEqual(now.reviewer);
+    expect(await counts(second)).toEqual(plus(now.second, 1, 0));
+    // Staff upload and an earlier rejection.
+    expect((await listed()).get(staffUpload.body.id)!.warningCount).toBe(2);
   });
 
   it("takes many new clients' first uploads at the same time", async () => {
